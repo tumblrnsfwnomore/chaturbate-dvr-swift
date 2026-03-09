@@ -23,6 +23,14 @@ A native macOS application for recording Chaturbate streams, built with Swift an
 
 ## Building
 
+## Using the shell script
+
+The included shell script builds a complete app bundle in the dist folder.
+
+```bash
+./scripts/package-app.sh
+```
+
 ### Using Xcode
 
 1. Open `Package.swift` in Xcode.
