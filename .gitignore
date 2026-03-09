@@ -2,3 +2,59 @@ videos
 chaturbate-dvr
 conf
 bin
+archived
+.vscode/
+.copilot/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# Virtual environments
+venv/
+ENV/
+env/
+
+# IDE
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment variables
+.env
+.env.local
+
+# Logs
+*.log
+npm-debug.log*
+
+/.build
+/.xcodebuild-out
+/Packages
+xcuserdata/
+DerivedData/
+.swiftpm/configuration/registries.json
+.netrc
+*.xcodeproj
+*.xcworkspace
