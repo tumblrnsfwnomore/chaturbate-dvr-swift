@@ -3,11 +3,7 @@
 A native macOS application for recording Chaturbate streams, built with Swift and SwiftUI.
 
 > [!NOTE]
-> This fork focuses on the SwiftUI rewrite of Chaturbate DVR. Favicon from [Twemoji](https://github.com/twitter/twemoji).
-
-![Image](https://github.com/user-attachments/assets/d71f0aaa-e821-4371-9f48-658a137b42b6)
-
-![Image](https://github.com/user-attachments/assets/43ab0a07-0ece-40ba-9a0f-045ca0316638)
+> Forked from the original, now deprecated, [Go version by teacat](https://github.com/teacat/chaturbate-dvr).
 
 ## Features
 
@@ -83,11 +79,6 @@ The app uses modern Swift concurrency features:
 - `actor` for thread-safe state management
 - `Task` for concurrent channel monitoring
 
-## Legacy Project Note
-
-This fork replaces the original Go implementation with a Swift/SwiftUI macOS app.
-If you need the original multi-platform Go version, see [teacat/chaturbate-dvr](https://github.com/teacat/chaturbate-dvr).
-
 ## Troubleshooting
 
 ### Channel Shows as Offline
@@ -95,15 +86,6 @@ If you need the original multi-platform Go version, see [teacat/chaturbate-dvr](
 - Verify the channel username is correct
 - Check your internet connection
 - The channel may actually be offline
-
-### Cloudflare Blocked
-
-If you encounter Cloudflare protection:
-
-1. Open Chaturbate in Safari/Chrome.
-2. Complete the Cloudflare check.
-3. Copy cookies from browser DevTools.
-4. Add cookies to app configuration.
 
 ### Recording Issues
 
