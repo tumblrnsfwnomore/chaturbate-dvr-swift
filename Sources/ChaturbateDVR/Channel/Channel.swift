@@ -4,6 +4,7 @@ import AppKit
 
 actor Channel {
     private static let pausedPreviewMinInterval: TimeInterval = 180
+    private static let pausedOnlineStickyDuration: TimeInterval = 60
     private static let pausedPreviewMaxSegmentBytes = 6 * 1024 * 1024
     private static let recordingPreviewWindowSeconds: TimeInterval = 30
     private static let recordingPreviewMaxBytes = 12 * 1024 * 1024
@@ -32,6 +33,7 @@ actor Channel {
     private var lastThumbnailTime: Date = Date.distantPast
     private var lastPausedPreviewTime: Date = Date.distantPast
     private var isRefreshingPausedPreview: Bool = false
+    private var pausedOnlineStickyUntil: Date?
     private var recentPreviewSegments: [PreviewSegmentChunk] = []
     private var recentPreviewDuration: Double = 0
     private var recentPreviewBytes: Int = 0
@@ -65,12 +67,13 @@ actor Channel {
     func pause() {
         let wasOnline = isOnline
         config.isPaused = true
+        pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
         monitoringTask?.cancel()
         monitoringTask = nil
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
         if wasOnline {
-            addLog("Channel paused (kept as paused-online until next background check)")
+            addLog("Channel paused (kept as paused-online for up to 1 minute)")
         } else {
             addLog("Channel paused")
         }
@@ -78,6 +81,7 @@ actor Channel {
     
     func resume() {
         config.isPaused = false
+        pausedOnlineStickyUntil = nil
         guard monitoringTask == nil else { return }
         
         monitoringTask = Task {
@@ -88,6 +92,7 @@ actor Channel {
     
     func stopForDeletion() {
         config.isPaused = true
+        pausedOnlineStickyUntil = nil
         monitoringTask?.cancel()
         monitoringTask = nil
         isOnline = false
@@ -179,12 +184,6 @@ actor Channel {
     func refreshPausedOnlineStatus(bypassRateLimit: Bool = false) async {
         guard config.isPaused else { return }
 
-        // If a channel was actively recording when paused, keep that online
-        // state sticky until the user resumes it.
-        if isOnline {
-            return
-        }
-
         let wasOnline = isOnline
 
         // Use rate limiter for normal background checks.
@@ -230,8 +229,19 @@ actor Channel {
                 }
             }
             isOnline = false
-            if wasOnline {
-                addLog("Background check: channel went offline")
+            let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
+            if stickyActive {
+                // Preserve paused-online state briefly for channels that were
+                // active at pause time, but continue probing in the background.
+                isOnline = true
+                if wasOnline {
+                    addLog("Background check: probe failed/offline, keeping paused-online sticky state")
+                }
+            } else {
+                pausedOnlineStickyUntil = nil
+                if wasOnline {
+                    addLog("Background check: channel went offline")
+                }
             }
         }
     }
