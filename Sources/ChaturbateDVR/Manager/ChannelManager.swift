@@ -9,9 +9,22 @@ struct FollowedImportPreview {
 }
 
 actor RequestCoordinator {
+    struct Stats {
+        let activeRequests: Int
+        let queuedRequests: Int
+        let maxConcurrent: Int
+        let saturationEvents: Int
+        let averageWaitMs: Int
+        let maxWaitMs: Int
+    }
+
     private var activeRequests: Int = 0
     private var maxConcurrent: Int
     private var waitingTasks: [CheckedContinuation<Void, Never>] = []
+    private var saturationEvents: Int = 0
+    private var totalWaitMs: Int = 0
+    private var waitSamples: Int = 0
+    private var maxObservedWaitMs: Int = 0
     
     init(maxConcurrent: Int) {
         self.maxConcurrent = maxConcurrent
@@ -32,10 +45,18 @@ actor RequestCoordinator {
             activeRequests += 1
             return
         }
+
+        saturationEvents += 1
+        let waitStart = Date()
         
         await withCheckedContinuation { continuation in
             waitingTasks.append(continuation)
         }
+
+        let waitedMs = max(0, Int(Date().timeIntervalSince(waitStart) * 1000))
+        totalWaitMs += waitedMs
+        waitSamples += 1
+        maxObservedWaitMs = max(maxObservedWaitMs, waitedMs)
     }
     
     func releaseSlot() {
@@ -47,12 +68,104 @@ actor RequestCoordinator {
             continuation.resume()
         }
     }
+
+    func getStats() -> Stats {
+        let average = waitSamples > 0 ? (totalWaitMs / waitSamples) : 0
+        return Stats(
+            activeRequests: activeRequests,
+            queuedRequests: waitingTasks.count,
+            maxConcurrent: maxConcurrent,
+            saturationEvents: saturationEvents,
+            averageWaitMs: average,
+            maxWaitMs: maxObservedWaitMs
+        )
+    }
+}
+
+actor RecordingCoordinator {
+    struct Stats {
+        let activeRecordings: Int
+        let queuedRecordings: Int
+        let maxConcurrent: Int
+    }
+
+    private var activeRecordings: Int = 0
+    private var maxConcurrent: Int
+    private var waitingTasks: [CheckedContinuation<Void, Never>] = []
+
+    init(maxConcurrent: Int) {
+        self.maxConcurrent = maxConcurrent
+    }
+
+    private var isUnlimited: Bool {
+        maxConcurrent <= 0
+    }
+
+    func updateMaxConcurrent(_ max: Int) {
+        maxConcurrent = max
+
+        if isUnlimited {
+            while !waitingTasks.isEmpty {
+                let continuation = waitingTasks.removeFirst()
+                activeRecordings += 1
+                continuation.resume()
+            }
+            return
+        }
+
+        while activeRecordings < maxConcurrent && !waitingTasks.isEmpty {
+            let continuation = waitingTasks.removeFirst()
+            activeRecordings += 1
+            continuation.resume()
+        }
+    }
+
+    func acquireSlot() async {
+        if isUnlimited || activeRecordings < maxConcurrent {
+            activeRecordings += 1
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            waitingTasks.append(continuation)
+        }
+    }
+
+    func releaseSlot() {
+        if activeRecordings > 0 {
+            activeRecordings -= 1
+        }
+
+        if isUnlimited {
+            if !waitingTasks.isEmpty {
+                let continuation = waitingTasks.removeFirst()
+                activeRecordings += 1
+                continuation.resume()
+            }
+            return
+        }
+
+        if !waitingTasks.isEmpty && activeRecordings < maxConcurrent {
+            let continuation = waitingTasks.removeFirst()
+            activeRecordings += 1
+            continuation.resume()
+        }
+    }
+
+    func getStats() -> Stats {
+        Stats(
+            activeRecordings: activeRecordings,
+            queuedRecordings: waitingTasks.count,
+            maxConcurrent: maxConcurrent
+        )
+    }
 }
 
 @MainActor
 class ChannelManager: ObservableObject {
     @Published var channels: [String: Channel] = [:]
     @Published var appConfig = AppConfig()
+    @Published var runtimeDiagnostics: RuntimeDiagnostics = .empty
     
     private let configURL: URL
     private let appConfigURL: URL
@@ -61,6 +174,7 @@ class ChannelManager: ObservableObject {
     private var pausedProbeIndex: Int = 0
     private var thumbnailBackfillIndex: Int = 0
     private let requestCoordinator: RequestCoordinator
+    private let recordingCoordinator: RecordingCoordinator
     
     init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -70,13 +184,15 @@ class ChannelManager: ObservableObject {
         appConfigURL = appFolder.appendingPathComponent("appconfig.json")
         
         // Initialize with default, will update after loading config
-        requestCoordinator = RequestCoordinator(maxConcurrent: 3)
+        requestCoordinator = RequestCoordinator(maxConcurrent: 6)
+        recordingCoordinator = RecordingCoordinator(maxConcurrent: 0)
         
         loadAppConfig()
         
         // Update with actual config value
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
+            await recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
         }
         
         loadConfig()
@@ -122,7 +238,10 @@ class ChannelManager: ObservableObject {
         
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
+            await recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
             await FileLogger.shared.log("[manager] updated max concurrent requests to \(appConfig.maxConcurrentRequests)")
+            let recordingsCap = appConfig.maxConcurrentRecordings == 0 ? "unlimited" : String(appConfig.maxConcurrentRecordings)
+            await FileLogger.shared.log("[manager] updated max concurrent recordings to \(recordingsCap)")
         }
     }
     
@@ -146,7 +265,12 @@ class ChannelManager: ObservableObject {
             await FileLogger.shared.log("[manager] channel validation non-fatal error: \(error.localizedDescription)", channel: config.username, level: "WARN")
         }
         
-        let channel = Channel(config: config, appConfig: appConfig, requestCoordinator: requestCoordinator)
+        let channel = Channel(
+            config: config,
+            appConfig: appConfig,
+            requestCoordinator: requestCoordinator,
+            recordingCoordinator: recordingCoordinator
+        )
         channels[config.username] = channel
         
         // Save immediately
@@ -162,6 +286,13 @@ class ChannelManager: ObservableObject {
     func pauseChannel(username: String) async {
         guard let channel = channels[username] else { return }
         await channel.pause()
+
+        // Prioritize freshly paused channels so paused-live/offline state
+        // resolves quickly and list placement stays accurate.
+        Task {
+            await channel.refreshPausedOnlineStatus(bypassRateLimit: true)
+        }
+
         await saveConfig()
         await FileLogger.shared.log("[manager] channel paused", channel: username)
     }
@@ -269,14 +400,16 @@ class ChannelManager: ObservableObject {
 
         func sortPriority(for info: ChannelInfo) -> Int {
             // Requested order:
-            // 0: recording, 1: paused but online, 2: offline, 3: paused (offline)
-            if info.isOnline && !info.isPaused { return 0 }
-            if info.isOnline && info.isPaused { return 1 }
-            if !info.isOnline && !info.isPaused { return 2 }
-            return 3
+            // 0: recording, 1: waiting for recording slot, 2: paused but online,
+            // 3: offline, 4: paused (offline)
+            if info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot { return 0 }
+            if info.isWaitingForRecordingSlot { return 1 }
+            if info.isOnline && info.isPaused { return 2 }
+            if !info.isOnline && !info.isPaused { return 3 }
+            return 4
         }
 
-        return infos.sorted { lhs, rhs in
+        let sortedInfos = infos.sorted { lhs, rhs in
             let lhsPriority = sortPriority(for: lhs)
             let rhsPriority = sortPriority(for: rhs)
 
@@ -294,6 +427,25 @@ class ChannelManager: ObservableObject {
             // Stable final tie-breaker.
             return lhs.username.lowercased() < rhs.username.lowercased()
         }
+
+        let coordinatorStats = await requestCoordinator.getStats()
+        let recordingStats = await recordingCoordinator.getStats()
+        runtimeDiagnostics = RuntimeDiagnostics(
+            activeRequests: coordinatorStats.activeRequests,
+            queuedRequests: coordinatorStats.queuedRequests,
+            maxConcurrentRequests: coordinatorStats.maxConcurrent,
+            requestQueueSaturated: coordinatorStats.queuedRequests > 0 || coordinatorStats.saturationEvents > 0,
+            averageQueueWaitMs: coordinatorStats.averageWaitMs,
+            maxQueueWaitMs: coordinatorStats.maxWaitMs,
+            checkingChannels: sortedInfos.filter { $0.isChecking }.count,
+            degradedChannels: sortedInfos.filter { $0.consecutiveSegmentFailures > 0 }.count,
+            cloudflareBlockedChannels: sortedInfos.filter { $0.cloudflareBlockCount > 0 }.count,
+            activeRecordings: recordingStats.activeRecordings,
+            queuedRecordings: recordingStats.queuedRecordings,
+            maxConcurrentRecordings: recordingStats.maxConcurrent
+        )
+
+        return sortedInfos
     }
 
     func openRecordingFolder(username: String) async {
@@ -386,7 +538,12 @@ class ChannelManager: ObservableObject {
                 continue
             }
 
-            let channel = Channel(config: config, appConfig: appConfig, requestCoordinator: requestCoordinator)
+            let channel = Channel(
+                config: config,
+                appConfig: appConfig,
+                requestCoordinator: requestCoordinator,
+                recordingCoordinator: recordingCoordinator
+            )
             channels[config.username] = channel
             importedChannels.append(channel)
             imported += 1
@@ -471,7 +628,12 @@ class ChannelManager: ObservableObject {
                 continue
             }
 
-            let channel = Channel(config: config, appConfig: appConfig, requestCoordinator: requestCoordinator)
+            let channel = Channel(
+                config: config,
+                appConfig: appConfig,
+                requestCoordinator: requestCoordinator,
+                recordingCoordinator: recordingCoordinator
+            )
             channels[config.username] = channel
             imported += 1
         }
@@ -520,7 +682,12 @@ class ChannelManager: ObservableObject {
 
             // Populate all channels first so UI list renders immediately.
             for config in configs {
-                let channel = Channel(config: config, appConfig: appConfig, requestCoordinator: requestCoordinator)
+                let channel = Channel(
+                    config: config,
+                    appConfig: appConfig,
+                    requestCoordinator: requestCoordinator,
+                    recordingCoordinator: recordingCoordinator
+                )
                 channels[config.username] = channel
                 
                 if !config.isPaused {
@@ -677,6 +844,9 @@ class ChannelManager: ObservableObject {
             if error is TimeoutError {
                 await channel.addLogFromManager("Thumbnail generation timed out after 30 seconds, moving to next channel")
                 await FileLogger.shared.logThumbnailTimeout(channel: await channel.config.username)
+            } else {
+                await channel.addLogFromManager("Thumbnail generation failed during background backfill: \(error.localizedDescription)")
+                await FileLogger.shared.log("Thumbnail backfill: unexpected error - \(error.localizedDescription)", channel: username, level: "WARN")
             }
         }
     }

@@ -100,7 +100,42 @@ struct ChannelInfo: Identifiable {
     var logs: [String]
     var thumbnailPath: String?
     var isChecking: Bool
+    var isWaitingForRecordingSlot: Bool
     var isInvalid: Bool
+    var cloudflareBlockCount: Int
+    var segmentRetryCount: Int
+    var consecutiveSegmentFailures: Int
+    var lastSegmentFailureAt: String?
+}
+
+struct RuntimeDiagnostics {
+    var activeRequests: Int
+    var queuedRequests: Int
+    var maxConcurrentRequests: Int
+    var requestQueueSaturated: Bool
+    var averageQueueWaitMs: Int
+    var maxQueueWaitMs: Int
+    var checkingChannels: Int
+    var degradedChannels: Int
+    var cloudflareBlockedChannels: Int
+    var activeRecordings: Int
+    var queuedRecordings: Int
+    var maxConcurrentRecordings: Int
+
+    static let empty = RuntimeDiagnostics(
+        activeRequests: 0,
+        queuedRequests: 0,
+        maxConcurrentRequests: 0,
+        requestQueueSaturated: false,
+        averageQueueWaitMs: 0,
+        maxQueueWaitMs: 0,
+        checkingChannels: 0,
+        degradedChannels: 0,
+        cloudflareBlockedChannels: 0,
+        activeRecordings: 0,
+        queuedRecordings: 0,
+        maxConcurrentRecordings: 0
+    )
 }
 
 struct AppConfig: Codable {
@@ -113,7 +148,8 @@ struct AppConfig: Codable {
     var interval: Int = 1 // minutes
     var selectedBrowser: SupportedBrowser = .none
     var domain: String = "https://chaturbate.com/"
-    var maxConcurrentRequests: Int = 3 // max concurrent API requests across all channels
+    var maxConcurrentRequests: Int = 6 // max concurrent API requests across all channels
+    var maxConcurrentRecordings: Int = 0 // 0 means unlimited concurrent recordings
     
     // Custom decoding to handle missing selectedBrowser from old configs
     init(from decoder: Decoder) throws {
@@ -127,7 +163,8 @@ struct AppConfig: Codable {
         interval = try container.decodeIfPresent(Int.self, forKey: .interval) ?? 1
         selectedBrowser = try container.decodeIfPresent(SupportedBrowser.self, forKey: .selectedBrowser) ?? .none
         domain = try container.decodeIfPresent(String.self, forKey: .domain) ?? "https://chaturbate.com/"
-        maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 3
+        maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 6
+        maxConcurrentRecordings = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecordings) ?? 0
     }
     
     init() {
@@ -138,6 +175,7 @@ struct AppConfig: Codable {
         case framerate, resolution, outputDirectory, pattern
         case maxDuration, maxFilesize, interval, selectedBrowser
         case domain, maxConcurrentRequests
+        case maxConcurrentRecordings
     }
     
     func getOutputPath() -> String {

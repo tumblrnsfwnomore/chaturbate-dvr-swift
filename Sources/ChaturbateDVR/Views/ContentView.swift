@@ -185,6 +185,14 @@ struct ContentView: View {
 }
 
 struct AllChannelsGridView: View {
+    private struct StatusCounts {
+        let total: Int
+        let recording: Int
+        let paused: Int
+        let offline: Int
+        let invalid: Int
+    }
+
     @ObservedObject var manager: ChannelManager
     @Binding var selectedChannel: String?
     @Binding var searchText: String
@@ -212,17 +220,34 @@ struct AllChannelsGridView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
-                    VStack(spacing: 8) {
-                        TextField("Filter by username", text: $searchText)
-                            .textFieldStyle(.roundedBorder)
+                    VStack(spacing: 10) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            TextField("Filter by username", text: $searchText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 240, idealWidth: 380, maxWidth: 520)
 
-                        Picker("Status", selection: $statusFilter) {
-                            ForEach(ChannelStatusFilter.allCases) { filter in
-                                Text(filter.rawValue).tag(filter)
+                            Picker("Status", selection: $statusFilter) {
+                                ForEach(ChannelStatusFilter.allCases) { filter in
+                                    Text(filter.rawValue).tag(filter)
+                                }
                             }
+                            .pickerStyle(.menu)
+                            .frame(width: 170, alignment: .leading)
+
+                            Spacer(minLength: 0)
                         }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                countChip("Total", count: statusCounts.total, tint: .primary)
+                                countChip("Recording", count: statusCounts.recording, tint: .green)
+                                countChip("Paused", count: statusCounts.paused, tint: .orange)
+                                countChip("Offline", count: statusCounts.offline, tint: .secondary)
+                                countChip("Invalid", count: statusCounts.invalid, tint: .red)
+                                countChip("Showing", count: filteredChannelInfos.count, tint: .blue)
+                            }
+                            .padding(.vertical, 1)
+                        }
                     }
                     .padding(.horizontal, 16)
                     .padding(.top, 12)
@@ -290,22 +315,50 @@ struct AllChannelsGridView: View {
                 matchesSearch = info.username.localizedCaseInsensitiveContains(searchText)
             }
 
-            let matchesStatus: Bool
-            switch statusFilter {
-            case .all:
-                matchesStatus = true
-            case .recording:
-                matchesStatus = info.isOnline && !info.isPaused && !info.isInvalid
-            case .paused:
-                matchesStatus = info.isPaused && !info.isInvalid
-            case .offline:
-                matchesStatus = !info.isOnline && !info.isPaused && !info.isInvalid
-            case .invalid:
-                matchesStatus = info.isInvalid
-            }
+            let matchesStatus = matchesStatusFilter(info, filter: statusFilter)
 
             return matchesSearch && matchesStatus
         }
+    }
+
+    private var statusCounts: StatusCounts {
+        StatusCounts(
+            total: channelInfos.count,
+            recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
+            paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
+            offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
+            invalid: channelInfos.filter { matchesStatusFilter($0, filter: .invalid) }.count
+        )
+    }
+
+    private func matchesStatusFilter(_ info: ChannelInfo, filter: ChannelStatusFilter) -> Bool {
+        switch filter {
+        case .all:
+            return true
+        case .recording:
+            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
+        case .paused:
+            return info.isPaused && !info.isInvalid
+        case .offline:
+            return !info.isOnline && !info.isPaused && !info.isInvalid
+        case .invalid:
+            return info.isInvalid
+        }
+    }
+
+    private func countChip(_ title: String, count: Int, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+            Text("\(count)")
+                .font(.caption)
+                .fontWeight(.semibold)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(tint.opacity(0.12))
+        .foregroundColor(tint)
+        .clipShape(Capsule())
     }
 }
 
@@ -314,10 +367,13 @@ struct ChannelPreviewCard: View {
     let info: ChannelInfo
     let isSelected: Bool
 
-    private var isRecording: Bool { info.isOnline && !info.isPaused }
+    private var isWaitingForRecordingSlot: Bool { info.isWaitingForRecordingSlot }
+    private var isWaitingOnline: Bool { isWaitingForRecordingSlot && info.isOnline }
+    private var isRecording: Bool { info.isOnline && !info.isPaused && !isWaitingForRecordingSlot }
     private var isPausedOnline: Bool { info.isOnline && info.isPaused }
     private var isOffline: Bool { !info.isOnline }
     private var isInvalid: Bool { info.isInvalid }
+    private var isDegraded: Bool { info.consecutiveSegmentFailures > 0 }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -328,8 +384,8 @@ struct ChannelPreviewCard: View {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .saturation(isRecording ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
-                        .opacity(isRecording ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
+                        .saturation((isRecording || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
+                        .opacity((isRecording || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
                         .overlay(
@@ -338,6 +394,8 @@ struct ChannelPreviewCard: View {
                                     Color.black.opacity(0.2)
                                 } else if isPausedOnline {
                                     Color.orange.opacity(0.12)
+                                } else if isWaitingOnline {
+                                    Color.blue.opacity(0.12)
                                 }
                             }
                         )
@@ -387,7 +445,17 @@ struct ChannelPreviewCard: View {
             )
             .overlay(
                 Group {
-                    if isPausedOnline {
+                    if isWaitingForRecordingSlot {
+                        Text(info.isOnline ? "Waiting Live" : "Waiting")
+                            .font(.caption2)
+                            .fontWeight(.semibold)
+                            .padding(.horizontal, 7)
+                            .padding(.vertical, 3)
+                            .background(Color.blue.opacity(0.9))
+                            .foregroundColor(.white)
+                            .clipShape(Capsule())
+                            .padding(8)
+                    } else if isPausedOnline {
                         Text("Paused Live")
                             .font(.caption2)
                             .fontWeight(.semibold)
@@ -445,9 +513,30 @@ struct ChannelPreviewCard: View {
                         .background(Color.accentColor.opacity(0.12))
                         .cornerRadius(6)
                     } else {
-                        Text(info.isInvalid ? "Invalid (404)" : (info.isPaused ? (info.isOnline ? "Paused (Online)" : "Paused") : (info.isOnline ? "Recording" : "Offline")))
-                            .font(.caption)
-                            .foregroundColor(info.isInvalid ? .red : .secondary)
+                        HStack(spacing: 6) {
+                            Text(
+                                info.isInvalid
+                                    ? "Invalid (404)"
+                                    : (info.isPaused
+                                        ? (info.isOnline ? "Paused (Online)" : "Paused")
+                                        : (isWaitingForRecordingSlot
+                                            ? (info.isOnline ? "Waiting (Online)" : "Waiting (Rechecking)")
+                                            : (info.isOnline ? "Recording" : "Offline")))
+                            )
+                                .font(.caption)
+                                .foregroundColor(info.isInvalid ? .red : .secondary)
+
+                            if isDegraded {
+                                Text("Degraded")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.orange)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.14))
+                                    .cornerRadius(6)
+                            }
+                        }
                     }
                 }
                 .frame(minWidth: 98, alignment: .trailing)
@@ -491,6 +580,14 @@ struct ChannelListView: View {
         let color: Color
     }
 
+    private struct StatusCounts {
+        let total: Int
+        let recording: Int
+        let paused: Int
+        let offline: Int
+        let invalid: Int
+    }
+
     @ObservedObject var manager: ChannelManager
     @Binding var selectedChannel: String?
     @Binding var searchText: String
@@ -517,17 +614,72 @@ struct ChannelListView: View {
                 .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
-                    VStack(spacing: 8) {
-                        TextField("Filter by username", text: $searchText)
-                            .textFieldStyle(.roundedBorder)
+                    VStack(spacing: 10) {
+                        HStack(alignment: .firstTextBaseline, spacing: 10) {
+                            TextField("Filter by username", text: $searchText)
+                                .textFieldStyle(.roundedBorder)
+                                .frame(minWidth: 190, idealWidth: 250, maxWidth: 320)
 
-                        Picker("Status", selection: $statusFilter) {
-                            ForEach(ChannelStatusFilter.allCases) { filter in
-                                Text(filter.rawValue).tag(filter)
+                            Picker("Status", selection: $statusFilter) {
+                                ForEach(ChannelStatusFilter.allCases) { filter in
+                                    Text(filter.rawValue).tag(filter)
+                                }
                             }
+                            .pickerStyle(.menu)
+                            .frame(width: 150, alignment: .leading)
+
+                            Spacer(minLength: 0)
                         }
-                        .pickerStyle(.menu)
-                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        ScrollView(.horizontal, showsIndicators: false) {
+                            HStack(spacing: 8) {
+                                countChip("Total", count: statusCounts.total, tint: .primary)
+                                countChip("Recording", count: statusCounts.recording, tint: .green)
+                                countChip("Paused", count: statusCounts.paused, tint: .orange)
+                                countChip("Offline", count: statusCounts.offline, tint: .secondary)
+                                countChip("Invalid", count: statusCounts.invalid, tint: .red)
+                                countChip("Showing", count: filteredChannelInfos.count, tint: .blue)
+                            }
+                            .padding(.vertical, 1)
+                        }
+
+                        if manager.runtimeDiagnostics.requestQueueSaturated ||
+                            manager.runtimeDiagnostics.queuedRecordings > 0 ||
+                            manager.runtimeDiagnostics.cloudflareBlockedChannels > 0 ||
+                            manager.runtimeDiagnostics.degradedChannels > 0 {
+                            HStack(spacing: 8) {
+                                Image(systemName: "gauge.with.dots.needle.33percent")
+                                    .foregroundColor(.orange)
+
+                                Text("Request pressure: \(manager.runtimeDiagnostics.activeRequests)/\(manager.runtimeDiagnostics.maxConcurrentRequests) active, \(manager.runtimeDiagnostics.queuedRequests) queued")
+                                    .font(.caption2)
+                                    .lineLimit(1)
+
+                                let recordingCap = manager.runtimeDiagnostics.maxConcurrentRecordings == 0 ? "unlimited" : String(manager.runtimeDiagnostics.maxConcurrentRecordings)
+                                Text("Recordings: \(manager.runtimeDiagnostics.activeRecordings)/\(recordingCap), \(manager.runtimeDiagnostics.queuedRecordings) waiting")
+                                    .font(.caption2)
+                                    .lineLimit(1)
+
+                                if manager.runtimeDiagnostics.cloudflareBlockedChannels > 0 {
+                                    Text("Cloudflare: \(manager.runtimeDiagnostics.cloudflareBlockedChannels)")
+                                        .font(.caption2)
+                                        .foregroundColor(.orange)
+                                }
+
+                                if manager.runtimeDiagnostics.degradedChannels > 0 {
+                                    Text("Degraded: \(manager.runtimeDiagnostics.degradedChannels)")
+                                        .font(.caption2)
+                                        .foregroundColor(.orange)
+                                }
+
+                                Spacer(minLength: 0)
+                            }
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 6)
+                            .background(Color.orange.opacity(0.12))
+                            .cornerRadius(8)
+                            .help("Avg queue wait: \(manager.runtimeDiagnostics.averageQueueWaitMs)ms, max observed: \(manager.runtimeDiagnostics.maxQueueWaitMs)ms")
+                        }
                     }
                     .padding(.horizontal, 10)
                     .padding(.top, 10)
@@ -652,22 +804,50 @@ struct ChannelListView: View {
                 matchesSearch = info.username.localizedCaseInsensitiveContains(searchText)
             }
 
-            let matchesStatus: Bool
-            switch statusFilter {
-            case .all:
-                matchesStatus = true
-            case .recording:
-                matchesStatus = info.isOnline && !info.isPaused && !info.isInvalid
-            case .paused:
-                matchesStatus = info.isPaused && !info.isInvalid
-            case .offline:
-                matchesStatus = !info.isOnline && !info.isPaused && !info.isInvalid
-            case .invalid:
-                matchesStatus = info.isInvalid
-            }
+            let matchesStatus = matchesStatusFilter(info, filter: statusFilter)
 
             return matchesSearch && matchesStatus
         }
+    }
+
+    private var statusCounts: StatusCounts {
+        StatusCounts(
+            total: channelInfos.count,
+            recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
+            paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
+            offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
+            invalid: channelInfos.filter { matchesStatusFilter($0, filter: .invalid) }.count
+        )
+    }
+
+    private func matchesStatusFilter(_ info: ChannelInfo, filter: ChannelStatusFilter) -> Bool {
+        switch filter {
+        case .all:
+            return true
+        case .recording:
+            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
+        case .paused:
+            return info.isPaused && !info.isInvalid
+        case .offline:
+            return !info.isOnline && !info.isPaused && !info.isInvalid
+        case .invalid:
+            return info.isInvalid
+        }
+    }
+
+    private func countChip(_ title: String, count: Int, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+            Text("\(count)")
+                .font(.caption)
+                .fontWeight(.semibold)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(tint.opacity(0.12))
+        .foregroundColor(tint)
+        .clipShape(Capsule())
     }
 
     private func sortKey(from log: String) -> Int {
@@ -720,6 +900,18 @@ struct ChannelRowView: View {
     private var isInvalid: Bool {
         info.isInvalid
     }
+
+    private var isDegraded: Bool {
+        info.consecutiveSegmentFailures > 0
+    }
+
+    private var hasCloudflarePressure: Bool {
+        info.cloudflareBlockCount > 0
+    }
+
+    private var isWaitingForRecordingSlot: Bool {
+        info.isWaitingForRecordingSlot
+    }
     
     var body: some View {
         HStack(spacing: 12) {
@@ -746,9 +938,37 @@ struct ChannelRowView: View {
                         Text("Invalid (404)")
                     } else if info.isPaused {
                         Text(info.isOnline ? "Paused (Online)" : "Paused")
+                    } else if isWaitingForRecordingSlot {
+                        HStack(spacing: 4) {
+                            ProgressView()
+                                .controlSize(.mini)
+                            Text(info.isOnline ? "Waiting For Slot (Online)" : "Waiting For Slot (Rechecking)")
+                        }
+                        .font(.caption2)
+                        .foregroundColor(.blue)
                     } else if info.isOnline {
                         Label(info.duration, systemImage: "clock")
                         Label(info.filesize, systemImage: "doc")
+                        if isDegraded {
+                            Text("Degraded")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.14))
+                                .cornerRadius(6)
+                        }
+                        if hasCloudflarePressure {
+                            Text("CF x\(info.cloudflareBlockCount)")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.14))
+                                .cornerRadius(6)
+                        }
                     } else {
                         Text("Offline")
                     }
@@ -953,6 +1173,17 @@ struct ChannelDetailView: View {
                 Text(info.isInvalid ? "Invalid (404)" : (info.isPaused ? (info.isOnline ? "Paused (Online)" : "Paused") : (info.isOnline ? "Recording" : "Offline")))
                     .font(.headline)
                     .foregroundColor(info.isInvalid ? .red : .primary)
+
+                if info.consecutiveSegmentFailures > 0 {
+                    Text("Degraded")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.orange.opacity(0.14))
+                        .cornerRadius(7)
+                }
             }
 
             ChannelInfoView(info: info)
@@ -1666,6 +1897,34 @@ struct ChannelInfoView: View {
                         .foregroundColor(.secondary)
                     Spacer()
                     Text(lastOnlineAt)
+                }
+                .padding(.horizontal, 4)
+            }
+
+            HStack {
+                Text("Segment Retries:")
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(info.segmentRetryCount)")
+            }
+            .padding(.horizontal, 4)
+
+            HStack {
+                Text("Consecutive Segment Failures:")
+                    .foregroundColor(.secondary)
+                Spacer()
+                Text("\(info.consecutiveSegmentFailures)")
+                    .foregroundColor(info.consecutiveSegmentFailures > 0 ? .orange : .primary)
+            }
+            .padding(.horizontal, 4)
+
+            if let lastFailureAt = info.lastSegmentFailureAt {
+                HStack {
+                    Text("Last Segment Failure:")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(lastFailureAt)
+                        .foregroundColor(.orange)
                 }
                 .padding(.horizontal, 4)
             }

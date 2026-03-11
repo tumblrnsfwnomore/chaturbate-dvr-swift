@@ -5,9 +5,12 @@ import AppKit
 actor Channel {
     private static let pausedPreviewMinInterval: TimeInterval = 180
     private static let pausedOnlineStickyDuration: TimeInterval = 60
+    private static let degradedRecoveryWindowSeconds: TimeInterval = 60
     private static let pausedPreviewMaxSegmentBytes = 6 * 1024 * 1024
     private static let recordingPreviewWindowSeconds: TimeInterval = 30
     private static let recordingPreviewMaxBytes = 12 * 1024 * 1024
+    private static let waitingStatusCheckIntervalSeconds: TimeInterval = 12
+    private static let waitingPreviewMinInterval: TimeInterval = 20
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -24,29 +27,40 @@ actor Channel {
     private(set) var currentFilename: String?
     private(set) var thumbnailPath: String?
     private(set) var isChecking: Bool = false
+    private(set) var isWaitingForRecordingSlot: Bool = false
     private(set) var isInvalid: Bool
     
     private var currentFile: FileHandle?
     private var monitoringTask: Task<Void, Never>?
+    private var waitingForSlotStatusTask: Task<Void, Never>?
     private let client: ChaturbateClient
     private let appConfig: AppConfig
     private var lastThumbnailTime: Date = Date.distantPast
     private var lastPausedPreviewTime: Date = Date.distantPast
+    private var lastWaitingPreviewTime: Date = Date.distantPast
     private var isRefreshingPausedPreview: Bool = false
+    private var isRefreshingWaitingPreview: Bool = false
     private var pausedOnlineStickyUntil: Date?
     private var recentPreviewSegments: [PreviewSegmentChunk] = []
     private var recentPreviewDuration: Double = 0
     private var recentPreviewBytes: Int = 0
     private var recordingPreviewTempPath: String?
+    private var lastPreviewFailureLogAt: Date = Date.distantPast
     private var cloudflareBlockCount: Int = 0
+    private var segmentRetryCount: Int = 0
+    private var consecutiveSegmentFailures: Int = 0
+    private var lastSegmentFailureAt: Date?
+    private var degradedRecoveryStartedAt: Date?
     private let requestCoordinator: RequestCoordinator
+    private let recordingCoordinator: RecordingCoordinator
     private var isFirstCheck: Bool = true
     
-    init(config: ChannelConfig, appConfig: AppConfig, requestCoordinator: RequestCoordinator) {
+    init(config: ChannelConfig, appConfig: AppConfig, requestCoordinator: RequestCoordinator, recordingCoordinator: RecordingCoordinator) {
         self.config = config
         self.appConfig = appConfig
         self.client = ChaturbateClient(config: appConfig)
         self.requestCoordinator = requestCoordinator
+        self.recordingCoordinator = recordingCoordinator
         self.isInvalid = config.isInvalid
         
         // Load existing thumbnail if available
@@ -70,8 +84,11 @@ actor Channel {
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
         monitoringTask?.cancel()
         monitoringTask = nil
+        waitingForSlotStatusTask?.cancel()
+        waitingForSlotStatusTask = nil
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
+        isWaitingForRecordingSlot = false
         if wasOnline {
             addLog("Channel paused (kept as paused-online for up to 1 minute)")
         } else {
@@ -95,7 +112,10 @@ actor Channel {
         pausedOnlineStickyUntil = nil
         monitoringTask?.cancel()
         monitoringTask = nil
+        waitingForSlotStatusTask?.cancel()
+        waitingForSlotStatusTask = nil
         isOnline = false
+        isWaitingForRecordingSlot = false
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
         cleanupThumbnail()
@@ -166,7 +186,12 @@ actor Channel {
             logs: Array(logs.suffix(100)),
             thumbnailPath: thumbnailPath,
             isChecking: isChecking,
-            isInvalid: isInvalid
+            isWaitingForRecordingSlot: isWaitingForRecordingSlot,
+            isInvalid: isInvalid,
+            cloudflareBlockCount: cloudflareBlockCount,
+            segmentRetryCount: segmentRetryCount,
+            consecutiveSegmentFailures: consecutiveSegmentFailures,
+            lastSegmentFailureAt: lastSegmentFailureAt.map { formatter.string(from: $0) }
         )
     }
 
@@ -228,7 +253,6 @@ actor Channel {
                     break
                 }
             }
-            isOnline = false
             let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
             if stickyActive {
                 // Preserve paused-online state briefly for channels that were
@@ -239,6 +263,7 @@ actor Channel {
                 }
             } else {
                 pausedOnlineStickyUntil = nil
+                markOfflineAndClearDegradedState()
                 if wasOnline {
                     addLog("Background check: channel went offline")
                 }
@@ -336,6 +361,7 @@ actor Channel {
                         addLog("Channel returned 404 (invalid/deleted). Retrying in \(formatWaitTime(waitTime))")
                         cloudflareBlockCount = 0
                     case .channelOffline, .privateStream:
+                        markOfflineAndClearDegradedState()
                         if isFirstCheck {
                             addLog("Channel is offline or private (initial check)")
                         } else {
@@ -387,47 +413,209 @@ actor Channel {
         if !config.isPaused {
             isOnline = false
         }
+        endWaitingForSlotMonitoring()
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
     }
     
     private func recordStream() async throws {
-        // Acquire slot from rate limiter before making request
-        await requestCoordinator.acquireSlot()
         isChecking = true
-        defer {
-            Task {
-                await requestCoordinator.releaseSlot()
-            }
+
+        let stream = try await withRequestSlot {
+            try await client.getStream(username: config.username)
         }
-        
-        let stream = try await client.getStream(username: config.username)
         markChannelValid()
         
         // Check is complete, now we're in recording mode
         isChecking = false
         
-        streamedAt = Date()
-        sequence = 0
-        
-        try await nextFile()
-        defer {
-            isOnline = false
-            closeCurrentFile(resetStats: true)
-            clearRecordingPreviewState(removeTempFile: true)
+        let playlist = try await withRequestSlot {
+            try await client.getPlaylist(
+                hlsSource: stream.hlsSource,
+                resolution: config.resolution,
+                framerate: config.framerate
+            )
         }
-        
-        let playlist = try await client.getPlaylist(
-            hlsSource: stream.hlsSource,
-            resolution: config.resolution,
-            framerate: config.framerate
-        )
-        
+
+        beginWaitingForSlotMonitoring(initialHlsSource: stream.hlsSource)
+
+        try await withRecordingSlot {
+            endWaitingForSlotMonitoring()
+
+            streamedAt = Date()
+            sequence = 0
+
+            try await nextFile()
+            defer {
+                // Preserve paused-live state after a user pause until paused probes settle.
+                if config.isPaused {
+                    let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
+                    if !stickyActive {
+                        isOnline = false
+                    }
+                } else {
+                    isOnline = false
+                }
+                closeCurrentFile(resetStats: true)
+                clearRecordingPreviewState(removeTempFile: true)
+            }
+
+            isOnline = true
+            markLastOnlineNow()
+            addLog("Recording slot acquired")
+            addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps)")
+
+            try await watchSegments(playlist: playlist)
+        }
+
+        endWaitingForSlotMonitoring()
+    }
+
+    private func beginWaitingForSlotMonitoring(initialHlsSource: String) {
+        waitingForSlotStatusTask?.cancel()
+        isWaitingForRecordingSlot = true
+        // We already confirmed stream availability before queueing for a slot.
         isOnline = true
         markLastOnlineNow()
-        addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps)")
-        
-        try await watchSegments(playlist: playlist)
+        addLog("Waiting for available recording slot")
+
+        waitingForSlotStatusTask = Task(priority: .background) { [weak self] in
+            guard let self else { return }
+            var latestHlsSource = initialHlsSource
+
+            await self.refreshWaitingForSlotState(hlsSource: latestHlsSource)
+
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: UInt64(Self.waitingStatusCheckIntervalSeconds * 1_000_000_000))
+                if Task.isCancelled { break }
+
+                if let refreshed = await self.probeWaitingStreamStatus() {
+                    latestHlsSource = refreshed
+                    await self.refreshWaitingForSlotState(hlsSource: latestHlsSource)
+                }
+            }
+        }
+    }
+
+    private func endWaitingForSlotMonitoring() {
+        waitingForSlotStatusTask?.cancel()
+        waitingForSlotStatusTask = nil
+        isWaitingForRecordingSlot = false
+    }
+
+    // Returns an updated HLS source when stream probing succeeds.
+    private func probeWaitingStreamStatus() async -> String? {
+        guard isWaitingForRecordingSlot, !config.isPaused else { return nil }
+
+        isChecking = true
+        do {
+            let stream = try await withRequestSlot {
+                try await client.getStream(username: config.username)
+            }
+            isChecking = false
+            markChannelValid()
+            isOnline = true
+            markLastOnlineNow()
+            return stream.hlsSource
+        } catch {
+            isChecking = false
+
+            if let cbError = error as? ChaturbateError {
+                switch cbError {
+                case .invalidChannel:
+                    markChannelInvalid()
+                    markOfflineAndClearDegradedState()
+                    addLog("Waiting for slot: channel returned 404 (marked invalid)")
+                case .channelOffline, .privateStream:
+                    markOfflineAndClearDegradedState()
+                default:
+                    // Keep previous online state for transient failures.
+                    break
+                }
+            }
+
+            return nil
+        }
+    }
+
+    private func refreshWaitingForSlotState(hlsSource: String) async {
+        guard isWaitingForRecordingSlot else { return }
+        await updateWaitingChannelThumbnailIfNeeded(hlsSource: hlsSource)
+    }
+
+    private func updateWaitingChannelThumbnailIfNeeded(hlsSource: String) async {
+        let now = Date()
+        guard now.timeIntervalSince(lastWaitingPreviewTime) >= Self.waitingPreviewMinInterval else {
+            return
+        }
+
+        guard !isRefreshingWaitingPreview else {
+            return
+        }
+        isRefreshingWaitingPreview = true
+        // Throttle on attempts (not only successes) to avoid retry storms.
+        lastWaitingPreviewTime = now
+        defer { isRefreshingWaitingPreview = false }
+
+        do {
+            let playlist = try await client.getPlaylist(
+                hlsSource: hlsSource,
+                resolution: config.resolution,
+                framerate: config.framerate
+            )
+
+            let httpClient = HTTPClient(config: appConfig)
+            let mediaPlaylistContent = try await httpClient.get(playlist.playlistURL)
+            let segments = try M3U8Parser.parseMediaPlaylist(mediaPlaylistContent)
+            guard let latestSegment = segments.last else { return }
+
+            let segmentURL = resolveSegmentURL(latestSegment.uri, playlistURL: playlist.playlistURL)
+            let segmentData = try await downloadSegmentWithRetry(httpClient: httpClient, url: segmentURL, maxRetries: 2)
+
+            guard segmentData.count <= Self.pausedPreviewMaxSegmentBytes else {
+                return
+            }
+
+            let tempDir = NSTemporaryDirectory()
+            let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_waiting_preview.ts")
+            let tempSegmentURL = URL(fileURLWithPath: tempSegmentPath)
+
+            try segmentData.write(to: tempSegmentURL, options: .atomic)
+            defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
+
+            let success = await generateThumbnail(from: tempSegmentPath)
+            if success {
+                await FileLogger.shared.logLiveThumbnailSuccess(channel: config.username)
+            }
+        } catch {
+            // Waiting previews are best-effort and should not affect queue progression.
+            await FileLogger.shared.logLiveThumbnailFailure(channel: config.username, error: error.localizedDescription)
+        }
+    }
+
+    private func withRequestSlot<T>(_ operation: () async throws -> T) async throws -> T {
+        await requestCoordinator.acquireSlot()
+        do {
+            let result = try await operation()
+            await requestCoordinator.releaseSlot()
+            return result
+        } catch {
+            await requestCoordinator.releaseSlot()
+            throw error
+        }
+    }
+
+    private func withRecordingSlot<T>(_ operation: () async throws -> T) async throws -> T {
+        await recordingCoordinator.acquireSlot()
+        do {
+            try Task.checkCancellation()
+            let result = try await operation()
+            await recordingCoordinator.releaseSlot()
+            return result
+        } catch {
+            await recordingCoordinator.releaseSlot()
+            throw error
+        }
     }
     
     private func watchSegments(playlist: Playlist) async throws {
@@ -481,16 +669,69 @@ actor Channel {
     private func downloadSegmentWithRetry(httpClient: HTTPClient, url: String, maxRetries: Int) async throws -> Data {
         var lastError: Error?
         
-        for _ in 0..<maxRetries {
+        for attempt in 1...maxRetries {
             do {
-                return try await httpClient.getData(url)
+                let data = try await httpClient.getData(url)
+                if attempt > 1 {
+                    segmentRetryCount += (attempt - 1)
+                }
+                noteSuccessfulSegmentDownload(attempt: attempt)
+                return data
             } catch {
                 lastError = error
+                degradedRecoveryStartedAt = nil
+                if attempt < maxRetries {
+                    addLog("Segment download failed (attempt \(attempt)/\(maxRetries)); retrying")
+                }
                 try? await Task.sleep(nanoseconds: 600_000_000) // 600ms delay
             }
         }
+
+        noteFailedSegmentDownload()
+        addLog("Segment download failed after \(maxRetries) attempts")
         
         throw lastError ?? ChaturbateError.networkError("Failed to download segment")
+    }
+
+    private func markOfflineAndClearDegradedState() {
+        isOnline = false
+        clearDegradedState()
+    }
+
+    private func clearDegradedState() {
+        consecutiveSegmentFailures = 0
+        lastSegmentFailureAt = nil
+        degradedRecoveryStartedAt = nil
+    }
+
+    private func noteFailedSegmentDownload() {
+        consecutiveSegmentFailures += 1
+        lastSegmentFailureAt = Date()
+        degradedRecoveryStartedAt = nil
+    }
+
+    private func noteSuccessfulSegmentDownload(attempt: Int) {
+        guard consecutiveSegmentFailures > 0 else {
+            degradedRecoveryStartedAt = nil
+            return
+        }
+
+        // Consider the stream healthy only when segments arrive without retries.
+        guard attempt == 1 else {
+            degradedRecoveryStartedAt = nil
+            return
+        }
+
+        let now = Date()
+        if let recoveryStart = degradedRecoveryStartedAt {
+            if now.timeIntervalSince(recoveryStart) > Self.degradedRecoveryWindowSeconds {
+                clearDegradedState()
+                addLog("Cleared degraded status after 1 minute of stable segment downloads")
+            }
+            return
+        }
+
+        degradedRecoveryStartedAt = now
     }
     
     private func handleSegment(data: Data, duration: Double) async throws {
@@ -614,7 +855,7 @@ actor Channel {
                 try file.synchronize()
                 try file.close()
             } catch {
-                // Ignore close errors
+                addLog("Could not close recording file cleanly: \(error.localizedDescription)")
             }
 
             currentFile = nil
@@ -649,7 +890,11 @@ actor Channel {
         let previewsDir = tempRoot
             .appendingPathComponent("ChaturbateDVR")
             .appendingPathComponent("recording_previews")
-        try? FileManager.default.createDirectory(at: previewsDir, withIntermediateDirectories: true)
+        do {
+            try FileManager.default.createDirectory(at: previewsDir, withIntermediateDirectories: true)
+        } catch {
+            logPreviewFailureIfNeeded("Could not create recording preview temp directory: \(error.localizedDescription)")
+        }
 
         let path = previewsDir.appendingPathComponent("\(config.username)_preview.ts").path
         recordingPreviewTempPath = path
@@ -671,8 +916,16 @@ actor Channel {
             try merged.write(to: url, options: .atomic)
             return path
         } catch {
+            logPreviewFailureIfNeeded("Could not write recording preview temp file: \(error.localizedDescription)")
             return nil
         }
+    }
+
+    private func logPreviewFailureIfNeeded(_ message: String) {
+        let now = Date()
+        guard now.timeIntervalSince(lastPreviewFailureLogAt) >= 30 else { return }
+        lastPreviewFailureLogAt = now
+        addLog(message)
     }
 
     private func refreshLiveRecordingThumbnail() async -> Bool {

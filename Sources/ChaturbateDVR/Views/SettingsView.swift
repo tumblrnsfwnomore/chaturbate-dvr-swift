@@ -6,6 +6,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) var dismiss
     @State private var outputDirectory: String = ""
     @State private var showingDirectoryPicker = false
+    @State private var diagnosticsTimer: Timer?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -118,16 +119,46 @@ struct SettingsView: View {
                                     Stepper(value: Binding(
                                         get: { manager.appConfig.maxConcurrentRequests },
                                         set: {
-                                            manager.appConfig.maxConcurrentRequests = max(1, min(10, $0))
+                                            manager.appConfig.maxConcurrentRequests = max(1, min(30, $0))
                                             manager.saveAppConfig()
                                         }
-                                    ), in: 1...10) {
+                                    ), in: 1...30) {
                                         Text("\(manager.appConfig.maxConcurrentRequests)")
                                             .foregroundColor(.secondary)
                                     }
                                 }
                                 Text("Limit simultaneous API requests to avoid rate limiting")
                                     .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("Recommended now: \(recommendedRequestRange)")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Max Simultaneous Recordings")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    Stepper(value: Binding(
+                                        get: { manager.appConfig.maxConcurrentRecordings },
+                                        set: {
+                                            manager.appConfig.maxConcurrentRecordings = max(0, min(50, $0))
+                                            manager.saveAppConfig()
+                                        }
+                                    ), in: 0...50) {
+                                        Text(manager.appConfig.maxConcurrentRecordings == 0 ? "Unlimited" : "\(manager.appConfig.maxConcurrentRecordings)")
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Text("Cap active recordings separately from request slots. Set to 0 for unlimited.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                                Text("Recommended now: \(recommendedRecordingRange)")
+                                    .font(.caption2)
                                     .foregroundColor(.secondary)
                             }
 
@@ -216,8 +247,70 @@ struct SettingsView: View {
         }
         .onAppear {
             outputDirectory = manager.appConfig.outputDirectory
+            startDiagnosticsRefresh()
+        }
+        .onDisappear {
+            diagnosticsTimer?.invalidate()
+            diagnosticsTimer = nil
         }
         .frame(width: 620, height: 540)
+    }
+
+    private var recommendedRequestRange: String {
+        let current = max(1, manager.appConfig.maxConcurrentRequests)
+        let diagnostics = manager.runtimeDiagnostics
+
+        if diagnostics.cloudflareBlockedChannels > 0 {
+            let lower = max(2, current - 3)
+            let upper = max(lower + 1, min(12, current))
+            return "\(lower)-\(upper) (Cloudflare pressure)"
+        }
+
+        if diagnostics.queuedRequests > 0 || diagnostics.averageQueueWaitMs > 200 {
+            let lower = max(3, current)
+            let upper = min(30, max(lower + 2, current + 4))
+            return "\(lower)-\(upper)"
+        }
+
+        let lower = max(2, min(current, 8))
+        let upper = min(20, max(lower + 2, current + 2))
+        return "\(lower)-\(upper)"
+    }
+
+    private var recommendedRecordingRange: String {
+        let diagnostics = manager.runtimeDiagnostics
+        let requestCap = max(1, manager.appConfig.maxConcurrentRequests)
+        let current = manager.appConfig.maxConcurrentRecordings
+
+        if diagnostics.cloudflareBlockedChannels > 0 || diagnostics.degradedChannels > 0 {
+            let cap = max(1, requestCap)
+            return "1-\(cap)"
+        }
+
+        if diagnostics.queuedRecordings > 0 {
+            let base = current == 0 ? max(2, requestCap / 2) : current
+            let lower = max(2, base)
+            let upper = min(50, max(lower + 2, base + 5))
+            return "\(lower)-\(upper)"
+        }
+
+        let baseline = max(2, requestCap / 2)
+        let upper = min(50, max(baseline + 2, requestCap + 4))
+        return "\(baseline)-\(upper) (0 = unlimited if stable)"
+    }
+
+    private func startDiagnosticsRefresh() {
+        refreshDiagnostics()
+        diagnosticsTimer?.invalidate()
+        diagnosticsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
+            refreshDiagnostics()
+        }
+    }
+
+    private func refreshDiagnostics() {
+        Task { @MainActor in
+            _ = await manager.getAllChannelInfo()
+        }
     }
     
     private func chooseDirectory() {
