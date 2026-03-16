@@ -22,8 +22,25 @@ actor ChaturbateClient {
         }
 
         let body = String(data: data, encoding: .utf8) ?? ""
+        do {
+            return try parseStream(body)
+        } catch let cbError as ChaturbateError {
+            guard shouldTryHTMLFallback(for: cbError) else {
+                throw cbError
+            }
 
-        return try parseStream(body)
+            await FileLogger.shared.log("[stream] XHR probe classified as \(cbError.localizedDescription); retrying with HTML", channel: username)
+
+            do {
+                let htmlBody = try await httpClient.getHTML(url)
+                let stream = try parseStream(htmlBody)
+                await FileLogger.shared.log("[stream] HTML fallback succeeded", channel: username)
+                return stream
+            } catch {
+                await FileLogger.shared.log("[stream] HTML fallback failed; keeping XHR classification", channel: username, level: "WARN")
+                throw cbError
+            }
+        }
     }
 
     func validateChannel(username: String) async throws {
@@ -225,22 +242,31 @@ actor ChaturbateClient {
         }
 
         let room = try JSONDecoder().decode(RoomDossier.self, from: data)
+        let status = room.roomStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let hlsSource = room.hlsSource?.trimmingCharacters(in: .whitespacesAndNewlines)
 
-        if let status = room.roomStatus?.lowercased() {
-            if status == "offline" {
-                throw ChaturbateError.channelOffline
-            }
-            if status == "private" {
-                throw ChaturbateError.privateStream
-            }
+        // If an HLS source exists, treat the room as streamable even when
+        // room_status is noisy or briefly stale.
+        if let hlsSource, !hlsSource.isEmpty {
+            return Stream(hlsSource: hlsSource)
         }
 
-        guard let hlsSource = room.hlsSource?.trimmingCharacters(in: .whitespacesAndNewlines),
-              !hlsSource.isEmpty else {
-            throw ChaturbateError.channelOffline
+        if status == "private" {
+            throw ChaturbateError.privateStream
         }
 
-        return Stream(hlsSource: hlsSource)
+        throw ChaturbateError.channelOffline
+    }
+
+    private func shouldTryHTMLFallback(for error: ChaturbateError) -> Bool {
+        switch error {
+        case .privateStream,
+             .channelOffline,
+             .parsingError:
+            return true
+        default:
+            return false
+        }
     }
 
     private func fetchFollowedUsernamesFromRoomList(showType: String, debugLines: inout [String], progress: (@Sendable (String) -> Void)? = nil) async throws -> Set<String> {

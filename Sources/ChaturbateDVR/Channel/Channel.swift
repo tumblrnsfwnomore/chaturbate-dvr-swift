@@ -18,7 +18,7 @@ actor Channel {
     private static let noPersonOfflineCarryWindowSeconds: TimeInterval = 600
     private static let noPersonThenStaticConfirmSeconds: TimeInterval = 45
     private static let recordingStartNoPersonSamples: Int = 3
-    private static let recordingStartNoPersonRequiredMisses: Int = 2
+    private static let recordingStartNoPersonRequiredMisses: Int = 3
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -502,47 +502,83 @@ actor Channel {
         
         // Check is complete, now we're in recording mode
         isChecking = false
-        
-        let playlist = try await withRequestSlot {
-            try await client.getPlaylist(
-                hlsSource: stream.hlsSource,
-                resolution: config.resolution,
-                framerate: config.framerate
-            )
-        }
 
-        beginWaitingForSlotMonitoring(initialHlsSource: stream.hlsSource)
+        var activeHlsSource = stream.hlsSource
+        var setupAttempt = 0
 
-        try await withRecordingSlot {
-            endWaitingForSlotMonitoring()
-
-            streamedAt = Date()
-            sequence = 0
-
-            try await nextFile()
-            defer {
-                // Preserve paused-live state after a user pause until paused probes settle.
-                if config.isPaused {
-                    let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
-                    if !stickyActive {
-                        isOnline = false
-                    }
-                } else {
-                    isOnline = false
+        while true {
+            setupAttempt += 1
+            do {
+                let playlist = try await withRequestSlot {
+                    try await client.getPlaylist(
+                        hlsSource: activeHlsSource,
+                        resolution: config.resolution,
+                        framerate: config.framerate
+                    )
                 }
-                closeCurrentFile(resetStats: true)
-                clearRecordingPreviewState(removeTempFile: true)
+
+                beginWaitingForSlotMonitoring(initialHlsSource: activeHlsSource)
+
+                try await withRecordingSlot {
+                    endWaitingForSlotMonitoring()
+
+                    streamedAt = Date()
+                    sequence = 0
+
+                    try await nextFile()
+                    defer {
+                        // Preserve paused-live state after a user pause until paused probes settle.
+                        if config.isPaused {
+                            let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
+                            if !stickyActive {
+                                isOnline = false
+                            }
+                        } else {
+                            isOnline = false
+                        }
+                        closeCurrentFile(resetStats: true)
+                        clearRecordingPreviewState(removeTempFile: true)
+                    }
+
+                    isOnline = true
+                    markLastOnlineNow()
+                    addLog("Recording slot acquired")
+                    addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps)")
+
+                    try await watchSegments(playlist: playlist)
+                }
+
+                endWaitingForSlotMonitoring()
+                return
+            } catch let cbError as ChaturbateError {
+                endWaitingForSlotMonitoring()
+
+                let isRetryableSetupError: Bool
+                switch cbError {
+                case .privateStream, .channelOffline:
+                    isRetryableSetupError = true
+                default:
+                    isRetryableSetupError = false
+                }
+
+                if isRetryableSetupError, setupAttempt < 2, !config.isPaused {
+                    addLog("Stream setup returned offline/private, refreshing stream source and retrying once")
+                    let refreshed = try await withRequestSlot {
+                        try await client.getStream(username: config.username)
+                    }
+                    activeHlsSource = refreshed.hlsSource
+                    markChannelValid()
+                    isOnline = true
+                    markLastOnlineNow()
+                    continue
+                }
+
+                throw cbError
+            } catch {
+                endWaitingForSlotMonitoring()
+                throw error
             }
-
-            isOnline = true
-            markLastOnlineNow()
-            addLog("Recording slot acquired")
-            addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps)")
-
-            try await watchSegments(playlist: playlist)
         }
-
-        endWaitingForSlotMonitoring()
     }
 
     private func beginWaitingForSlotMonitoring(initialHlsSource: String) {
@@ -716,6 +752,12 @@ actor Channel {
                 httpClient: httpClient
             )
             let segments = try M3U8Parser.parseMediaPlaylist(content)
+
+            if lastSeq == -1, let latestSequence = segments.last?.sequenceNumber {
+                // On startup, begin from the latest published segment to avoid
+                // failing on older entries that may already be expired.
+                lastSeq = max(-1, latestSequence - 1)
+            }
             
             for segment in segments {
                 if Task.isCancelled || config.isPaused {
@@ -1536,7 +1578,11 @@ actor Channel {
         guard breakEnforced else { return false }
 
         do {
-            let checkResult = try await runPreflightFrameAnalysis(hlsSource: hlsSource, purpose: "break_recheck")
+            let checkResult = try await runPreflightFrameAnalysis(
+                hlsSource: hlsSource,
+                purpose: "break_recheck",
+                analyzeForBreak: true
+            )
             if checkResult.breakDetected {
                 return true
             }
@@ -1567,7 +1613,8 @@ actor Channel {
                 lastBreakAnalysisAt = nil
                 let checkResult = try await runPreflightFrameAnalysis(
                     hlsSource: hlsSource,
-                    purpose: "start_gate_\(index)"
+                    purpose: "start_gate_\(index)",
+                    analyzeForBreak: false
                 )
 
                 if checkResult.breakDetected {
@@ -1600,7 +1647,11 @@ actor Channel {
         return false
     }
 
-    private func runPreflightFrameAnalysis(hlsSource: String, purpose: String) async throws -> ThumbnailGenerationResult {
+    private func runPreflightFrameAnalysis(
+        hlsSource: String,
+        purpose: String,
+        analyzeForBreak: Bool
+    ) async throws -> ThumbnailGenerationResult {
         let playlist = try await withRequestSlot {
             try await client.getPlaylist(
                 hlsSource: hlsSource,
@@ -1644,7 +1695,13 @@ actor Channel {
         try previewData.write(to: tempSegmentURL, options: .atomic)
         defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
 
-        return await generateThumbnailDetailed(from: tempSegmentPath, analyzeForBreak: true)
+        if !analyzeForBreak {
+            let personDetected = await detectHumanPresence(inVideoAtPath: tempSegmentPath)
+            latestPersonDetected = personDetected
+            lastPersonSeenAt = personDetected ? Date() : nil
+        }
+
+        return await generateThumbnailDetailed(from: tempSegmentPath, analyzeForBreak: analyzeForBreak)
     }
 
     private func hasRecoveredFromBreak() -> Bool {
@@ -1827,19 +1884,80 @@ actor Channel {
 
     private func detectHumanPresence(in image: CGImage) -> Bool {
         let faceRequest = VNDetectFaceRectanglesRequest()
-        let bodyRequest = VNDetectHumanRectanglesRequest()
-        bodyRequest.upperBodyOnly = false
+        let fullBodyRequest = VNDetectHumanRectanglesRequest()
+        fullBodyRequest.upperBodyOnly = false
+        let upperBodyRequest = VNDetectHumanRectanglesRequest()
+        upperBodyRequest.upperBodyOnly = true
 
         let handler = VNImageRequestHandler(cgImage: image, options: [:])
         do {
-            try handler.perform([faceRequest, bodyRequest])
+            try handler.perform([faceRequest, fullBodyRequest, upperBodyRequest])
             let hasFace = !(faceRequest.results?.isEmpty ?? true)
-            let hasBody = !(bodyRequest.results?.isEmpty ?? true)
-            return hasFace || hasBody
+            let hasFullBody = !(fullBodyRequest.results?.isEmpty ?? true)
+            let hasUpperBody = !(upperBodyRequest.results?.isEmpty ?? true)
+            return hasFace || hasFullBody || hasUpperBody
         } catch {
             // Fail open to avoid false positives if Vision cannot analyze the frame.
             return true
         }
+    }
+
+    private func detectHumanPresence(inVideoAtPath videoPath: String) async -> Bool {
+        guard FileManager.default.fileExists(atPath: videoPath) else {
+            return true
+        }
+
+        let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.maximumSize = CGSize(width: 960, height: 540)
+        imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 0.8, preferredTimescale: 600)
+        imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 0.8, preferredTimescale: 600)
+
+        let duration: CMTime
+        do {
+            duration = try await withTimeoutInterval(4.0) {
+                try await asset.load(.duration)
+            }
+        } catch {
+            duration = CMTime(seconds: 3.0, preferredTimescale: 600)
+        }
+
+        let durationSeconds = max(0.0, duration.seconds.isFinite ? duration.seconds : 0.0)
+        let candidateSeconds: [Double]
+        if durationSeconds > 0 {
+            candidateSeconds = [
+                min(0.5, durationSeconds),
+                min(1.4, durationSeconds),
+                max(0.0, durationSeconds * 0.5),
+                max(0.0, durationSeconds - 0.35)
+            ]
+        } else {
+            candidateSeconds = [0.0, 0.6, 1.2]
+        }
+
+        var analyzedFrame = false
+        var visitedTimes = Set<Int>()
+        for seconds in candidateSeconds {
+            let key = Int((seconds * 10.0).rounded())
+            if visitedTimes.contains(key) {
+                continue
+            }
+            visitedTimes.insert(key)
+
+            let targetTime = CMTime(seconds: seconds, preferredTimescale: 600)
+            guard let cgImage = try? imageGenerator.copyCGImage(at: targetTime, actualTime: nil) else {
+                continue
+            }
+
+            analyzedFrame = true
+            if detectHumanPresence(in: cgImage) {
+                return true
+            }
+        }
+
+        // If we couldn't decode any frame, fail open rather than block recording start.
+        return analyzedFrame ? false : true
     }
     
     private func generateThumbnail(from videoPath: String) async -> Bool {
