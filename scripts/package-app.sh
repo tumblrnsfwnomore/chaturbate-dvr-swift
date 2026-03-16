@@ -139,6 +139,10 @@ iconutil -c icns "$ICONSET_DIR" -o "$RESOURCES_DIR/${ICON_NAME}.icns"
 cp "$EXECUTABLE_PATH" "$MACOS_DIR/$APP_NAME"
 chmod +x "$MACOS_DIR/$APP_NAME"
 
+# Copy web server resources
+mkdir -p "$RESOURCES_DIR/WebServer"
+cp "$ROOT_DIR/Sources/ChaturbateDVR/WebServer/dashboard.html" "$RESOURCES_DIR/WebServer/"
+
 cat > "$PLIST_PATH" <<'EOF'
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">

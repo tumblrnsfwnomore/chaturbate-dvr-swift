@@ -16,7 +16,10 @@ let package = Package(
     targets: [
         .executableTarget(
             name: "ChaturbateDVR",
-            dependencies: []
+            dependencies: [],
+            resources: [
+                .copy("WebServer/dashboard.html")
+            ]
         ),
     ]
 )

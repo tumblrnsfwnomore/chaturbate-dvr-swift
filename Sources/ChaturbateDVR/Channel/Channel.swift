@@ -415,6 +415,10 @@ actor Channel {
                         cloudflareBlockCount = 0
                     case .channelOffline:
                         let breakReason = consumePendingBreakOfflineReason()
+                        if breakReason != nil {
+                            // Retry sooner for break-gated holds so recovery is detected quickly.
+                            waitTime = min(waitTime, 45)
+                        }
                         markOfflineAndClearDegradedState()
                         if let breakReason {
                             addLog("\(breakReason). Treating stream as offline, trying again in \(formatWaitTime(waitTime))")
@@ -1596,8 +1600,11 @@ actor Channel {
             pendingBreakOfflineReason = "Break hold: still waiting for clear person+motion recovery"
             return true
         } catch {
-            pendingBreakOfflineReason = "Break hold: recheck failed (\(error.localizedDescription))"
-            return true
+            // Fail open on recheck errors. If the stream is still on break,
+            // active recording analysis will enforce the break again quickly.
+            pendingBreakOfflineReason = nil
+            addLog("Break hold: recheck failed (\(error.localizedDescription)); allowing recording attempt")
+            return false
         }
     }
 

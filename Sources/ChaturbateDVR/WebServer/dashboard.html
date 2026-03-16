@@ -1,0 +1,240 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="ChaturbateDVR">
+<meta name="theme-color" content="#0f0f0f">
+<link rel="manifest" href="/manifest.json">
+<link rel="icon" type="image/svg+xml" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 192 192'><rect fill='%230f0f0f' width='192' height='192'/><circle cx='96' cy='96' r='72' fill='%23a78bfa'/><polygon points='80,64 128,96 80,128' fill='%230f0f0f'/></svg>">
+<link rel="apple-touch-icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 180 180'><rect fill='%231a1a1a' width='180' height='180' rx='40'/><circle cx='90' cy='90' r='54' fill='%23a78bfa'/><polygon points='72,60 120,90 72,120' fill='%231a1a1a'/></svg>">
+<title>ChaturbateDVR</title>
+<style>
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{background:#0f0f0f;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-top:60px;padding-bottom:60px}
+header{background:#1a1a1a;padding:14px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #252525;position:fixed;top:0;left:0;right:0;z-index:20}
+header h1{font-size:16px;font-weight:600;flex:1}
+#meta{font-size:12px;color:#666;display:flex;align-items:center;gap:6px}
+#dot{width:6px;height:6px;border-radius:50%;background:#ef4444;flex-shrink:0;transition:background .3s}
+#dot.ok{background:#22c55e}
+#filterBtn{background:transparent;border:1px solid #383838;color:#999;padding:6px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:all .15s}
+#filterBtn:hover{border-color:#666;color:#ccc}
+#filterPanel{position:fixed;top:60px;left:0;right:0;background:#1a1a1a;border-bottom:1px solid #252525;padding:16px;display:none;z-index:19}
+#filterPanel.open{display:block}
+.filter-group{margin-bottom:14px}
+.filter-group:last-child{margin-bottom:0}
+.filter-label{font-size:12px;font-weight:600;color:#999;margin-bottom:6px;display:block}
+.filter-options{display:flex;flex-wrap:wrap;gap:8px}
+.filter-btn{background:transparent;border:1px solid #383838;color:#999;padding:6px 12px;border-radius:20px;font-size:11px;cursor:pointer;transition:all .15s}
+.filter-btn.active{background:#a78bfa;color:#0f0f0f;border-color:#a78bfa}
+.filter-btn:hover{border-color:#666}
+#searchBox{width:100%;padding:8px 12px;background:#0f0f0f;border:1px solid #383838;color:#e5e5e5;border-radius:6px;font-size:14px;margin-bottom:12px}
+#searchBox::placeholder{color:#666}
+body{scroll-padding-top:140px}
+.grid{display:grid;grid-template-columns:1fr;gap:12px;padding:16px}
+.card{background:#1a1a1a;border-radius:10px;overflow:hidden;border:1px solid #252525;transition:border-color .15s;cursor:pointer;display:flex;flex-direction:column}
+.card:active{border-color:#383838}
+.thumb-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#1e1e1e;overflow:hidden}
+.thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
+.placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#2e2e2e}
+.info{padding:12px;display:flex;flex-direction:column;flex:1;min-height:110px}
+.username{font-size:14px;font-weight:600;margin-bottom:8px;word-break:break-word}
+.badges{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
+.badge{font-size:10px;font-weight:600;padding:3px 8px;border-radius:99px;white-space:nowrap}
+.b-rec {background:rgba(124,58,237,.18);color:#a78bfa;border:1px solid rgba(124,58,237,.5)}
+.b-on  {background:rgba(34,197,94,.12); color:#4ade80;border:1px solid rgba(34,197,94,.4)}
+.b-wait{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.4)}
+.b-off {background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
+.b-paus{background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
+.b-np  {background:rgba(239,68,68,.12); color:#f87171;border:1px solid rgba(239,68,68,.35)}
+.meta{font-size:12px;color:#666;line-height:1.6;margin-bottom:8px}
+.actions{display:flex;gap:8px;margin-top:auto}
+.actions button{font-size:12px;font-weight:500;padding:6px 12px;border-radius:5px;border:1px solid;cursor:pointer;background:transparent;flex:1;transition:opacity .15s}
+.actions button:active{opacity:.6}
+.actions button:disabled{opacity:.35;cursor:not-allowed}
+.btn-pause {color:#facc15;border-color:rgba(234,179,8,.45)}
+.btn-resume{color:#4ade80;border-color:rgba(34,197,94,.45)}
+#empty{text-align:center;color:#444;padding:60px 20px;font-size:15px}
+#toTop{position:fixed;bottom:20px;right:20px;width:40px;height:40px;background:#a78bfa;color:#0f0f0f;border:none;border-radius:50%;cursor:pointer;font-size:18px;display:none;z-index:15;font-weight:600;transition:all .2s}
+#toTop:active{transform:scale(.95)}
+@media (min-width:768px) {
+  body{padding-top:0;padding-bottom:20px}
+  header{position:sticky;padding:14px 20px}
+  #filterBtn{display:none}
+  #filterPanel{position:sticky;top:59px;left:auto;right:auto;display:flex !important;gap:12px;align-items:center;flex-wrap:wrap;background:#151515;border-bottom:1px solid #252525;padding:12px 20px;z-index:19}
+  .grid{grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;padding:20px}
+  .card:hover{border-color:#383838}
+  .actions button{font-size:11px;padding:4px 10px}
+  #toTop{width:36px;height:36px;font-size:16px}
+  .filter-group{margin:0}
+  .filter-label{display:none}
+  .filter-options{gap:6px}
+  #searchBox{width:240px;max-width:100%;padding:6px 10px;font-size:12px;margin-bottom:0}
+}
+</style>
+</head>
+<body>
+<header>
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+    <circle cx="12" cy="12" r="10"/><polygon points="10,8 16,12 10,16"/>
+  </svg>
+  <h1>ChaturbateDVR</h1>
+  <div id="meta"><span id="updated">Connecting…</span><span id="dot"></span></div>
+  <button id="filterBtn">≋ Filter</button>
+</header>
+<div id="filterPanel">
+  <input type="text" id="searchBox" placeholder="Search channels...">
+  <div class="filter-group">
+    <span class="filter-label">Status</span>
+    <div class="filter-options">
+      <button class="filter-btn active" data-filter="status" data-value="">All</button>
+      <button class="filter-btn" data-filter="status" data-value="recording">Recording</button>
+      <button class="filter-btn" data-filter="status" data-value="online">Online</button>
+      <button class="filter-btn" data-filter="status" data-value="offline">Offline</button>
+    </div>
+  </div>
+</div>
+<div class="grid" id="grid"></div>
+<button id="toTop" title="Back to top">↑</button>
+<script>
+const grid = document.getElementById('grid');
+const updated = document.getElementById('updated');
+const dot = document.getElementById('dot');
+const filterBtn = document.getElementById('filterBtn');
+const filterPanel = document.getElementById('filterPanel');
+const searchBox = document.getElementById('searchBox');
+const toTopBtn = document.getElementById('toTop');
+
+let allChannels = [];
+let statusFilter = '';
+
+function esc(s) {
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+function badge(ch) {
+  if (ch.isRecording)              return {cls:'b-rec', label:'Recording'};
+  if (ch.isWaiting)                return {cls:'b-wait',label:'Waiting'};
+  if (ch.isOnline && ch.isPaused)  return {cls:'b-on',  label:'Online'};
+  if (!ch.isOnline && !ch.isPaused)return {cls:'b-off', label:'Offline'};
+  return {cls:'b-paus',label:'Paused'};
+}
+
+function matchesFilter(ch) {
+  if (statusFilter) {
+    if (statusFilter === 'recording' && !ch.isRecording) return false;
+    if (statusFilter === 'online' && !(ch.isOnline && ch.isPaused)) return false;
+    if (statusFilter === 'offline' && ch.isOnline) return false;
+  }
+  const search = searchBox.value.toLowerCase();
+  if (search && !ch.username.toLowerCase().includes(search)) return false;
+  return true;
+}
+
+function renderCard(ch) {
+  const {cls, label} = badge(ch);
+  const pausedBadge = (ch.isOnline && ch.isPaused)
+    ? '<span class="badge b-paus">Paused</span>' : '';
+  const noPerson = ch.isNoPersonDetected
+    ? '<span class="badge b-np">No Person</span>' : '';
+
+  const tv = Math.floor(Date.now() / 30000);
+  const thumbSrc = ch.hasThumbnail
+    ? '/thumbnails/' + encodeURIComponent(ch.username) + '?v=' + tv
+    : '';
+  const thumbHtml = thumbSrc
+    ? '<img src="' + thumbSrc + '" alt="" loading="lazy">'
+    : '<div class="placeholder"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>';
+
+  const meta = [];
+  if ((ch.isRecording || ch.isWaiting) && ch.duration && ch.duration !== '0:00')
+    meta.push('🕐 ' + esc(ch.duration) + (ch.filesize ? ' · ' + esc(ch.filesize) : ''));
+  if (ch.lastOnlineAt && !ch.isOnline)
+    meta.push('Last: ' + esc(ch.lastOnlineAt));
+  const metaHTML = meta.length ? '<div class="meta">' + meta.join('<br>') + '</div>' : '';
+
+  const btn = ch.isPaused
+    ? '<button class="btn-resume" data-user="' + esc(ch.username) + '" data-action="resume">Resume</button>'
+    : '<button class="btn-pause" data-user="' + esc(ch.username) + '" data-action="pause">Pause</button>';
+
+  return '<div class="card">' +
+    '<div class="thumb-wrap">' + thumbHtml + '</div>' +
+    '<div class="info">' +
+      '<div class="username">' + esc(ch.username) + '</div>' +
+      '<div class="badges"><span class="badge ' + cls + '">' + label + '</span>' + pausedBadge + noPerson + '</div>' +
+      metaHTML +
+      '<div class="actions">' + btn + '</div>' +
+    '</div>' +
+  '</div>';
+}
+
+function render() {
+  const filtered = allChannels.filter(matchesFilter);
+  grid.innerHTML = filtered.length
+    ? filtered.map(renderCard).join('')
+    : '<div id="empty">No channels match your filters</div>';
+}
+
+async function fetchChannels() {
+  try {
+    const r = await fetch('/api/channels');
+    if (!r.ok) throw new Error('HTTP ' + r.status);
+    allChannels = await r.json();
+    dot.className = 'ok';
+    updated.textContent = new Date().toLocaleTimeString();
+    render();
+  } catch(e) {
+    dot.className = '';
+    updated.textContent = 'Error – retrying…';
+  }
+}
+
+filterBtn.addEventListener('click', () => {
+  filterPanel.classList.toggle('open');
+});
+
+document.querySelectorAll('[data-filter]').forEach(btn => {
+  btn.addEventListener('click', e => {
+    if (e.target.dataset.filter === 'status') {
+      document.querySelectorAll('[data-filter="status"]').forEach(b => b.classList.remove('active'));
+      e.target.classList.add('active');
+      statusFilter = e.target.dataset.value;
+      render();
+    }
+  });
+});
+
+searchBox.addEventListener('input', render);
+
+grid.addEventListener('click', async e => {
+  const btn = e.target.closest('button[data-action]');
+  if (!btn) return;
+  const username = btn.dataset.user;
+  const action   = btn.dataset.action;
+  btn.disabled = true;
+  try {
+    await fetch('/api/channels/' + encodeURIComponent(username) + '/' + action, {method:'POST'});
+    await fetchChannels();
+  } catch(_) {
+    btn.disabled = false;
+  }
+});
+
+window.addEventListener('scroll', () => {
+  toTopBtn.style.display = window.scrollY > 300 ? 'block' : 'none';
+});
+
+toTopBtn.addEventListener('click', () => {
+  window.scrollTo({top: 0, behavior: 'smooth'});
+});
+
+fetchChannels();
+setInterval(fetchChannels, 3000);
+</script>
+</body>
+</html>

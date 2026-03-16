@@ -1072,7 +1072,7 @@ struct WrappingStatusBadgesView: View {
     let filteredCount: Int
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
                 statusBadge("Total", count: totalCount, tint: .primary) {
                     statusFilter = .all
@@ -1957,9 +1957,9 @@ struct ChannelDetailView: View {
         GeometryReader { geometry in
             let detailWidth = responsiveDetailWidth(totalWidth: geometry.size.width)
 
-            HStack(alignment: .top, spacing: 14) {
-                VStack(alignment: .leading, spacing: 20) {
-                    VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .top, spacing: 12) {
+                VStack(alignment: .leading, spacing: 16) {
+                    VStack(alignment: .leading, spacing: 8) {
                         Text("Live Preview")
                             .font(.headline)
 
@@ -1971,157 +1971,191 @@ struct ChannelDetailView: View {
                     }
 
                     activityLogSection(info: info)
+                        .frame(maxHeight: .infinity, alignment: .top)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
+                .frame(maxHeight: .infinity, alignment: .top)
 
                 channelDetailsPanel(info: info)
                     .frame(width: detailWidth)
+                    .frame(maxHeight: .infinity, alignment: .top)
             }
+            .frame(maxHeight: .infinity, alignment: .top)
         }
-        .frame(minHeight: 540)
+        .frame(minHeight: 520)
         .padding(20)
     }
 
     @ViewBuilder
     private func activityLogSection(info: ChannelInfo) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
-            Text("Activity Log")
-                .font(.headline)
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 10) {
+                Text("Activity Log")
+                    .font(.headline)
+
+                Spacer(minLength: 0)
+
+                Button(action: { copyActivityLogs(info.logs) }) {
+                    Label("Copy Logs", systemImage: "doc.on.doc")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .disabled(info.logs.isEmpty)
+            }
 
             ScrollView {
-                VStack(alignment: .leading, spacing: 4) {
-                    ForEach(Array(info.logs.enumerated()), id: \.offset) { _, log in
-                        Text(log)
-                            .font(.system(.caption, design: .monospaced))
-                            .foregroundColor(colorForDetailLog(log, info: info))
-                            .textSelection(.enabled)
-                    }
-                }
-                .frame(maxWidth: .infinity, alignment: .leading)
+                Text(info.logs.joined(separator: "\n"))
+                    .font(.system(.caption, design: .monospaced))
+                    .foregroundColor(.primary)
+                    .textSelection(.enabled)
+                    .frame(maxWidth: .infinity, alignment: .leading)
             }
-            .frame(height: 180)
-            .padding(12)
+            .frame(maxHeight: .infinity)
+            .padding(10)
             .background(Color(NSColor.textBackgroundColor))
             .cornerRadius(8)
         }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
 
     @ViewBuilder
     private func channelDetailsPanel(info: ChannelInfo) -> some View {
-        VStack(alignment: .leading, spacing: 14) {
-            Text("Channel Details")
-                .font(.headline)
+        let sidebarHorizontalInset: CGFloat = 4
 
-            HStack(spacing: 8) {
-                Button(action: { onPrevious?() }) {
-                    Label("Previous", systemImage: "chevron.left")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!canGoPrevious)
+        VStack(alignment: .leading, spacing: 10) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("Channel Details")
+                        .font(.headline)
 
-                Button(action: { onNext?() }) {
-                    Label("Next", systemImage: "chevron.right")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!canGoNext)
-            }
-
-            HStack(spacing: 8) {
-                Circle()
-                    .fill(info.isInvalid ? Color.red : (info.isPaused ? Color.orange : (info.isOnline ? Color.green : Color.gray)))
-                    .frame(width: 12, height: 12)
-                Text(info.isInvalid ? "Invalid (404)" : (info.isPaused ? (info.isOnline ? "Paused (Online)" : "Paused") : (info.isOnline ? "Recording" : "Offline")))
-                    .font(.headline)
-                    .foregroundColor(info.isInvalid ? .red : .primary)
-
-                if info.consecutiveSegmentFailures > 0 {
-                    Text("Degraded")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.orange)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color.orange.opacity(0.14))
-                        .cornerRadius(7)
-                }
-
-                if info.isOnline && info.isNoPersonDetected && !info.isInvalid {
-                    Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
-                        .font(.caption)
-                        .fontWeight(.semibold)
-                        .foregroundColor(.orange)
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(Color.orange.opacity(0.14))
-                        .cornerRadius(7)
-                        .lineLimit(1)
-                }
-            }
-
-            ChannelInfoView(info: info)
-
-            BioMetadataView(info: info, manager: manager, username: username)
-
-            recordingsSection(info: info)
-
-            Button(action: {
-                manager.openChannelPage(username: username)
-            }) {
-                Label("Open Channel Page", systemImage: "link")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-
-            Button(action: {
-                Task {
-                    await manager.openRecordingFolder(username: username)
-                }
-            }) {
-                Label("Open Recordings Folder", systemImage: "folder")
-                    .frame(maxWidth: .infinity)
-            }
-            .buttonStyle(.bordered)
-
-            HStack(spacing: 10) {
-                if info.isPaused {
-                    Button(action: {
-                        Task {
-                            await manager.resumeChannel(username: username)
+                    HStack(spacing: 8) {
+                        Button(action: { onPrevious?() }) {
+                            Label("Previous", systemImage: "chevron.left")
+                                .frame(maxWidth: .infinity)
                         }
-                    }) {
-                        Label("Resume", systemImage: "play.fill")
-                            .frame(maxWidth: .infinity)
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!canGoPrevious)
+
+                        Button(action: { onNext?() }) {
+                            Label("Next", systemImage: "chevron.right")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(!canGoNext)
                     }
-                    .buttonStyle(.borderedProminent)
-                } else {
-                    Button(action: {
-                        Task {
-                            await manager.pauseChannel(username: username)
+
+                    HStack(spacing: 8) {
+                        Circle()
+                            .fill(info.isInvalid ? Color.red : (info.isPaused ? Color.orange : (info.isOnline ? Color.green : Color.gray)))
+                            .frame(width: 10, height: 10)
+                        Text(info.isInvalid ? "Invalid (404)" : (info.isPaused ? (info.isOnline ? "Paused (Online)" : "Paused") : (info.isOnline ? "Recording" : "Offline")))
+                            .font(.subheadline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(info.isInvalid ? .red : .primary)
+                            .lineLimit(1)
+
+                        if info.consecutiveSegmentFailures > 0 {
+                            Text("Degraded")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.14))
+                                .cornerRadius(6)
                         }
-                    }) {
-                        Label("Pause", systemImage: "pause.fill")
+
+                        if info.isOnline && info.isNoPersonDetected && !info.isInvalid {
+                            Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 7)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.14))
+                                .cornerRadius(6)
+                                .lineLimit(1)
+                        }
+                    }
+
+                    ChannelInfoView(info: info)
+
+                    BioMetadataView(info: info, manager: manager, username: username)
+
+                    recordingsSection(info: info)
+                }
+                .padding(.horizontal, sidebarHorizontalInset)
+            }
+            .frame(maxHeight: .infinity)
+
+            VStack(spacing: 8) {
+                Button(action: {
+                    manager.openChannelPage(username: username)
+                }) {
+                    Label("Open Channel Page", systemImage: "link")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                Button(action: {
+                    Task {
+                        await manager.openRecordingFolder(username: username)
+                    }
+                }) {
+                    Label("Open Recordings Folder", systemImage: "folder")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
+                HStack(spacing: 8) {
+                    if info.isPaused {
+                        Button(action: {
+                            Task {
+                                await manager.resumeChannel(username: username)
+                            }
+                        }) {
+                            Label("Resume", systemImage: "play.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                    } else {
+                        Button(action: {
+                            Task {
+                                await manager.pauseChannel(username: username)
+                            }
+                        }) {
+                            Label("Pause", systemImage: "pause.fill")
+                                .frame(maxWidth: .infinity)
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                    }
+
+                    Button(action: { onEdit?() }) {
+                        Label("Edit", systemImage: "pencil")
                             .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
-                }
+                    .controlSize(.small)
 
-                Button(action: { onEdit?() }) {
-                    Label("Edit", systemImage: "pencil")
-                        .frame(maxWidth: .infinity)
+                    Button(role: .destructive) {
+                        showingDeleteConfirmation = true
+                    } label: {
+                        Label("Delete", systemImage: "trash")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
                 }
-                .buttonStyle(.bordered)
-
-                Button(role: .destructive) {
-                    showingDeleteConfirmation = true
-                } label: {
-                    Label("Delete", systemImage: "trash")
-                        .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
             }
+            .padding(.horizontal, sidebarHorizontalInset)
         }
+        .frame(maxHeight: .infinity, alignment: .top)
     }
     
     private func updateInfo() {
@@ -2163,10 +2197,10 @@ struct ChannelDetailView: View {
 
             HStack(spacing: 4) {
                 Text("\(existingRecordings.count) video\(existingRecordings.count == 1 ? "" : "s") found")
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundColor(.secondary)
                 Text("• app recorded \(info.recordings.count) session\(info.recordings.count == 1 ? "" : "s")")
-                    .font(.caption)
+                    .font(.caption2)
                     .foregroundColor(.secondary)
             }
 
@@ -2177,11 +2211,11 @@ struct ChannelDetailView: View {
                     .italic()
             } else {
                 ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
+                    VStack(alignment: .leading, spacing: 5) {
                         if let activeRecordingPath,
                            FileManager.default.fileExists(atPath: activeRecordingPath) {
                             Text("\((activeRecordingPath as NSString).lastPathComponent) (recording)")
-                                .font(.system(.caption, design: .monospaced))
+                                .font(.system(.caption2, design: .monospaced))
                                 .foregroundColor(.green)
                                 .lineLimit(1)
                                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -2196,7 +2230,7 @@ struct ChannelDetailView: View {
                                 }
                             } label: {
                                 Text((recording as NSString).lastPathComponent)
-                                    .font(.system(.caption, design: .monospaced))
+                                    .font(.system(.caption2, design: .monospaced))
                                     .lineLimit(1)
                                     .textSelection(.enabled)
                                     .frame(maxWidth: .infinity, alignment: .leading)
@@ -2212,7 +2246,7 @@ struct ChannelDetailView: View {
                         }
                     }
                 }
-                .frame(maxHeight: 110)
+                .frame(maxHeight: 96)
             }
         }
         .padding(10)
@@ -2255,8 +2289,8 @@ struct ChannelDetailView: View {
     }
 
     private func responsiveDetailWidth(totalWidth: CGFloat) -> CGFloat {
-        let target = totalWidth * 0.34
-        return min(max(target, 330), 440)
+        let target = totalWidth * 0.36
+        return min(max(target, 350), 470)
     }
 
     private static func recordingsOnDisk(info: ChannelInfo) -> [String] {
@@ -2322,6 +2356,14 @@ struct ChannelDetailView: View {
             return .green
         }
         return .secondary
+    }
+
+    private func copyActivityLogs(_ logs: [String]) {
+        guard !logs.isEmpty else { return }
+        let text = logs.joined(separator: "\n")
+        let pasteboard = NSPasteboard.general
+        pasteboard.clearContents()
+        pasteboard.setString(text, forType: .string)
     }
 
     @ViewBuilder
@@ -2769,11 +2811,11 @@ struct ChannelInfoView: View {
     let info: ChannelInfo
     
     var body: some View {
-        VStack(spacing: 16) {
+        VStack(spacing: 10) {
             LazyVGrid(columns: [
                 GridItem(.flexible()),
                 GridItem(.flexible())
-            ], spacing: 12) {
+            ], spacing: 8) {
                 InfoCard(title: "Duration", value: info.duration, icon: "clock")
                 InfoCard(title: "File Size", value: info.filesize, icon: "doc")
                 InfoCard(title: "Max Duration", value: info.maxDuration, icon: "timer")
@@ -2781,81 +2823,66 @@ struct ChannelInfoView: View {
             }
             
             if let filename = info.filename {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 4) {
                     Text("Current File")
-                        .font(.caption)
+                        .font(.caption2)
                         .foregroundColor(.secondary)
                     Text((filename as NSString).lastPathComponent)
-                        .font(.system(.body, design: .monospaced))
+                        .font(.system(.caption, design: .monospaced))
+                        .lineLimit(1)
                         .textSelection(.enabled)
                 }
-                .padding(12)
+                .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(8)
             }
             
             if let streamedAt = info.streamedAt {
-                HStack {
-                    Text("Stream Started:")
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(streamedAt)
-                }
-                .padding(.horizontal, 4)
+                detailRow(label: "Stream Started", value: streamedAt)
             }
 
             if let lastOnlineAt = info.lastOnlineAt {
-                HStack {
-                    Text("Last Online:")
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(lastOnlineAt)
-                }
-                .padding(.horizontal, 4)
+                detailRow(label: "Last Online", value: lastOnlineAt)
             }
 
             if info.isOnline {
-                HStack {
-                    Text("Person Detection:")
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(info.isNoPersonDetected
-                         ? "No person detected for \(formatNoPersonDuration(info.noPersonDurationSeconds))"
-                         : "Person detected")
-                        .foregroundColor(info.isNoPersonDetected ? .orange : .primary)
-                }
-                .padding(.horizontal, 4)
+                detailRow(
+                    label: "Person Detection",
+                    value: info.isNoPersonDetected
+                        ? "No person detected for \(formatNoPersonDuration(info.noPersonDurationSeconds))"
+                        : "Person detected",
+                    valueColor: info.isNoPersonDetected ? .orange : .primary
+                )
             }
 
-            HStack {
-                Text("Segment Retries:")
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text("\(info.segmentRetryCount)")
-            }
-            .padding(.horizontal, 4)
+            detailRow(label: "Segment Retries", value: "\(info.segmentRetryCount)")
 
-            HStack {
-                Text("Consecutive Segment Failures:")
-                    .foregroundColor(.secondary)
-                Spacer()
-                Text("\(info.consecutiveSegmentFailures)")
-                    .foregroundColor(info.consecutiveSegmentFailures > 0 ? .orange : .primary)
-            }
-            .padding(.horizontal, 4)
+            detailRow(
+                label: "Consecutive Segment Failures",
+                value: "\(info.consecutiveSegmentFailures)",
+                valueColor: info.consecutiveSegmentFailures > 0 ? .orange : .primary
+            )
 
             if let lastFailureAt = info.lastSegmentFailureAt {
-                HStack {
-                    Text("Last Segment Failure:")
-                        .foregroundColor(.secondary)
-                    Spacer()
-                    Text(lastFailureAt)
-                        .foregroundColor(.orange)
-                }
-                .padding(.horizontal, 4)
+                detailRow(label: "Last Segment Failure", value: lastFailureAt, valueColor: .orange)
             }
         }
+    }
+
+    private func detailRow(label: String, value: String, valueColor: Color = .primary) -> some View {
+        HStack(alignment: .firstTextBaseline, spacing: 8) {
+            Text("\(label):")
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Spacer(minLength: 0)
+            Text(value)
+                .font(.caption)
+                .foregroundColor(valueColor)
+                .lineLimit(1)
+                .multilineTextAlignment(.trailing)
+        }
+        .padding(.horizontal, 2)
     }
 }
 
@@ -2865,15 +2892,16 @@ struct InfoCard: View {
     let icon: String
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 5) {
             Label(title, systemImage: icon)
-                .font(.caption)
+                .font(.caption2)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.title3)
+                .font(.headline)
                 .fontWeight(.medium)
         }
-        .padding(12)
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(NSColor.controlBackgroundColor))
         .cornerRadius(8)
@@ -2888,43 +2916,45 @@ struct BioMetadataView: View {
     @State private var localBioMetadata: BioMetadata?
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 14) {
+        VStack(alignment: .leading, spacing: 8) {
             Text("Bio Metadata")
-                .font(.headline)
+                .font(.subheadline)
+                .fontWeight(.semibold)
             
             if let bioMetadata = localBioMetadata ?? info.bioMetadata {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 7) {
                     if let gender = bioMetadata.gender {
-                        metadataRow("Gender", value: gender)
+                        metadataRow("Gender", value: gender, labelFont: .caption, valueFont: .caption)
                     }
 
                     if let followers = bioMetadata.followers {
-                        metadataRow("Followers", value: String(followers))
+                        metadataRow("Followers", value: String(followers), labelFont: .caption, valueFont: .caption)
                     }
 
                     if let location = bioMetadata.location {
-                        metadataRow("Location", value: location)
+                        metadataRow("Location", value: location, labelFont: .caption, valueFont: .caption)
                     }
 
                     if let body = bioMetadata.body {
-                        metadataRow("Body", value: body)
+                        metadataRow("Body", value: body, labelFont: .caption, valueFont: .caption)
                     }
 
                     if let language = bioMetadata.language {
-                        metadataRow("Language", value: language)
+                        metadataRow("Language", value: language, labelFont: .caption, valueFont: .caption)
                     }
 
                     if let lastBioRefresh = bioMetadata.lastBioRefresh {
                         metadataRow("Last Refreshed", value: formatTimestamp(lastBioRefresh), labelFont: .caption, valueFont: .caption)
                     }
                 }
-                .padding(12)
+                .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(NSColor.controlBackgroundColor))
                 .cornerRadius(8)
             } else {
-                VStack(alignment: .leading, spacing: 10) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("No bio data yet")
+                        .font(.caption)
                         .foregroundColor(.secondary)
                     Button(action: fetchBio) {
                         if isFetchingBio {
@@ -2941,7 +2971,7 @@ struct BioMetadataView: View {
                     .buttonStyle(.bordered)
                     .disabled(isFetchingBio)
                 }
-                .padding(12)
+                .padding(10)
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
                 .cornerRadius(8)

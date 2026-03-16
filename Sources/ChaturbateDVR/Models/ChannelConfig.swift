@@ -186,6 +186,8 @@ struct AppConfig: Codable {
     var breakStaticThresholdMinutes: Int = 10
     var breakNoPersonNoMotionThresholdMinutes: Int = 3
     var breakAnalysisIntervalSeconds: Int = 10
+    var webServerEnabled: Bool = false
+    var webServerPort: Int = 8888
     
     // Custom decoding to handle missing selectedBrowser from old configs
     init(from decoder: Decoder) throws {
@@ -204,6 +206,8 @@ struct AppConfig: Codable {
         breakStaticThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakStaticThresholdMinutes) ?? 10
         breakNoPersonNoMotionThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakNoPersonNoMotionThresholdMinutes) ?? 3
         breakAnalysisIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .breakAnalysisIntervalSeconds) ?? 10
+        webServerEnabled = try container.decodeIfPresent(Bool.self, forKey: .webServerEnabled) ?? false
+        webServerPort = try container.decodeIfPresent(Int.self, forKey: .webServerPort) ?? 8888
     }
     
     init() {
@@ -218,6 +222,8 @@ struct AppConfig: Codable {
         case breakStaticThresholdMinutes
         case breakNoPersonNoMotionThresholdMinutes
         case breakAnalysisIntervalSeconds
+        case webServerEnabled
+        case webServerPort
     }
     
     func getOutputPath() -> String {

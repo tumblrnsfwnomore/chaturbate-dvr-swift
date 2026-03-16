@@ -40,6 +40,10 @@ actor HTTPClient {
         let (data, httpResponse) = try await execute(request: request)
         let body = String(data: data, encoding: .utf8) ?? ""
         await FileLogger.shared.log("[http] getHTML status=\(httpResponse.statusCode) url=\(httpResponse.url?.absoluteString ?? "nil") bytes=\(body.count) title=\(body.components(separatedBy: "<title>").dropFirst().first?.components(separatedBy: "</title>").first ?? "none")")
+        // Detect redirect to /roomlogin/ — treat as offline (same as getDataWithStatus).
+        if let finalURL = httpResponse.url, finalURL.path.hasPrefix("/roomlogin/") {
+            throw ChaturbateError.channelOffline
+        }
         return body
     }
     
@@ -54,7 +58,13 @@ actor HTTPClient {
         }
         let request = await buildRequest(url: url)
         let (data, httpResponse) = try await execute(request: request)
-        
+
+        // Detect redirect to /roomlogin/ — Chaturbate sends some offline/restricted
+        // channels here. The login page has no room dossier so treat this as offline.
+        if let finalURL = httpResponse.url, finalURL.path.hasPrefix("/roomlogin/") {
+            throw ChaturbateError.channelOffline
+        }
+
         if httpResponse.statusCode == 403 {
             throw ChaturbateError.privateStream
         }

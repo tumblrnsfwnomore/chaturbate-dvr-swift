@@ -188,7 +188,9 @@ class ChannelManager: ObservableObject {
     private var bioBackfillIndex: Int = 0
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
-    
+    private var webServer: WebServer?
+    private var webServerActivePort: Int = 0
+
     init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let appFolder = appSupport.appendingPathComponent("ChaturbateDVR")
@@ -214,6 +216,10 @@ class ChannelManager: ObservableObject {
         // Bio backfill is manual via on-demand refresh controls in Add Channel and Settings
         // startBioBackfill()
 
+        if appConfig.webServerEnabled {
+            startWebServer()
+        }
+
         Task {
             await FileLogger.shared.log("[manager] initialized")
         }
@@ -223,6 +229,7 @@ class ChannelManager: ObservableObject {
         pausedStatusCheckTask?.cancel()
         offlineThumbnailBackfillTask?.cancel()
         bioBackfillTask?.cancel()
+        webServer?.stop()
     }
     
     private func loadAppConfig() {
@@ -262,6 +269,12 @@ class ChannelManager: ObservableObject {
             let recordingsCap = appConfig.maxConcurrentRecordings == 0 ? "unlimited" : String(appConfig.maxConcurrentRecordings)
             await FileLogger.shared.log("[manager] updated max concurrent recordings to \(recordingsCap)")
             await FileLogger.shared.log("[manager] updated break detection settings: static=\(appConfig.breakStaticThresholdMinutes)m no_person=\(appConfig.breakNoPersonNoMotionThresholdMinutes)m analysis=\(appConfig.breakAnalysisIntervalSeconds)s")
+        }
+
+        if appConfig.webServerEnabled {
+            startWebServer()
+        } else {
+            stopWebServer()
         }
     }
     
@@ -1011,6 +1024,58 @@ class ChannelManager: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: - Embedded web server
+
+    private func startWebServer() {
+        let port = appConfig.webServerPort
+        // Avoid redundant restart when port hasn't changed.
+        if webServer != nil && webServerActivePort == port { return }
+
+        webServer?.stop()
+        webServer = nil
+        webServerActivePort = 0
+
+        let server = WebServer()
+
+        server.getChannelInfos = { [weak self] in
+            guard let self else { return [] }
+            return await self.getAllChannelInfo()
+        }
+        server.pauseAction = { [weak self] username in
+            guard let self else { return }
+            await self.pauseChannel(username: username)
+        }
+        server.resumeAction = { [weak self] username in
+            guard let self else { return }
+            await self.resumeChannel(username: username)
+        }
+        server.getThumbnailPath = { [weak self] username in
+            guard let self else { return nil }
+            return await self.getChannelThumbnailPath(username: username)
+        }
+
+        do {
+            try server.start(port: UInt16(port))
+            webServer = server
+            webServerActivePort = port
+        } catch {
+            Task { await FileLogger.shared.log("[webserver] start failed on port \(port): \(error)", level: "WARN") }
+        }
+    }
+
+    private func stopWebServer() {
+        guard webServer != nil else { return }
+        webServer?.stop()
+        webServer = nil
+        webServerActivePort = 0
+        Task { await FileLogger.shared.log("[webserver] stopped") }
+    }
+
+    func getChannelThumbnailPath(username: String) async -> String? {
+        guard let channel = channels[username] else { return nil }
+        return await channel.thumbnailPath
     }
 }
 

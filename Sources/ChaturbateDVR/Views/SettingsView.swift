@@ -12,6 +12,7 @@ struct SettingsView: View {
     @State private var bioBackfillCount = 0
     @State private var bioBackfillTotal = 0
     @State private var bioBackfillTask: Task<Void, Never>?
+    @State private var webServerPortString: String = ""
     
     var body: some View {
         VStack(spacing: 0) {
@@ -327,6 +328,62 @@ struct SettingsView: View {
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(10)
 
+                    // MARK: Web Interface
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Web Interface")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+
+                        VStack(alignment: .leading, spacing: 12) {
+                            Toggle(isOn: Binding(
+                                get: { manager.appConfig.webServerEnabled },
+                                set: { enabled in
+                                    manager.appConfig.webServerEnabled = enabled
+                                    manager.saveAppConfig()
+                                }
+                            )) {
+                                Text("Enable web server")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+                            }
+                            .toggleStyle(.switch)
+
+                            if manager.appConfig.webServerEnabled {
+                                Divider()
+
+                                HStack {
+                                    Text("Port")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    TextField("8888", text: $webServerPortString)
+                                        .frame(width: 72)
+                                        .multilineTextAlignment(.trailing)
+                                        .textFieldStyle(.roundedBorder)
+                                        .onSubmit { applyWebServerPort() }
+                                }
+
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Access from any device on your local network:")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Text("http://[your-mac-ip]:\(manager.appConfig.webServerPort)")
+                                        .font(.caption)
+                                        .fontDesign(.monospaced)
+                                        .foregroundColor(.secondary)
+                                        .textSelection(.enabled)
+                                }
+                            }
+
+                            Text("Monitor channel status and pause or resume recording from any browser on your local network.")
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                        .padding(16)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(10)
+                    }
+
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Logs")
                             .font(.headline)
@@ -369,6 +426,7 @@ struct SettingsView: View {
         }
         .onAppear {
             outputDirectory = manager.appConfig.outputDirectory
+            webServerPortString = String(manager.appConfig.webServerPort)
             startDiagnosticsRefresh()
         }
         .onDisappear {
@@ -377,7 +435,7 @@ struct SettingsView: View {
             bioBackfillTask?.cancel()
             bioBackfillTask = nil
         }
-        .frame(width: 620, height: 540)
+        .frame(width: 620, height: 640)
     }
 
     private var recommendedRequestRange: String {
@@ -466,6 +524,16 @@ struct SettingsView: View {
         }
     }
     
+    private func applyWebServerPort() {
+        let trimmed = webServerPortString.trimmingCharacters(in: .whitespaces)
+        guard let port = Int(trimmed), port >= 1024, port <= 65535 else {
+            webServerPortString = String(manager.appConfig.webServerPort)
+            return
+        }
+        manager.appConfig.webServerPort = port
+        manager.saveAppConfig()
+    }
+
     private func chooseDirectory() {
         let panel = NSOpenPanel()
         panel.canChooseFiles = false
