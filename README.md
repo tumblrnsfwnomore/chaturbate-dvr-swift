@@ -107,14 +107,14 @@ The app uses modern Swift concurrency features:
 
 ```text
 Sources/
-	ChaturbateDVR/
-		Models/        # Data models
-		Networking/    # HTTP client
-		M3U8/          # Playlist parser
-		Chaturbate/    # Chaturbate API client
-		Channel/       # Channel recording logic
-		Manager/       # Channel management
-		Views/         # SwiftUI views
+ ChaturbateDVR/
+  Models/        # Data models
+  Networking/    # HTTP client
+  M3U8/          # Playlist parser
+  Chaturbate/    # Chaturbate API client
+  Channel/       # Channel recording logic
+  Manager/       # Channel management
+  Views/         # SwiftUI views
 ```
 
 ### Adding Features

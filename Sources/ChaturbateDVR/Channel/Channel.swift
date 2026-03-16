@@ -1,6 +1,7 @@
 import Foundation
 import AVFoundation
 import AppKit
+import Vision
 
 actor Channel {
     private static let pausedPreviewMinInterval: TimeInterval = 180
@@ -11,10 +12,22 @@ actor Channel {
     private static let recordingPreviewMaxBytes = 12 * 1024 * 1024
     private static let waitingStatusCheckIntervalSeconds: TimeInterval = 12
     private static let waitingPreviewMinInterval: TimeInterval = 20
+    private static let breakStaticMotionThreshold: Double = 0.003
+    private static let breakLowMotionThreshold: Double = 0.015
+    private static let breakAnalysisImageSize: Int = 64
+    private static let noPersonOfflineCarryWindowSeconds: TimeInterval = 600
+    private static let noPersonThenStaticConfirmSeconds: TimeInterval = 45
+    private static let recordingStartNoPersonSamples: Int = 3
+    private static let recordingStartNoPersonRequiredMisses: Int = 2
 
     private struct PreviewSegmentChunk {
         let data: Data
         let duration: Double
+    }
+
+    private struct ThumbnailGenerationResult {
+        let success: Bool
+        let breakDetected: Bool
     }
 
     private(set) var config: ChannelConfig
@@ -33,8 +46,8 @@ actor Channel {
     private var currentFile: FileHandle?
     private var monitoringTask: Task<Void, Never>?
     private var waitingForSlotStatusTask: Task<Void, Never>?
-    private let client: ChaturbateClient
-    private let appConfig: AppConfig
+    private var client: ChaturbateClient
+    private var appConfig: AppConfig
     private var lastThumbnailTime: Date = Date.distantPast
     private var lastPausedPreviewTime: Date = Date.distantPast
     private var lastWaitingPreviewTime: Date = Date.distantPast
@@ -45,12 +58,29 @@ actor Channel {
     private var recentPreviewDuration: Double = 0
     private var recentPreviewBytes: Int = 0
     private var recordingPreviewTempPath: String?
+    private var activeInitSegmentURI: String?
+    private var activeInitSegmentData: Data?
+    private var currentFileDecodeTimeOffset: UInt64?
     private var lastPreviewFailureLogAt: Date = Date.distantPast
     private var cloudflareBlockCount: Int = 0
     private var segmentRetryCount: Int = 0
     private var consecutiveSegmentFailures: Int = 0
     private var lastSegmentFailureAt: Date?
     private var degradedRecoveryStartedAt: Date?
+    private var lastBreakAnalysisAt: Date?
+    private var lastBreakLumaFrame: [UInt8]?
+    private var latestPersonDetected: Bool?
+    private var lastPersonSeenAt: Date?
+    private var isNoPersonLikely: Bool = false
+    private var noPersonStreakSeconds: TimeInterval = 0
+    private var noPersonCarryExpiryAt: Date?
+    private var noPersonEvidenceExpiryAt: Date?
+    private var activePersonMotionSeconds: TimeInterval = 0
+    private var breakEnforced: Bool = false
+    private var breakEnforcedAt: Date?
+    private var staticFrameStreakSeconds: TimeInterval = 0
+    private var noPersonNoMotionStreakSeconds: TimeInterval = 0
+    private var pendingBreakOfflineReason: String?
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
     private var isFirstCheck: Bool = true
@@ -65,6 +95,11 @@ actor Channel {
         
         // Load existing thumbnail if available
         self.thumbnailPath = Self.findExistingThumbnail(username: config.username)
+    }
+
+    func updateAppConfig(_ newAppConfig: AppConfig) {
+        appConfig = newAppConfig
+        client = ChaturbateClient(config: newAppConfig)
     }
     
     private nonisolated static func findExistingThumbnail(username: String) -> String? {
@@ -82,6 +117,7 @@ actor Channel {
         let wasOnline = isOnline
         config.isPaused = true
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
+        resetBreakDetectionState()
         monitoringTask?.cancel()
         monitoringTask = nil
         waitingForSlotStatusTask?.cancel()
@@ -110,6 +146,7 @@ actor Channel {
     func stopForDeletion() {
         config.isPaused = true
         pausedOnlineStickyUntil = nil
+        resetBreakDetectionState()
         monitoringTask?.cancel()
         monitoringTask = nil
         waitingForSlotStatusTask?.cancel()
@@ -132,6 +169,7 @@ actor Channel {
         config.pattern = newConfig.pattern
         config.maxDuration = newConfig.maxDuration
         config.maxFilesize = newConfig.maxFilesize
+        config.bioMetadata = newConfig.bioMetadata
         
         // If settings changed while recording, log it
         if wasRecording {
@@ -189,9 +227,12 @@ actor Channel {
             isWaitingForRecordingSlot: isWaitingForRecordingSlot,
             isInvalid: isInvalid,
             cloudflareBlockCount: cloudflareBlockCount,
+            isNoPersonDetected: isNoPersonLikely,
+            noPersonDurationSeconds: max(0, Int(noPersonStreakSeconds.rounded())),
             segmentRetryCount: segmentRetryCount,
             consecutiveSegmentFailures: consecutiveSegmentFailures,
-            lastSegmentFailureAt: lastSegmentFailureAt.map { formatter.string(from: $0) }
+            lastSegmentFailureAt: lastSegmentFailureAt.map { formatter.string(from: $0) },
+            bioMetadata: config.bioMetadata
         )
     }
 
@@ -313,10 +354,22 @@ actor Channel {
             }
 
             let tempDir = NSTemporaryDirectory()
-            let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_paused_preview.ts")
+            let initData = try await loadInitSegmentDataIfPresent(
+                mediaPlaylistContent: mediaPlaylistContent,
+                playlistURL: playlist.playlistURL,
+                httpClient: httpClient
+            )
+            let tempExtension = initData == nil ? "ts" : "mp4"
+            let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_paused_preview.\(tempExtension)")
             let tempSegmentURL = URL(fileURLWithPath: tempSegmentPath)
 
-            try segmentData.write(to: tempSegmentURL, options: .atomic)
+            var previewData = Data()
+            if let initData {
+                previewData.append(initData)
+            }
+            previewData.append(segmentData)
+
+            try previewData.write(to: tempSegmentURL, options: .atomic)
             defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
 
             addLog("Attempting to refresh thumbnail from live stream")
@@ -360,12 +413,23 @@ actor Channel {
                         waitTime = max(waitTime, 30 * 60)
                         addLog("Channel returned 404 (invalid/deleted). Retrying in \(formatWaitTime(waitTime))")
                         cloudflareBlockCount = 0
-                    case .channelOffline, .privateStream:
+                    case .channelOffline:
+                        let breakReason = consumePendingBreakOfflineReason()
+                        markOfflineAndClearDegradedState()
+                        if let breakReason {
+                            addLog("\(breakReason). Treating stream as offline, trying again in \(formatWaitTime(waitTime))")
+                        } else if isFirstCheck {
+                            addLog("Channel is offline or private (initial check)")
+                        } else {
+                            addLog("Channel is offline, trying again in \(formatWaitTime(waitTime))")
+                        }
+                        cloudflareBlockCount = 0 // Reset on normal offline
+                    case .privateStream:
                         markOfflineAndClearDegradedState()
                         if isFirstCheck {
                             addLog("Channel is offline or private (initial check)")
                         } else {
-                            addLog("Channel is offline or private, trying again in \(formatWaitTime(waitTime))")
+                            addLog("Channel is private, trying again in \(formatWaitTime(waitTime))")
                         }
                         cloudflareBlockCount = 0 // Reset on normal offline
                     case .cloudflareBlocked:
@@ -413,6 +477,7 @@ actor Channel {
         if !config.isPaused {
             isOnline = false
         }
+        resetBreakDetectionState()
         endWaitingForSlotMonitoring()
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
@@ -420,11 +485,20 @@ actor Channel {
     
     private func recordStream() async throws {
         isChecking = true
+        prepareForRecordingAttempt()
 
         let stream = try await withRequestSlot {
             try await client.getStream(username: config.username)
         }
         markChannelValid()
+
+        if await shouldRemainOnBreakBeforeRecording(hlsSource: stream.hlsSource) {
+            throw ChaturbateError.channelOffline
+        }
+
+        if await shouldDelayStartForNoPerson(hlsSource: stream.hlsSource) {
+            throw ChaturbateError.channelOffline
+        }
         
         // Check is complete, now we're in recording mode
         isChecking = false
@@ -577,10 +651,22 @@ actor Channel {
             }
 
             let tempDir = NSTemporaryDirectory()
-            let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_waiting_preview.ts")
+            let initData = try await loadInitSegmentDataIfPresent(
+                mediaPlaylistContent: mediaPlaylistContent,
+                playlistURL: playlist.playlistURL,
+                httpClient: httpClient
+            )
+            let tempExtension = initData == nil ? "ts" : "mp4"
+            let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_waiting_preview.\(tempExtension)")
             let tempSegmentURL = URL(fileURLWithPath: tempSegmentPath)
 
-            try segmentData.write(to: tempSegmentURL, options: .atomic)
+            var previewData = Data()
+            if let initData {
+                previewData.append(initData)
+            }
+            previewData.append(segmentData)
+
+            try previewData.write(to: tempSegmentURL, options: .atomic)
             defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
 
             let success = await generateThumbnail(from: tempSegmentPath)
@@ -624,6 +710,11 @@ actor Channel {
         
         while !Task.isCancelled && !config.isPaused {
             let content = try await httpClient.get(playlist.playlistURL)
+            try await refreshActiveInitSegment(
+                mediaPlaylistContent: content,
+                playlistURL: playlist.playlistURL,
+                httpClient: httpClient
+            )
             let segments = try M3U8Parser.parseMediaPlaylist(content)
             
             for segment in segments {
@@ -645,8 +736,10 @@ actor Channel {
                     url: segmentURL,
                     maxRetries: 3
                 )
+
+                let normalizedSegmentData = normalizeFragmentDecodeTimeIfNeeded(segmentData)
                 
-                try await handleSegment(data: segmentData, duration: segment.duration)
+                try await handleSegment(data: normalizedSegmentData, duration: segment.duration)
             }
             
             try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
@@ -695,6 +788,7 @@ actor Channel {
 
     private func markOfflineAndClearDegradedState() {
         isOnline = false
+        preserveNoPersonStateAcrossTransientOffline()
         clearDegradedState()
     }
 
@@ -738,9 +832,22 @@ actor Channel {
         if config.isPaused {
             throw ChaturbateError.paused
         }
-        
+
+        guard currentFile != nil else {
+            throw ChaturbateError.fileError("No file open")
+        }
+
+        if filesize == 0, activeInitSegmentData != nil {
+            try migrateActiveRecordingFileToMP4IfNeeded()
+        }
+
         guard let file = currentFile else {
             throw ChaturbateError.fileError("No file open")
+        }
+
+        if filesize == 0, let initData = activeInitSegmentData {
+            try file.write(contentsOf: initData)
+            filesize += initData.count
         }
         
         try file.write(contentsOf: data)
@@ -754,9 +861,12 @@ actor Channel {
         let now = Date()
         if now.timeIntervalSince(lastThumbnailTime) >= 5.0 {
             lastThumbnailTime = now
-            let success = await refreshLiveRecordingThumbnail()
-            if success {
+            let thumbnailResult = await refreshLiveRecordingThumbnail()
+            if thumbnailResult.success {
                 await FileLogger.shared.logLiveThumbnailSuccess(channel: config.username)
+            }
+            if thumbnailResult.breakDetected {
+                throw ChaturbateError.channelOffline
             }
         }
         
@@ -771,7 +881,12 @@ actor Channel {
     private func nextFile() async throws {
         closeCurrentFile(resetStats: true)
         let filename = try generateFilename()
-        try await createNewFile(filename: filename)
+        let fileExtension = activeInitSegmentData == nil ? "ts" : "mp4"
+        let isFirstFileInSession = (sequence == 0)
+        try await createNewFile(filename: filename, fileExtension: fileExtension)
+        if isFirstFileInSession {
+            addLog("Recording container selected: .\(fileExtension)")
+        }
         sequence += 1
     }
     
@@ -825,8 +940,8 @@ actor Channel {
         return fullPath
     }
     
-    private func createNewFile(filename: String) async throws {
-        let fileURL = URL(fileURLWithPath: (filename as NSString).expandingTildeInPath + ".ts")
+    private func createNewFile(filename: String, fileExtension: String) async throws {
+        let fileURL = URL(fileURLWithPath: (filename as NSString).expandingTildeInPath + ".\(fileExtension)")
         
         let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -848,6 +963,44 @@ actor Channel {
             config.recordingHistory.removeFirst(config.recordingHistory.count - 200)
         }
     }
+
+    private func migrateActiveRecordingFileToMP4IfNeeded() throws {
+        guard let existingPath = currentFilename,
+              existingPath.lowercased().hasSuffix(".ts"),
+              let existingHandle = currentFile else {
+            return
+        }
+
+        let sourceURL = URL(fileURLWithPath: existingPath)
+        let destinationURL = sourceURL.deletingPathExtension().appendingPathExtension("mp4")
+
+        do {
+            try existingHandle.synchronize()
+            try existingHandle.close()
+        } catch {
+            // Continue with rename attempt; some handles can still be moved safely.
+        }
+        currentFile = nil
+
+        if FileManager.default.fileExists(atPath: destinationURL.path) {
+            try FileManager.default.removeItem(at: destinationURL)
+        }
+
+        try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
+
+        guard let reopenedHandle = FileHandle(forWritingAtPath: destinationURL.path) else {
+            throw ChaturbateError.fileError("Could not reopen file after switching to .mp4: \(destinationURL.path)")
+        }
+        reopenedHandle.seekToEndOfFile()
+        currentFile = reopenedHandle
+        currentFilename = destinationURL.path
+
+        if let historyIndex = config.recordingHistory.lastIndex(of: sourceURL.path) {
+            config.recordingHistory[historyIndex] = destinationURL.path
+        }
+
+        addLog("Detected fragmented MP4 stream, saving recording as .mp4")
+    }
     
     private func closeCurrentFile(resetStats: Bool) {
         if let file = currentFile {
@@ -865,7 +1018,156 @@ actor Channel {
             filesize = 0
             duration = 0
             currentFilename = nil
+            currentFileDecodeTimeOffset = nil
         }
+    }
+
+    private func normalizeFragmentDecodeTimeIfNeeded(_ data: Data) -> Data {
+        guard activeInitSegmentData != nil else {
+            return data
+        }
+
+        var bytes = [UInt8](data)
+        var changed = false
+        rewriteTFDTBoxes(
+            in: &bytes,
+            range: 0..<bytes.count,
+            decodeTimeOffset: &currentFileDecodeTimeOffset,
+            changed: &changed
+        )
+
+        if changed {
+            return Data(bytes)
+        }
+        return data
+    }
+
+    private func rewriteTFDTBoxes(in bytes: inout [UInt8], range: Range<Int>, decodeTimeOffset: inout UInt64?, changed: inout Bool) {
+        var cursor = range.lowerBound
+
+        while cursor + 8 <= range.upperBound {
+            let size32 = readUInt32(bytes, at: cursor)
+            if size32 == 0 {
+                break
+            }
+
+            var boxSize = Int(size32)
+            var headerSize = 8
+
+            if size32 == 1 {
+                guard cursor + 16 <= range.upperBound else { break }
+                let size64 = readUInt64(bytes, at: cursor + 8)
+                guard size64 >= 16, size64 <= UInt64(range.upperBound - cursor) else { break }
+                boxSize = Int(size64)
+                headerSize = 16
+            } else {
+                guard boxSize >= 8, cursor + boxSize <= range.upperBound else { break }
+            }
+
+            let type = String(bytes: bytes[(cursor + 4)..<(cursor + 8)], encoding: .ascii) ?? ""
+            let payloadStart = cursor + headerSize
+            let payloadEnd = cursor + boxSize
+
+            if type == "tfdt" {
+                guard payloadStart + 4 <= payloadEnd else {
+                    cursor += boxSize
+                    continue
+                }
+
+                let version = bytes[payloadStart]
+                let valueOffset = payloadStart + 4
+
+                if version == 1 {
+                    guard valueOffset + 8 <= payloadEnd else {
+                        cursor += boxSize
+                        continue
+                    }
+
+                    let decodeTime = readUInt64(bytes, at: valueOffset)
+                    if decodeTimeOffset == nil {
+                        decodeTimeOffset = decodeTime
+                    }
+                    let adjusted = decodeTime &- (decodeTimeOffset ?? 0)
+                    if adjusted != decodeTime {
+                        writeUInt64(adjusted, to: &bytes, at: valueOffset)
+                        changed = true
+                    }
+                } else {
+                    guard valueOffset + 4 <= payloadEnd else {
+                        cursor += boxSize
+                        continue
+                    }
+
+                    let decodeTime32 = readUInt32(bytes, at: valueOffset)
+                    let decodeTime = UInt64(decodeTime32)
+                    if decodeTimeOffset == nil {
+                        decodeTimeOffset = decodeTime
+                    }
+                    let adjusted = decodeTime &- (decodeTimeOffset ?? 0)
+                    if adjusted <= UInt64(UInt32.max) {
+                        let adjusted32 = UInt32(adjusted)
+                        if adjusted32 != decodeTime32 {
+                            writeUInt32(adjusted32, to: &bytes, at: valueOffset)
+                            changed = true
+                        }
+                    }
+                }
+            } else if isContainerBox(type), payloadStart < payloadEnd {
+                rewriteTFDTBoxes(
+                    in: &bytes,
+                    range: payloadStart..<payloadEnd,
+                    decodeTimeOffset: &decodeTimeOffset,
+                    changed: &changed
+                )
+            }
+
+            cursor += boxSize
+        }
+    }
+
+    private func isContainerBox(_ type: String) -> Bool {
+        switch type {
+        case "moov", "moof", "traf", "trak", "mdia", "minf", "stbl", "edts", "dinf", "mvex", "meta", "udta", "mfra", "skip", "ilst":
+            return true
+        default:
+            return false
+        }
+    }
+
+    private func readUInt32(_ bytes: [UInt8], at offset: Int) -> UInt32 {
+        return (UInt32(bytes[offset]) << 24)
+            | (UInt32(bytes[offset + 1]) << 16)
+            | (UInt32(bytes[offset + 2]) << 8)
+            | UInt32(bytes[offset + 3])
+    }
+
+    private func readUInt64(_ bytes: [UInt8], at offset: Int) -> UInt64 {
+        return (UInt64(bytes[offset]) << 56)
+            | (UInt64(bytes[offset + 1]) << 48)
+            | (UInt64(bytes[offset + 2]) << 40)
+            | (UInt64(bytes[offset + 3]) << 32)
+            | (UInt64(bytes[offset + 4]) << 24)
+            | (UInt64(bytes[offset + 5]) << 16)
+            | (UInt64(bytes[offset + 6]) << 8)
+            | UInt64(bytes[offset + 7])
+    }
+
+    private func writeUInt32(_ value: UInt32, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8((value >> 24) & 0xFF)
+        bytes[offset + 1] = UInt8((value >> 16) & 0xFF)
+        bytes[offset + 2] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 3] = UInt8(value & 0xFF)
+    }
+
+    private func writeUInt64(_ value: UInt64, to bytes: inout [UInt8], at offset: Int) {
+        bytes[offset] = UInt8((value >> 56) & 0xFF)
+        bytes[offset + 1] = UInt8((value >> 48) & 0xFF)
+        bytes[offset + 2] = UInt8((value >> 40) & 0xFF)
+        bytes[offset + 3] = UInt8((value >> 32) & 0xFF)
+        bytes[offset + 4] = UInt8((value >> 24) & 0xFF)
+        bytes[offset + 5] = UInt8((value >> 16) & 0xFF)
+        bytes[offset + 6] = UInt8((value >> 8) & 0xFF)
+        bytes[offset + 7] = UInt8(value & 0xFF)
     }
 
     private func appendSegmentToRecordingPreviewBuffer(data: Data, duration: Double) {
@@ -882,8 +1184,16 @@ actor Channel {
     }
 
     private func recordingPreviewTempFilePath() -> String {
-        if let existing = recordingPreviewTempPath {
+        let preferredExtension = activeInitSegmentData == nil ? "ts" : "mp4"
+
+        if let existing = recordingPreviewTempPath,
+           (existing as NSString).pathExtension == preferredExtension {
             return existing
+        }
+
+        if let stalePath = recordingPreviewTempPath {
+            try? FileManager.default.removeItem(atPath: stalePath)
+            recordingPreviewTempPath = nil
         }
 
         let tempRoot = URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
@@ -896,7 +1206,7 @@ actor Channel {
             logPreviewFailureIfNeeded("Could not create recording preview temp directory: \(error.localizedDescription)")
         }
 
-        let path = previewsDir.appendingPathComponent("\(config.username)_preview.ts").path
+        let path = previewsDir.appendingPathComponent("\(config.username)_preview.\(preferredExtension)").path
         recordingPreviewTempPath = path
         return path
     }
@@ -909,7 +1219,12 @@ actor Channel {
 
         do {
             var merged = Data()
-            merged.reserveCapacity(recentPreviewBytes)
+            merged.reserveCapacity(recentPreviewBytes + (activeInitSegmentData?.count ?? 0))
+
+            if let initData = activeInitSegmentData {
+                merged.append(initData)
+            }
+
             for chunk in recentPreviewSegments {
                 merged.append(chunk.data)
             }
@@ -928,27 +1243,60 @@ actor Channel {
         addLog(message)
     }
 
-    private func refreshLiveRecordingThumbnail() async -> Bool {
+    private func refreshLiveRecordingThumbnail() async -> ThumbnailGenerationResult {
         if let previewPath = writeRecordingPreviewTempFileIfNeeded() {
-            let previewSuccess = await generateThumbnail(from: previewPath)
-            if previewSuccess {
-                return true
+            let previewResult = await generateThumbnailDetailed(from: previewPath, analyzeForBreak: true)
+            if previewResult.breakDetected {
+                return previewResult
+            }
+            if previewResult.success {
+                return previewResult
             }
         }
 
-        guard let filename = currentFilename else { return false }
-        return await generateThumbnail(from: filename)
+        guard let filename = currentFilename else {
+            return ThumbnailGenerationResult(success: false, breakDetected: false)
+        }
+        return await generateThumbnailDetailed(from: filename, analyzeForBreak: true)
     }
 
     private func clearRecordingPreviewState(removeTempFile: Bool) {
         recentPreviewSegments.removeAll(keepingCapacity: false)
         recentPreviewDuration = 0
         recentPreviewBytes = 0
+        activeInitSegmentURI = nil
+        activeInitSegmentData = nil
 
         if removeTempFile, let path = recordingPreviewTempPath {
             try? FileManager.default.removeItem(atPath: path)
             recordingPreviewTempPath = nil
         }
+    }
+
+    private func refreshActiveInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws {
+        guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
+            activeInitSegmentURI = nil
+            activeInitSegmentData = nil
+            return
+        }
+
+        if activeInitSegmentURI == initURI, activeInitSegmentData != nil {
+            return
+        }
+
+        let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
+        let initData = try await httpClient.getData(resolvedInitURL)
+        activeInitSegmentURI = initURI
+        activeInitSegmentData = initData
+    }
+
+    private func loadInitSegmentDataIfPresent(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws -> Data? {
+        guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
+            return nil
+        }
+
+        let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
+        return try await httpClient.getData(resolvedInitURL)
     }
     
     private func cleanupThumbnail() {
@@ -1118,9 +1466,391 @@ actor Channel {
 
         return sorted.first
     }
+
+    private func consumePendingBreakOfflineReason() -> String? {
+        let reason = pendingBreakOfflineReason
+        pendingBreakOfflineReason = nil
+        return reason
+    }
+
+    private func resetBreakDetectionState(clearPendingReason: Bool = true) {
+        lastBreakAnalysisAt = nil
+        lastBreakLumaFrame = nil
+        latestPersonDetected = nil
+        lastPersonSeenAt = nil
+        isNoPersonLikely = false
+        noPersonStreakSeconds = 0
+        noPersonCarryExpiryAt = nil
+        noPersonEvidenceExpiryAt = nil
+        activePersonMotionSeconds = 0
+        breakEnforced = false
+        breakEnforcedAt = nil
+        staticFrameStreakSeconds = 0
+        noPersonNoMotionStreakSeconds = 0
+        if clearPendingReason {
+            pendingBreakOfflineReason = nil
+        }
+    }
+
+    private func preserveNoPersonStateAcrossTransientOffline() {
+        lastBreakAnalysisAt = nil
+        lastBreakLumaFrame = nil
+        pendingBreakOfflineReason = nil
+
+        if noPersonStreakSeconds > 0 || isNoPersonLikely || noPersonNoMotionStreakSeconds > 0 || noPersonEvidenceExpiryAt != nil {
+            noPersonCarryExpiryAt = Date().addingTimeInterval(Self.noPersonOfflineCarryWindowSeconds)
+        } else {
+            noPersonCarryExpiryAt = nil
+        }
+
+        if noPersonEvidenceExpiryAt != nil {
+            noPersonEvidenceExpiryAt = Date().addingTimeInterval(Self.noPersonOfflineCarryWindowSeconds)
+        }
+    }
+
+    private func prepareForRecordingAttempt() {
+        let now = Date()
+
+        if let carryExpiry = noPersonCarryExpiryAt, now > carryExpiry {
+            noPersonStreakSeconds = 0
+            noPersonNoMotionStreakSeconds = 0
+            isNoPersonLikely = false
+            latestPersonDetected = nil
+            lastPersonSeenAt = nil
+            noPersonEvidenceExpiryAt = nil
+            activePersonMotionSeconds = 0
+        }
+
+        if let noPersonEvidenceExpiryAt, now > noPersonEvidenceExpiryAt {
+            self.noPersonEvidenceExpiryAt = nil
+            activePersonMotionSeconds = 0
+        }
+
+        noPersonCarryExpiryAt = nil
+        lastBreakAnalysisAt = nil
+        lastBreakLumaFrame = nil
+        pendingBreakOfflineReason = nil
+    }
+
+    private func shouldRemainOnBreakBeforeRecording(hlsSource: String) async -> Bool {
+        guard breakEnforced else { return false }
+
+        do {
+            let checkResult = try await runPreflightFrameAnalysis(hlsSource: hlsSource, purpose: "break_recheck")
+            if checkResult.breakDetected {
+                return true
+            }
+
+            if hasRecoveredFromBreak() {
+                clearBreakEnforcement()
+                addLog("Break cleared after sustained person+motion recovery")
+                return false
+            }
+
+            pendingBreakOfflineReason = "Break hold: still waiting for clear person+motion recovery"
+            return true
+        } catch {
+            pendingBreakOfflineReason = "Break hold: recheck failed (\(error.localizedDescription))"
+            return true
+        }
+    }
+
+    private func shouldDelayStartForNoPerson(hlsSource: String) async -> Bool {
+        var misses = 0
+        let sampleCount = max(Self.recordingStartNoPersonRequiredMisses, Self.recordingStartNoPersonSamples)
+        let requiredMisses = max(1, min(sampleCount, Self.recordingStartNoPersonRequiredMisses))
+        let sampleDelaySeconds = 2.0
+
+        for index in 0..<sampleCount {
+            do {
+                // Force each preflight iteration to run a fresh analysis pass.
+                lastBreakAnalysisAt = nil
+                let checkResult = try await runPreflightFrameAnalysis(
+                    hlsSource: hlsSource,
+                    purpose: "start_gate_\(index)"
+                )
+
+                if checkResult.breakDetected {
+                    return true
+                }
+
+                let personDetected = latestPersonDetected == true
+                if personDetected {
+                    return false
+                }
+
+                misses += 1
+                if misses >= requiredMisses {
+                    pendingBreakOfflineReason = "Start gate: no person detected during preflight checks"
+                    addLog("Start gate: delaying recording start (no person detected)")
+                    noPersonCarryExpiryAt = Date().addingTimeInterval(Self.noPersonOfflineCarryWindowSeconds)
+                    return true
+                }
+            } catch {
+                // Fail open on preflight errors to avoid blocking healthy channels due transient fetch issues.
+                addLog("Start gate preflight error (\(error.localizedDescription)); not blocking start")
+                return false
+            }
+
+            if index < sampleCount - 1 {
+                try? await Task.sleep(nanoseconds: UInt64(sampleDelaySeconds * 1_000_000_000))
+            }
+        }
+
+        return false
+    }
+
+    private func runPreflightFrameAnalysis(hlsSource: String, purpose: String) async throws -> ThumbnailGenerationResult {
+        let playlist = try await withRequestSlot {
+            try await client.getPlaylist(
+                hlsSource: hlsSource,
+                resolution: config.resolution,
+                framerate: config.framerate
+            )
+        }
+
+        let httpClient = HTTPClient(config: appConfig)
+        let mediaPlaylistContent = try await withRequestSlot {
+            try await httpClient.get(playlist.playlistURL)
+        }
+        let segments = try M3U8Parser.parseMediaPlaylist(mediaPlaylistContent)
+
+        guard let latestSegment = segments.last else {
+            throw ChaturbateError.parsingError("No media segments available for preflight analysis")
+        }
+
+        let segmentURL = resolveSegmentURL(latestSegment.uri, playlistURL: playlist.playlistURL)
+        let segmentData = try await downloadSegmentWithRetry(httpClient: httpClient, url: segmentURL, maxRetries: 2)
+
+        guard segmentData.count <= Self.pausedPreviewMaxSegmentBytes else {
+            throw ChaturbateError.parsingError("Preflight segment too large")
+        }
+
+        let tempDir = NSTemporaryDirectory()
+        let initData = try await loadInitSegmentDataIfPresent(
+            mediaPlaylistContent: mediaPlaylistContent,
+            playlistURL: playlist.playlistURL,
+            httpClient: httpClient
+        )
+        let tempExtension = initData == nil ? "ts" : "mp4"
+        let tempSegmentPath = (tempDir as NSString).appendingPathComponent("\(config.username)_\(purpose).\(tempExtension)")
+        let tempSegmentURL = URL(fileURLWithPath: tempSegmentPath)
+
+        var previewData = Data()
+        if let initData {
+            previewData.append(initData)
+        }
+        previewData.append(segmentData)
+        try previewData.write(to: tempSegmentURL, options: .atomic)
+        defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
+
+        return await generateThumbnailDetailed(from: tempSegmentPath, analyzeForBreak: true)
+    }
+
+    private func hasRecoveredFromBreak() -> Bool {
+        let noPersonThresholdSeconds = TimeInterval(max(1, min(60, appConfig.breakNoPersonNoMotionThresholdMinutes))) * 60
+        let requiredMotionSeconds = max(30.0, min(180.0, noPersonThresholdSeconds / 2.0))
+
+        let hasPerson = latestPersonDetected == true
+        let hasMotion = activePersonMotionSeconds >= requiredMotionSeconds
+        let notStatic = staticFrameStreakSeconds == 0
+
+        return hasPerson && hasMotion && notStatic
+    }
+
+    private func clearBreakEnforcement() {
+        breakEnforced = false
+        breakEnforcedAt = nil
+        noPersonEvidenceExpiryAt = nil
+        noPersonNoMotionStreakSeconds = 0
+        noPersonStreakSeconds = 0
+        isNoPersonLikely = false
+        noPersonCarryExpiryAt = nil
+        pendingBreakOfflineReason = nil
+    }
+
+    private func evaluateBreakSignalIfNeeded(frameImage: CGImage) -> Bool {
+        let analysisIntervalSeconds = TimeInterval(max(5, min(60, appConfig.breakAnalysisIntervalSeconds)))
+        let staticThresholdSeconds = TimeInterval(max(1, min(180, appConfig.breakStaticThresholdMinutes))) * 60
+        let noPersonThresholdSeconds = TimeInterval(max(1, min(60, appConfig.breakNoPersonNoMotionThresholdMinutes))) * 60
+        let noPersonBadgeThresholdSeconds = min(90.0, max(20.0, noPersonThresholdSeconds / 3.0))
+        let sustainedNoPersonEvidenceThresholdSeconds = min(noPersonThresholdSeconds, max(120.0, noPersonBadgeThresholdSeconds * 2.0))
+        let personDetectionGraceSeconds = max(30.0, analysisIntervalSeconds * 6.0)
+
+        let now = Date()
+        if let carryExpiry = noPersonCarryExpiryAt, now > carryExpiry {
+            noPersonStreakSeconds = 0
+            noPersonNoMotionStreakSeconds = 0
+            isNoPersonLikely = false
+            latestPersonDetected = nil
+            lastPersonSeenAt = nil
+            noPersonEvidenceExpiryAt = nil
+            activePersonMotionSeconds = 0
+            noPersonCarryExpiryAt = nil
+        }
+
+        if let noPersonEvidenceExpiryAt, now > noPersonEvidenceExpiryAt {
+            self.noPersonEvidenceExpiryAt = nil
+            activePersonMotionSeconds = 0
+        }
+
+        if let last = lastBreakAnalysisAt,
+           now.timeIntervalSince(last) < analysisIntervalSeconds {
+            return false
+        }
+
+        let elapsed = max(
+            analysisIntervalSeconds,
+            lastBreakAnalysisAt.map { now.timeIntervalSince($0) } ?? analysisIntervalSeconds
+        )
+        lastBreakAnalysisAt = now
+
+        guard let currentLuma = lumaFrame(from: frameImage, size: Self.breakAnalysisImageSize) else {
+            resetBreakDetectionState()
+            return false
+        }
+
+        let motionScore: Double?
+        if let previousLuma = lastBreakLumaFrame, previousLuma.count == currentLuma.count {
+            motionScore = meanAbsoluteDifference(previousLuma, currentLuma)
+        } else {
+            motionScore = nil
+        }
+        lastBreakLumaFrame = currentLuma
+
+        let hasPerson = detectHumanPresence(in: frameImage)
+        if hasPerson {
+            latestPersonDetected = true
+            lastPersonSeenAt = now
+        } else if let lastSeenAt = lastPersonSeenAt,
+                  now.timeIntervalSince(lastSeenAt) <= personDetectionGraceSeconds {
+            latestPersonDetected = true
+        } else {
+            latestPersonDetected = false
+        }
+        let effectivePersonDetected = latestPersonDetected ?? hasPerson
+        let isStaticFrame = (motionScore ?? 1.0) <= Self.breakStaticMotionThreshold
+        let isLowMotion = (motionScore ?? 1.0) <= Self.breakLowMotionThreshold
+
+        if !effectivePersonDetected {
+            noPersonStreakSeconds += elapsed
+        } else {
+            noPersonStreakSeconds = 0
+        }
+
+        if motionScore != nil, isStaticFrame {
+            staticFrameStreakSeconds += elapsed
+        } else {
+            staticFrameStreakSeconds = 0
+        }
+
+        if motionScore != nil, !effectivePersonDetected, isLowMotion {
+            noPersonNoMotionStreakSeconds += elapsed
+        } else {
+            noPersonNoMotionStreakSeconds = 0
+        }
+        isNoPersonLikely = noPersonNoMotionStreakSeconds >= noPersonBadgeThresholdSeconds
+
+        if noPersonNoMotionStreakSeconds >= sustainedNoPersonEvidenceThresholdSeconds {
+            noPersonEvidenceExpiryAt = now.addingTimeInterval(Self.noPersonOfflineCarryWindowSeconds)
+        }
+
+        if effectivePersonDetected && !isLowMotion {
+            activePersonMotionSeconds += elapsed
+        } else {
+            activePersonMotionSeconds = 0
+        }
+
+        if activePersonMotionSeconds >= 120 {
+            noPersonEvidenceExpiryAt = nil
+        }
+
+        let hasSustainedNoPersonEvidence = noPersonEvidenceExpiryAt.map { now <= $0 } ?? false
+
+        if hasSustainedNoPersonEvidence,
+           staticFrameStreakSeconds >= Self.noPersonThenStaticConfirmSeconds {
+            breakEnforced = true
+            breakEnforcedAt = now
+            pendingBreakOfflineReason = "Break detection: sustained no-person period followed by confirmed static image"
+            addLog(pendingBreakOfflineReason ?? "Break detection: no-person + static image")
+            return true
+        }
+
+        if staticFrameStreakSeconds >= staticThresholdSeconds {
+            breakEnforced = true
+            breakEnforcedAt = now
+            pendingBreakOfflineReason = "Break detection: stream has looked static for \(Int(staticFrameStreakSeconds))s"
+            addLog(pendingBreakOfflineReason ?? "Break detection: static stream")
+            return true
+        }
+
+        if noPersonNoMotionStreakSeconds >= noPersonThresholdSeconds {
+            breakEnforced = true
+            breakEnforcedAt = now
+            pendingBreakOfflineReason = "Break detection: no person + minimal motion for \(Int(noPersonNoMotionStreakSeconds))s"
+            addLog(pendingBreakOfflineReason ?? "Break detection: no person + no motion")
+            return true
+        }
+
+        return false
+    }
+
+    private func lumaFrame(from image: CGImage, size: Int) -> [UInt8]? {
+        var pixels = [UInt8](repeating: 0, count: size * size)
+        guard let context = CGContext(
+            data: &pixels,
+            width: size,
+            height: size,
+            bitsPerComponent: 8,
+            bytesPerRow: size,
+            space: CGColorSpaceCreateDeviceGray(),
+            bitmapInfo: CGImageAlphaInfo.none.rawValue
+        ) else {
+            return nil
+        }
+
+        context.interpolationQuality = .low
+        context.draw(image, in: CGRect(x: 0, y: 0, width: size, height: size))
+        return pixels
+    }
+
+    private func meanAbsoluteDifference(_ lhs: [UInt8], _ rhs: [UInt8]) -> Double {
+        guard lhs.count == rhs.count, !lhs.isEmpty else { return 1.0 }
+
+        var totalDifference: Int = 0
+        for index in lhs.indices {
+            totalDifference += abs(Int(lhs[index]) - Int(rhs[index]))
+        }
+
+        return Double(totalDifference) / Double(lhs.count * 255)
+    }
+
+    private func detectHumanPresence(in image: CGImage) -> Bool {
+        let faceRequest = VNDetectFaceRectanglesRequest()
+        let bodyRequest = VNDetectHumanRectanglesRequest()
+        bodyRequest.upperBodyOnly = false
+
+        let handler = VNImageRequestHandler(cgImage: image, options: [:])
+        do {
+            try handler.perform([faceRequest, bodyRequest])
+            let hasFace = !(faceRequest.results?.isEmpty ?? true)
+            let hasBody = !(bodyRequest.results?.isEmpty ?? true)
+            return hasFace || hasBody
+        } catch {
+            // Fail open to avoid false positives if Vision cannot analyze the frame.
+            return true
+        }
+    }
     
     private func generateThumbnail(from videoPath: String) async -> Bool {
-        guard FileManager.default.fileExists(atPath: videoPath) else { return false }
+        let result = await generateThumbnailDetailed(from: videoPath, analyzeForBreak: false)
+        return result.success
+    }
+
+    private func generateThumbnailDetailed(from videoPath: String, analyzeForBreak: Bool) async -> ThumbnailGenerationResult {
+        guard FileManager.default.fileExists(atPath: videoPath) else {
+            return ThumbnailGenerationResult(success: false, breakDetected: false)
+        }
         
         let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
         let imageGenerator = AVAssetImageGenerator(asset: asset)
@@ -1155,6 +1885,7 @@ actor Channel {
             }
             
             let cgImage = try imageGenerator.copyCGImage(at: targetTime, actualTime: nil)
+            let breakDetected = analyzeForBreak ? evaluateBreakSignalIfNeeded(frameImage: cgImage) : false
             
             // Save thumbnail to persistent app support directory
             let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
@@ -1177,13 +1908,13 @@ actor Channel {
                 try jpegData.write(to: thumbnailURL)
                 thumbnailPath = newThumbnailPath
                 addLog("✓ Thumbnail generated successfully")
-                return true
+                return ThumbnailGenerationResult(success: true, breakDetected: breakDetected)
             }
-            return false
+            return ThumbnailGenerationResult(success: false, breakDetected: breakDetected)
         } catch {
             // Silently fail on most errors - thumbnails are nice-to-have
             addLog("Thumbnail generation failed: \(error.localizedDescription)")
-            return false
+            return ThumbnailGenerationResult(success: false, breakDetected: false)
         }
     }
     

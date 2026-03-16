@@ -1,5 +1,30 @@
 import Foundation
 
+struct BioMetadata: Codable, Equatable {
+    var gender: String? // e.g., "A Woman", "A Man"
+    var followers: Int?
+    var location: String?
+    var body: String? // e.g., "36 / 23 / 37"
+    var language: String?
+    var lastBioRefresh: Int64? // timestamp of last bio fetch
+    
+    init(
+        gender: String? = nil,
+        followers: Int? = nil,
+        location: String? = nil,
+        body: String? = nil,
+        language: String? = nil,
+        lastBioRefresh: Int64? = nil
+    ) {
+        self.gender = gender
+        self.followers = followers
+        self.location = location
+        self.body = body
+        self.language = language
+        self.lastBioRefresh = lastBioRefresh
+    }
+}
+
 struct ChannelConfig: Codable, Identifiable {
     var id: String { username }
     var isPaused: Bool
@@ -14,6 +39,7 @@ struct ChannelConfig: Codable, Identifiable {
     var lastOnlineAt: Int64?
     var recordingHistory: [String]
     var isInvalid: Bool
+    var bioMetadata: BioMetadata?
     
     init(
         isPaused: Bool = false,
@@ -27,7 +53,8 @@ struct ChannelConfig: Codable, Identifiable {
         createdAt: Int64? = nil,
         lastOnlineAt: Int64? = nil,
         recordingHistory: [String] = [],
-        isInvalid: Bool = false
+        isInvalid: Bool = false,
+        bioMetadata: BioMetadata? = nil
     ) {
         self.isPaused = isPaused
         self.username = Self.sanitizeUsername(username)
@@ -41,6 +68,7 @@ struct ChannelConfig: Codable, Identifiable {
         self.lastOnlineAt = lastOnlineAt
         self.recordingHistory = recordingHistory
         self.isInvalid = isInvalid
+        self.bioMetadata = bioMetadata
     }
 
     private enum CodingKeys: String, CodingKey {
@@ -56,6 +84,7 @@ struct ChannelConfig: Codable, Identifiable {
         case lastOnlineAt
         case recordingHistory
         case isInvalid
+        case bioMetadata
     }
 
     init(from decoder: Decoder) throws {
@@ -72,6 +101,7 @@ struct ChannelConfig: Codable, Identifiable {
         lastOnlineAt = try container.decodeIfPresent(Int64.self, forKey: .lastOnlineAt)
         recordingHistory = try container.decodeIfPresent([String].self, forKey: .recordingHistory) ?? []
         isInvalid = try container.decodeIfPresent(Bool.self, forKey: .isInvalid) ?? false
+        bioMetadata = try container.decodeIfPresent(BioMetadata.self, forKey: .bioMetadata)
     }
     
     private static func sanitizeUsername(_ username: String) -> String {
@@ -103,9 +133,12 @@ struct ChannelInfo: Identifiable {
     var isWaitingForRecordingSlot: Bool
     var isInvalid: Bool
     var cloudflareBlockCount: Int
+    var isNoPersonDetected: Bool
+    var noPersonDurationSeconds: Int
     var segmentRetryCount: Int
     var consecutiveSegmentFailures: Int
     var lastSegmentFailureAt: String?
+    var bioMetadata: BioMetadata?
 }
 
 struct RuntimeDiagnostics {
@@ -150,6 +183,9 @@ struct AppConfig: Codable {
     var domain: String = "https://chaturbate.com/"
     var maxConcurrentRequests: Int = 6 // max concurrent API requests across all channels
     var maxConcurrentRecordings: Int = 0 // 0 means unlimited concurrent recordings
+    var breakStaticThresholdMinutes: Int = 10
+    var breakNoPersonNoMotionThresholdMinutes: Int = 3
+    var breakAnalysisIntervalSeconds: Int = 10
     
     // Custom decoding to handle missing selectedBrowser from old configs
     init(from decoder: Decoder) throws {
@@ -165,6 +201,9 @@ struct AppConfig: Codable {
         domain = try container.decodeIfPresent(String.self, forKey: .domain) ?? "https://chaturbate.com/"
         maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 6
         maxConcurrentRecordings = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecordings) ?? 0
+        breakStaticThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakStaticThresholdMinutes) ?? 10
+        breakNoPersonNoMotionThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakNoPersonNoMotionThresholdMinutes) ?? 3
+        breakAnalysisIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .breakAnalysisIntervalSeconds) ?? 10
     }
     
     init() {
@@ -176,6 +215,9 @@ struct AppConfig: Codable {
         case maxDuration, maxFilesize, interval, selectedBrowser
         case domain, maxConcurrentRequests
         case maxConcurrentRecordings
+        case breakStaticThresholdMinutes
+        case breakNoPersonNoMotionThresholdMinutes
+        case breakAnalysisIntervalSeconds
     }
     
     func getOutputPath() -> String {

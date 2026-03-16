@@ -7,6 +7,11 @@ struct SettingsView: View {
     @State private var outputDirectory: String = ""
     @State private var showingDirectoryPicker = false
     @State private var diagnosticsTimer: Timer?
+    @State private var bioBackfillMessage: String?
+    @State private var isBackfillingBio = false
+    @State private var bioBackfillCount = 0
+    @State private var bioBackfillTotal = 0
+    @State private var bioBackfillTask: Task<Void, Never>?
     
     var body: some View {
         VStack(spacing: 0) {
@@ -165,6 +170,78 @@ struct SettingsView: View {
                             Divider()
 
                             VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Break: Static Scene Threshold")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    Stepper(value: Binding(
+                                        get: { manager.appConfig.breakStaticThresholdMinutes },
+                                        set: {
+                                            manager.appConfig.breakStaticThresholdMinutes = max(1, min(180, $0))
+                                            manager.saveAppConfig()
+                                        }
+                                    ), in: 1...180) {
+                                        Text("\(manager.appConfig.breakStaticThresholdMinutes) min")
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Text("Treat stream as break/offline when frames stay essentially static this long")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Break: No Person + Low Motion")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    Stepper(value: Binding(
+                                        get: { manager.appConfig.breakNoPersonNoMotionThresholdMinutes },
+                                        set: {
+                                            manager.appConfig.breakNoPersonNoMotionThresholdMinutes = max(1, min(60, $0))
+                                            manager.saveAppConfig()
+                                        }
+                                    ), in: 1...60) {
+                                        Text("\(manager.appConfig.breakNoPersonNoMotionThresholdMinutes) min")
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Text("Require both no detected human body/face and low motion for this duration")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Break Analysis Interval")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    Stepper(value: Binding(
+                                        get: { manager.appConfig.breakAnalysisIntervalSeconds },
+                                        set: {
+                                            manager.appConfig.breakAnalysisIntervalSeconds = max(5, min(60, $0))
+                                            manager.saveAppConfig()
+                                        }
+                                    ), in: 5...60) {
+                                        Text("\(manager.appConfig.breakAnalysisIntervalSeconds) sec")
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Text("How frequently live frames are sampled for break detection")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
                                 Text("Browser for Cookies & User-Agent")
                                     .font(.subheadline)
                                     .fontWeight(.medium)
@@ -204,6 +281,51 @@ struct SettingsView: View {
                         .padding(16)
                         .background(Color(NSColor.controlBackgroundColor))
                         .cornerRadius(10)
+
+                    VStack(alignment: .leading, spacing: 12) {
+                        Text("Bio Metadata")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+
+                        HStack(spacing: 12) {
+                            Button(action: refreshAllBioMetadataFromSettings) {
+                                Label("Refresh All Bio Data", systemImage: "arrow.clockwise")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isBackfillingBio)
+
+                            if isBackfillingBio {
+                                HStack(spacing: 8) {
+                                    ProgressView()
+                                        .scaleEffect(0.8)
+                                    Text("\(bioBackfillCount)/\(bioBackfillTotal)")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    Button("Cancel") {
+                                        bioBackfillTask?.cancel()
+                                        bioBackfillTask = nil
+                                        isBackfillingBio = false
+                                        bioBackfillMessage = "Cancelled."
+                                    }
+                                    .buttonStyle(.bordered)
+                                }
+                            }
+                        }
+
+                        Text("Bio metadata is fetched automatically for every new channel. Use this to refresh all channels on demand.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        if let bioBackfillMessage {
+                            Text(bioBackfillMessage)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+                    }
+                    .padding(16)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
 
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Logs")
@@ -252,6 +374,8 @@ struct SettingsView: View {
         .onDisappear {
             diagnosticsTimer?.invalidate()
             diagnosticsTimer = nil
+            bioBackfillTask?.cancel()
+            bioBackfillTask = nil
         }
         .frame(width: 620, height: 540)
     }
@@ -310,6 +434,35 @@ struct SettingsView: View {
     private func refreshDiagnostics() {
         Task { @MainActor in
             _ = await manager.getAllChannelInfo()
+        }
+    }
+
+    private func refreshAllBioMetadataFromSettings() {
+        bioBackfillMessage = nil
+        isBackfillingBio = true
+        bioBackfillCount = 0
+        bioBackfillTotal = manager.channelCount
+
+        bioBackfillTask = Task { @MainActor in
+            do {
+                try await manager.backfillAllChannelsBioMetadata { progress in
+                    Task { @MainActor in
+                        bioBackfillCount = progress.completed
+                        bioBackfillMessage = "Fetching bio data from \(progress.currentChannel)..."
+                    }
+                }
+                isBackfillingBio = false
+                bioBackfillMessage = "Bio metadata refresh complete."
+                bioBackfillTask = nil
+            } catch is CancellationError {
+                isBackfillingBio = false
+                bioBackfillMessage = "Cancelled."
+                bioBackfillTask = nil
+            } catch {
+                isBackfillingBio = false
+                bioBackfillMessage = "Error: \(error.localizedDescription)"
+                bioBackfillTask = nil
+            }
         }
     }
     

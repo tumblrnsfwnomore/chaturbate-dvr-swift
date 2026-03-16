@@ -1,14 +1,17 @@
 import SwiftUI
 import AppKit
 import AVKit
+import AVFoundation
 
 private enum DetailTab: String {
     case allChannels
     case channel
+    case recordings
 }
 
 enum ChannelStatusFilter: String, CaseIterable, Identifiable {
     case all = "All"
+    case online = "Online"
     case recording = "Recording"
     case paused = "Paused"
     case offline = "Offline"
@@ -17,27 +20,43 @@ enum ChannelStatusFilter: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+private func formatNoPersonDuration(_ seconds: Int) -> String {
+    let clamped = max(0, seconds)
+    let hours = clamped / 3600
+    let minutes = (clamped % 3600) / 60
+    let remainingSeconds = clamped % 60
+
+    if hours > 0 {
+        return String(format: "%dh %02dm", hours, minutes)
+    }
+    return String(format: "%d:%02d", minutes, remainingSeconds)
+}
+
 struct ContentView: View {
     @StateObject private var manager = ChannelManager()
     @State private var showingAddChannel = false
+    @State private var showingImportChannels = false
     @State private var showingSettings = false
     @State private var showingEditChannel = false
     @State private var selectedChannel: String?
     @State private var selectedDetailTab: DetailTab = .allChannels
     @State private var errorMessage: String?
     @State private var showingError = false
-    @State private var orderedChannelUsernames: [String] = []
-    @State private var channelOrderTimer: Timer?
+    @State private var channelInfos: [ChannelInfo] = []
+    @State private var channelInfoTimer: Timer?
     @State private var searchText: String = ""
     @State private var statusFilter: ChannelStatusFilter = .all
+    @State private var genderFilter: String? = nil
     
     var body: some View {
         NavigationSplitView {
             ChannelListView(
                 manager: manager,
                 selectedChannel: $selectedChannel,
+                channelInfos: channelInfos,
                 searchText: $searchText,
                 statusFilter: $statusFilter,
+                genderFilter: $genderFilter,
                 onActivateChannel: { username in
                     selectedChannel = username
                     selectedDetailTab = .channel
@@ -48,6 +67,7 @@ struct ContentView: View {
                 Picker("View", selection: $selectedDetailTab) {
                     Text("All Channels").tag(DetailTab.allChannels)
                     Text("Channel").tag(DetailTab.channel)
+                    Text("Recordings").tag(DetailTab.recordings)
                 }
                 .pickerStyle(.segmented)
                 .padding(.horizontal, 16)
@@ -61,10 +81,14 @@ struct ContentView: View {
                         AllChannelsGridView(
                             manager: manager,
                             selectedChannel: $selectedChannel,
+                            channelInfos: channelInfos,
                             searchText: $searchText,
                             statusFilter: $statusFilter,
+                            genderFilter: $genderFilter,
                             onOpenChannel: { selectedDetailTab = .channel }
                         )
+                    } else if selectedDetailTab == .recordings {
+                        RecordingsLibraryView(manager: manager)
                     } else if let username = selectedChannel {
                         ChannelDetailView(
                             manager: manager,
@@ -103,12 +127,15 @@ struct ContentView: View {
             }
         }
         .toolbar {
-            ToolbarItem(placement: .primaryAction) {
+            ToolbarItemGroup(placement: .primaryAction) {
                 Button(action: { showingAddChannel = true }) {
                     Label("Add Channel", systemImage: "plus")
                 }
-            }
-            ToolbarItem(placement: .automatic) {
+
+                Button(action: { showingImportChannels = true }) {
+                    Label("Import", systemImage: "square.and.arrow.down")
+                }
+
                 Button(action: { showingSettings = true }) {
                     Label("Settings", systemImage: "gearshape")
                 }
@@ -116,6 +143,9 @@ struct ContentView: View {
         }
         .sheet(isPresented: $showingAddChannel) {
             AddChannelView(manager: manager, errorMessage: $errorMessage, showingError: $showingError)
+        }
+        .sheet(isPresented: $showingImportChannels) {
+            ImportChannelsView(manager: manager)
         }
         .sheet(isPresented: $showingEditChannel) {
             if let username = selectedChannel {
@@ -140,11 +170,15 @@ struct ContentView: View {
         }
         .frame(minWidth: 1200, minHeight: 820)
         .onAppear {
-            startChannelOrderTimer()
+            startChannelInfoTimer()
         }
         .onDisappear {
-            channelOrderTimer?.invalidate()
+            channelInfoTimer?.invalidate()
         }
+    }
+
+    private var orderedChannelUsernames: [String] {
+        channelInfos.map { $0.username }
     }
 
     private var selectedChannelIndex: Int? {
@@ -163,18 +197,17 @@ struct ContentView: View {
         return orderedChannelUsernames[selectedChannelIndex + 1]
     }
 
-    private func startChannelOrderTimer() {
-        updateChannelOrder()
-        channelOrderTimer?.invalidate()
-        channelOrderTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            updateChannelOrder()
+    private func startChannelInfoTimer() {
+        updateChannelInfos()
+        channelInfoTimer?.invalidate()
+        channelInfoTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
+            updateChannelInfos()
         }
     }
 
-    private func updateChannelOrder() {
+    private func updateChannelInfos() {
         Task { @MainActor in
-            let infos = await manager.getAllChannelInfo()
-            orderedChannelUsernames = infos.map { $0.username }
+            channelInfos = await manager.getAllChannelInfo()
 
             if let selectedChannel,
                !orderedChannelUsernames.contains(selectedChannel) {
@@ -187,6 +220,7 @@ struct ContentView: View {
 struct AllChannelsGridView: View {
     private struct StatusCounts {
         let total: Int
+        let online: Int
         let recording: Int
         let paused: Int
         let offline: Int
@@ -195,58 +229,120 @@ struct AllChannelsGridView: View {
 
     @ObservedObject var manager: ChannelManager
     @Binding var selectedChannel: String?
+    let channelInfos: [ChannelInfo]
     @Binding var searchText: String
     @Binding var statusFilter: ChannelStatusFilter
+    @Binding var genderFilter: String?
     var onOpenChannel: (() -> Void)? = nil
-    @State private var channelInfos: [ChannelInfo] = []
-    @State private var timer: Timer?
 
     private let gridColumns = [GridItem(.adaptive(minimum: 260), spacing: 14)]
 
     var body: some View {
         Group {
             if channelInfos.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "rectangle.grid.2x2")
-                        .font(.system(size: 40))
-                        .foregroundColor(.secondary)
-                    Text("No Channels")
-                        .font(.headline)
-                        .foregroundColor(.secondary)
-                    Text("Add a channel to populate the preview grid")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
+                if manager.isHydratingChannels {
+                    VStack(spacing: 12) {
+                        ProgressView()
+                            .scaleEffect(1.1)
+                        Text("Loading channels...")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                        Text("Fetching your channel list")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    VStack(spacing: 12) {
+                        Image(systemName: "rectangle.grid.2x2")
+                            .font(.system(size: 40))
+                            .foregroundColor(.secondary)
+                        Text("No Channels")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                        Text("Add a channel to populate the preview grid")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
             } else {
                 VStack(spacing: 0) {
-                    VStack(spacing: 10) {
+                    VStack(spacing: 8) {
                         HStack(alignment: .firstTextBaseline, spacing: 10) {
                             TextField("Filter by username", text: $searchText)
                                 .textFieldStyle(.roundedBorder)
                                 .frame(minWidth: 240, idealWidth: 380, maxWidth: 520)
 
-                            Picker("Status", selection: $statusFilter) {
-                                ForEach(ChannelStatusFilter.allCases) { filter in
-                                    Text(filter.rawValue).tag(filter)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .frame(width: 170, alignment: .leading)
-
                             Spacer(minLength: 0)
                         }
 
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                countChip("Total", count: statusCounts.total, tint: .primary)
-                                countChip("Recording", count: statusCounts.recording, tint: .green)
-                                countChip("Paused", count: statusCounts.paused, tint: .orange)
-                                countChip("Offline", count: statusCounts.offline, tint: .secondary)
-                                countChip("Invalid", count: statusCounts.invalid, tint: .red)
-                                countChip("Showing", count: filteredChannelInfos.count, tint: .blue)
+                        HStack(spacing: 8) {
+                            countChip("Total", count: statusCounts.total, tint: .primary) {
+                                statusFilter = .all
                             }
-                            .padding(.vertical, 1)
+                            countChip("Online", count: statusCounts.online, tint: .mint) {
+                                statusFilter = .online
+                            }
+                            countChip("Recording", count: statusCounts.recording, tint: .green) {
+                                statusFilter = .recording
+                            }
+                            countChip("Paused", count: statusCounts.paused, tint: .orange) {
+                                statusFilter = .paused
+                            }
+                            countChip("Offline", count: statusCounts.offline, tint: .secondary) {
+                                statusFilter = .offline
+                            }
+                            countChip("Invalid", count: statusCounts.invalid, tint: .red) {
+                                statusFilter = .invalid
+                            }
+                            countChip("Showing", count: filteredChannelInfos.count, tint: .blue) {
+                                statusFilter = .all
+                            }
+                            
+                            Spacer(minLength: 0)
+                        }
+
+                        HStack(spacing: 8) {
+                            Button(action: { genderFilter = nil }) {
+                                HStack(spacing: 4) {
+                                    Text("All")
+                                        .font(.caption)
+                                        .lineLimit(1)
+                                    if genderFilter == nil {
+                                        Image(systemName: "checkmark")
+                                            .font(.caption2)
+                                    }
+                                }
+                                .padding(.horizontal, 9)
+                                .padding(.vertical, 4)
+                            }
+                            .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == nil))
+                            
+                            if availableGenders.isEmpty {
+                                Text("Fetching bio...")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                ForEach(availableGenders, id: \.self) { gender in
+                                    Button(action: { genderFilter = gender }) {
+                                        HStack(spacing: 4) {
+                                            Text(gender)
+                                                .font(.caption)
+                                                .lineLimit(1)
+                                            if genderFilter == gender {
+                                                Image(systemName: "checkmark")
+                                                    .font(.caption2)
+                                            }
+                                        }
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 4)
+                                    }
+                                    .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == gender))
+                                }
+                            }
+                            
+                            Spacer(minLength: 0)
                         }
                     }
                     .padding(.horizontal, 16)
@@ -285,25 +381,6 @@ struct AllChannelsGridView: View {
                 }
             }
         }
-        .onAppear {
-            startTimer()
-        }
-        .onDisappear {
-            timer?.invalidate()
-        }
-    }
-
-    private func startTimer() {
-        updateChannelInfos()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            updateChannelInfos()
-        }
-    }
-
-    private func updateChannelInfos() {
-        Task { @MainActor in
-            channelInfos = await manager.getAllChannelInfo()
-        }
     }
 
     private var filteredChannelInfos: [ChannelInfo] {
@@ -316,14 +393,16 @@ struct AllChannelsGridView: View {
             }
 
             let matchesStatus = matchesStatusFilter(info, filter: statusFilter)
+            let matchesGender = matchesGenderFilter(info, filter: genderFilter)
 
-            return matchesSearch && matchesStatus
+            return matchesSearch && matchesStatus && matchesGender
         }
     }
 
     private var statusCounts: StatusCounts {
         StatusCounts(
             total: channelInfos.count,
+            online: channelInfos.filter { matchesStatusFilter($0, filter: .online) }.count,
             recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
             paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
             offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
@@ -335,6 +414,8 @@ struct AllChannelsGridView: View {
         switch filter {
         case .all:
             return true
+        case .online:
+            return info.isOnline && !info.isInvalid
         case .recording:
             return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
         case .paused:
@@ -346,19 +427,721 @@ struct AllChannelsGridView: View {
         }
     }
 
-    private func countChip(_ title: String, count: Int, tint: Color) -> some View {
+    private func matchesGenderFilter(_ info: ChannelInfo, filter: String?) -> Bool {
+        guard let filter = filter, !filter.isEmpty else {
+            return true
+        }
+        guard let gender = info.bioMetadata?.gender else {
+            return false
+        }
+        return gender.localizedCaseInsensitiveContains(filter)
+    }
+
+    private var availableGenders: [String] {
+        let genders = Set(channelInfos.compactMap { $0.bioMetadata?.gender })
+        return genders.sorted()
+    }
+
+    private func countChip(_ title: String, count: Int, tint: Color, action: (() -> Void)? = nil) -> some View {
         HStack(spacing: 6) {
             Text(title)
                 .font(.caption)
+                .lineLimit(1)
             Text("\(count)")
                 .font(.caption)
                 .fontWeight(.semibold)
+                .lineLimit(1)
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 4)
         .background(tint.opacity(0.12))
         .foregroundColor(tint)
         .clipShape(Capsule())
+        .onTapGesture {
+            action?()
+        }
+    }
+}
+
+private enum RecordingSortOption: String, CaseIterable, Identifiable {
+    case newest = "Newest"
+    case oldest = "Oldest"
+    case largest = "Largest"
+    case smallest = "Smallest"
+    case filename = "Filename"
+
+    var id: String { rawValue }
+}
+
+private struct RecordingLibraryItem: Identifiable, Equatable {
+    let path: String
+    let filename: String
+    let channelName: String
+    let fileExtension: String
+    let sizeBytes: Int64
+    let modifiedAt: Date
+
+    var id: String { path }
+
+    var thumbnailCacheKey: String {
+        let modifiedStamp = Int64(modifiedAt.timeIntervalSince1970)
+        return "\(path)|\(sizeBytes)|\(modifiedStamp)"
+    }
+}
+
+private actor RecordingThumbnailStore {
+    static let shared = RecordingThumbnailStore()
+
+    private var inFlight: [String: Task<String?, Never>] = [:]
+    private var lastFailureAt: [String: Date] = [:]
+    private let failureRetryInterval: TimeInterval = 300
+    private let fileManager = FileManager.default
+    private let cacheDirectory: URL
+
+    init() {
+        let cachesRoot = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
+            ?? URL(fileURLWithPath: NSTemporaryDirectory(), isDirectory: true)
+        cacheDirectory = cachesRoot
+            .appendingPathComponent("ChaturbateDVR", isDirectory: true)
+            .appendingPathComponent("recording-card-thumbnails", isDirectory: true)
+
+        try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+    }
+
+    func thumbnailPath(for item: RecordingLibraryItem) async -> String? {
+        let cacheKey = item.thumbnailCacheKey
+        let destinationURL = cacheDirectory.appendingPathComponent("\(Self.stableHash(cacheKey)).jpg")
+
+        if fileManager.fileExists(atPath: destinationURL.path) {
+            return destinationURL.path
+        }
+
+        if let failedAt = lastFailureAt[cacheKey],
+           Date().timeIntervalSince(failedAt) < failureRetryInterval {
+            return nil
+        }
+
+        if let existingTask = inFlight[cacheKey] {
+            return await existingTask.value
+        }
+
+        let sourcePath = (item.path as NSString).expandingTildeInPath
+        let task = Task.detached(priority: .utility) {
+            Self.generateThumbnail(sourcePath: sourcePath, destinationURL: destinationURL)
+        }
+        inFlight[cacheKey] = task
+
+        let result = await task.value
+        inFlight[cacheKey] = nil
+
+        if result == nil {
+            lastFailureAt[cacheKey] = Date()
+        } else {
+            lastFailureAt[cacheKey] = nil
+        }
+
+        return result
+    }
+
+    func prewarm(items: [RecordingLibraryItem]) async {
+        for item in items {
+            if Task.isCancelled { return }
+            _ = await thumbnailPath(for: item)
+        }
+    }
+
+    private nonisolated static func generateThumbnail(sourcePath: String, destinationURL: URL) -> String? {
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else { return nil }
+
+        let asset = AVURLAsset(
+            url: sourceURL,
+            options: [AVURLAssetPreferPreciseDurationAndTimingKey: false]
+        )
+        let imageGenerator = AVAssetImageGenerator(asset: asset)
+        imageGenerator.appliesPreferredTrackTransform = true
+        imageGenerator.maximumSize = CGSize(width: 480, height: 270)
+        imageGenerator.requestedTimeToleranceBefore = CMTime(seconds: 2, preferredTimescale: 600)
+        imageGenerator.requestedTimeToleranceAfter = CMTime(seconds: 2, preferredTimescale: 600)
+
+        let candidateTimes = [
+            CMTime(seconds: 1, preferredTimescale: 600),
+            CMTime(seconds: 3, preferredTimescale: 600),
+            CMTime(seconds: 0, preferredTimescale: 600)
+        ]
+
+        for time in candidateTimes {
+            guard let cgImage = try? imageGenerator.copyCGImage(at: time, actualTime: nil) else {
+                continue
+            }
+
+            let bitmap = NSBitmapImageRep(cgImage: cgImage)
+            guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.72]) else {
+                continue
+            }
+
+            do {
+                try data.write(to: destinationURL, options: .atomic)
+                return destinationURL.path
+            } catch {
+                return nil
+            }
+        }
+
+        return nil
+    }
+
+    private nonisolated static func stableHash(_ input: String) -> String {
+        var hash: UInt64 = 1469598103934665603
+        for byte in input.utf8 {
+            hash ^= UInt64(byte)
+            hash &*= 1099511628211
+        }
+        return String(hash, radix: 16)
+    }
+}
+
+private struct RecordingThumbnailView: View {
+    let item: RecordingLibraryItem
+
+    @State private var thumbnailPath: String?
+    @State private var isLoading = false
+
+    var body: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8)
+                .fill(Color(NSColor.controlBackgroundColor).opacity(0.45))
+
+            if let thumbnailPath,
+               FileManager.default.fileExists(atPath: thumbnailPath),
+               let image = NSImage(contentsOfFile: thumbnailPath) {
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .clipped()
+            } else if isLoading {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Loading preview...")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Image(systemName: "film")
+                    .font(.system(size: 34, weight: .medium))
+                    .foregroundColor(.secondary)
+            }
+        }
+        .frame(height: 120)
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .task(id: item.thumbnailCacheKey) {
+            isLoading = true
+            thumbnailPath = await RecordingThumbnailStore.shared.thumbnailPath(for: item)
+            isLoading = false
+        }
+    }
+}
+
+struct RecordingsLibraryView: View {
+    @ObservedObject var manager: ChannelManager
+
+    private static let thumbnailCardMinimumWidth: CGFloat = 260
+    private static let thumbnailCardSpacing: CGFloat = 14
+    private static let thumbnailCardEstimatedHeight: CGFloat = 230
+    private static let thumbnailPrewarmDebounceNanoseconds: UInt64 = 180_000_000
+
+    @State private var allRecordings: [RecordingLibraryItem] = []
+    @State private var searchText: String = ""
+    @State private var selectedChannelFilter: String = "All Channels"
+    @State private var sortOption: RecordingSortOption = .newest
+    @State private var isScanning = false
+    @State private var scanError: String?
+    @State private var refreshTimer: Timer?
+
+    @State private var showingPreview = false
+    @State private var previewPaths: [String] = []
+    @State private var previewIndex = 0
+    @State private var thumbnailPrewarmTask: Task<Void, Never>?
+    @State private var thumbnailViewportSize: CGSize = .zero
+
+    private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
+
+    var body: some View {
+        GeometryReader { geometry in
+            VStack(spacing: 0) {
+                VStack(spacing: 8) {
+                    HStack(alignment: .firstTextBaseline, spacing: 10) {
+                        TextField("Filter by filename or channel", text: $searchText)
+                            .textFieldStyle(.roundedBorder)
+                            .frame(minWidth: 240, idealWidth: 420, maxWidth: 560)
+
+                        Picker("Sort", selection: $sortOption) {
+                            ForEach(RecordingSortOption.allCases) { option in
+                                Text(option.rawValue).tag(option)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 120)
+
+                        Picker("Channel", selection: $selectedChannelFilter) {
+                            Text("All Channels").tag("All Channels")
+                            ForEach(channelFilters, id: \.self) { channel in
+                                Text(channel).tag(channel)
+                            }
+                        }
+                        .pickerStyle(.menu)
+                        .frame(width: 170)
+
+                        Button {
+                            refreshRecordings()
+                        } label: {
+                            Label("Refresh", systemImage: "arrow.clockwise")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
+                        Spacer(minLength: 0)
+                    }
+
+                    HStack(spacing: 8) {
+                        countChip("Total", count: allRecordings.count, tint: .primary)
+                        countChip("Showing", count: visibleRecordings.count, tint: .blue)
+                        Text("Size: \(formatByteCount(totalVisibleBytes))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 0)
+                    }
+                }
+                .padding(.horizontal, 16)
+                .padding(.top, 12)
+                .padding(.bottom, 10)
+
+                if let scanError {
+                    VStack(spacing: 8) {
+                        Image(systemName: "exclamationmark.triangle")
+                            .font(.title2)
+                            .foregroundColor(.orange)
+                        Text("Could not scan recordings")
+                            .font(.headline)
+                        Text(scanError)
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .multilineTextAlignment(.center)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if isScanning && allRecordings.isEmpty {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Scanning recordings...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else if visibleRecordings.isEmpty {
+                    VStack(spacing: 8) {
+                        Image(systemName: "film.stack")
+                            .font(.title2)
+                            .foregroundColor(.secondary)
+                        Text(allRecordings.isEmpty ? "No recordings found" : "No matching recordings")
+                            .font(.headline)
+                            .foregroundColor(.secondary)
+                        Text(allRecordings.isEmpty
+                             ? "Recordings are discovered from the target output folder"
+                             : "Adjust the search text or filters")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    ScrollView {
+                        LazyVGrid(columns: gridColumns, spacing: Self.thumbnailCardSpacing) {
+                            ForEach(visibleRecordings) { item in
+                                Button {
+                                    openRecordingPreview(for: item)
+                                } label: {
+                                    RecordingLibraryCardView(item: item)
+                                }
+                                .buttonStyle(.plain)
+                            }
+                        }
+                        .padding(16)
+                    }
+                }
+            }
+            .onAppear {
+                updateThumbnailViewportSize(geometry.size)
+            }
+            .onChange(of: geometry.size) { newSize in
+                updateThumbnailViewportSize(newSize)
+            }
+        }
+        .sheet(isPresented: $showingPreview) {
+            RecordingPreviewSheet(paths: $previewPaths, currentIndex: $previewIndex, isPresented: $showingPreview)
+        }
+        .onAppear {
+            refreshRecordings()
+            startRefreshTimer()
+        }
+        .onDisappear {
+            refreshTimer?.invalidate()
+            refreshTimer = nil
+            thumbnailPrewarmTask?.cancel()
+            thumbnailPrewarmTask = nil
+        }
+        .onChange(of: showingPreview) { isShowing in
+            if !isShowing {
+                refreshRecordings()
+            }
+        }
+        .onChange(of: visibleRecordings.map(\.thumbnailCacheKey)) { _ in
+            scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
+        }
+    }
+
+    private var channelFilters: [String] {
+        Array(Set(allRecordings.map { $0.channelName }))
+            .sorted { $0.lowercased() < $1.lowercased() }
+    }
+
+    private var visibleRecordings: [RecordingLibraryItem] {
+        var filtered = allRecordings.filter { item in
+            if selectedChannelFilter != "All Channels" && item.channelName != selectedChannelFilter {
+                return false
+            }
+
+            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+            if query.isEmpty { return true }
+
+            return item.filename.localizedCaseInsensitiveContains(query)
+                || item.channelName.localizedCaseInsensitiveContains(query)
+        }
+
+        switch sortOption {
+        case .newest:
+            filtered.sort { $0.modifiedAt > $1.modifiedAt }
+        case .oldest:
+            filtered.sort { $0.modifiedAt < $1.modifiedAt }
+        case .largest:
+            filtered.sort { $0.sizeBytes > $1.sizeBytes }
+        case .smallest:
+            filtered.sort { $0.sizeBytes < $1.sizeBytes }
+        case .filename:
+            filtered.sort { $0.filename.lowercased() < $1.filename.lowercased() }
+        }
+
+        return filtered
+    }
+
+    private var totalVisibleBytes: Int64 {
+        visibleRecordings.reduce(0) { $0 + $1.sizeBytes }
+    }
+
+    private func startRefreshTimer() {
+        refreshTimer?.invalidate()
+        refreshTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { _ in
+            refreshRecordings()
+        }
+    }
+
+    private func refreshRecordings() {
+        let rootPath = manager.appConfig.getOutputPath()
+        isScanning = true
+        scanError = nil
+
+        Task { @MainActor in
+            let recordings = await loadRecordings(rootPath: rootPath)
+            allRecordings = recordings
+
+            if selectedChannelFilter != "All Channels",
+               !channelFilters.contains(selectedChannelFilter) {
+                selectedChannelFilter = "All Channels"
+            }
+            isScanning = false
+            scheduleThumbnailPrewarm(debounceNanoseconds: 0)
+        }
+    }
+
+    private func scheduleThumbnailPrewarm(debounceNanoseconds: UInt64) {
+        thumbnailPrewarmTask?.cancel()
+
+        let prioritizedCount = prioritizedThumbnailCount(for: thumbnailViewportSize)
+        let prioritizedItems = Array(visibleRecordings.prefix(prioritizedCount))
+        let backgroundItems = Array(visibleRecordings.dropFirst(prioritizedCount))
+
+        guard !prioritizedItems.isEmpty || !backgroundItems.isEmpty else {
+            thumbnailPrewarmTask = nil
+            return
+        }
+
+        thumbnailPrewarmTask = Task(priority: .userInitiated) {
+            if debounceNanoseconds > 0 {
+                try? await Task.sleep(nanoseconds: debounceNanoseconds)
+                if Task.isCancelled { return }
+            }
+
+            await RecordingThumbnailStore.shared.prewarm(items: prioritizedItems)
+            if Task.isCancelled { return }
+
+            await Task.yield()
+            await RecordingThumbnailStore.shared.prewarm(items: backgroundItems)
+        }
+    }
+
+    private func prioritizedThumbnailCount(for viewportSize: CGSize) -> Int {
+        let usableWidth = max(viewportSize.width - 32, Self.thumbnailCardMinimumWidth)
+        let columns = max(1, Int((usableWidth + Self.thumbnailCardSpacing) / (Self.thumbnailCardMinimumWidth + Self.thumbnailCardSpacing)))
+
+        let usableHeight = max(viewportSize.height - 120, Self.thumbnailCardEstimatedHeight)
+        let visibleRows = max(1, Int(ceil((usableHeight + Self.thumbnailCardSpacing) / (Self.thumbnailCardEstimatedHeight + Self.thumbnailCardSpacing))))
+
+        return max(columns * (visibleRows + 1), columns)
+    }
+
+    private func updateThumbnailViewportSize(_ newSize: CGSize) {
+        guard abs(newSize.width - thumbnailViewportSize.width) > 8 || abs(newSize.height - thumbnailViewportSize.height) > 8 else {
+            return
+        }
+
+        thumbnailViewportSize = newSize
+        scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
+    }
+
+    private func loadRecordings(rootPath: String) async -> [RecordingLibraryItem] {
+        await Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            let normalizedRoot = (rootPath as NSString).expandingTildeInPath
+            let rootURL = URL(fileURLWithPath: normalizedRoot, isDirectory: true)
+
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: rootURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return []
+            }
+
+            let validExtensions = Set(["ts", "mp4", "mkv", "mov"])
+            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .fileSizeKey, .contentModificationDateKey]
+
+            guard let enumerator = fm.enumerator(
+                at: rootURL,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else {
+                return []
+            }
+
+            var items: [RecordingLibraryItem] = []
+            while let fileURL = enumerator.nextObject() as? URL {
+                let ext = fileURL.pathExtension.lowercased()
+                guard validExtensions.contains(ext) else { continue }
+
+                guard let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                      values.isRegularFile == true else {
+                    continue
+                }
+
+                let sizeBytes = Int64(values.fileSize ?? 0)
+                let modifiedAt = values.contentModificationDate ?? Date.distantPast
+                let channelName = fileURL.deletingLastPathComponent().lastPathComponent
+
+                items.append(
+                    RecordingLibraryItem(
+                        path: fileURL.path,
+                        filename: fileURL.lastPathComponent,
+                        channelName: channelName,
+                        fileExtension: ext,
+                        sizeBytes: sizeBytes,
+                        modifiedAt: modifiedAt
+                    )
+                )
+            }
+
+            return items
+        }.value
+    }
+
+    private func openRecordingPreview(for item: RecordingLibraryItem) {
+        let orderedPaths = visibleRecordings.map { $0.path }
+        guard let index = orderedPaths.firstIndex(of: item.path) else { return }
+
+        previewPaths = orderedPaths
+        previewIndex = index
+        showingPreview = true
+    }
+
+    private func countChip(_ title: String, count: Int, tint: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+                .lineLimit(1)
+            Text("\(count)")
+                .font(.caption)
+                .fontWeight(.semibold)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 9)
+        .padding(.vertical, 4)
+        .background(tint.opacity(0.12))
+        .foregroundColor(tint)
+        .clipShape(Capsule())
+    }
+
+    private func formatByteCount(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+}
+
+private struct RecordingLibraryCardView: View {
+    let item: RecordingLibraryItem
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack(alignment: .topTrailing) {
+                RecordingThumbnailView(item: item)
+
+                Text(item.fileExtension.uppercased())
+                    .font(.caption2)
+                    .fontWeight(.semibold)
+                    .padding(.horizontal, 7)
+                    .padding(.vertical, 3)
+                    .background(Color.accentColor.opacity(0.14))
+                    .foregroundColor(.accentColor)
+                    .cornerRadius(6)
+                    .padding(8)
+            }
+
+            Text(item.filename)
+                .font(.headline)
+                .lineLimit(1)
+
+            HStack(spacing: 6) {
+                Image(systemName: "person.crop.square")
+                    .foregroundColor(.secondary)
+                Text(item.channelName)
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+                Spacer(minLength: 0)
+            }
+
+            HStack(spacing: 10) {
+                Label(formatModifiedDate(item.modifiedAt), systemImage: "calendar")
+                Label(formatSize(item.sizeBytes), systemImage: "doc")
+                Spacer(minLength: 0)
+            }
+            .font(.caption)
+            .foregroundColor(.secondary)
+            .lineLimit(1)
+        }
+        .padding(12)
+        .background(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .fill(Color(NSColor.windowBackgroundColor))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: 10, style: .continuous)
+                .stroke(Color(NSColor.separatorColor).opacity(0.28), lineWidth: 1)
+        )
+        .shadow(color: Color.black.opacity(0.06), radius: 2, x: 0, y: 1)
+    }
+
+    private func formatModifiedDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+
+    private func formatSize(_ bytes: Int64) -> String {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter.string(fromByteCount: bytes)
+    }
+}
+
+struct WrappingStatusBadgesView: View {
+    @Binding var statusFilter: ChannelStatusFilter
+    let totalCount: Int
+    let onlineCount: Int
+    let recordingCount: Int
+    let pausedCount: Int
+    let offlineCount: Int
+    let invalidCount: Int
+    let filteredCount: Int
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            HStack(spacing: 8) {
+                statusBadge("Total", count: totalCount, tint: .primary) {
+                    statusFilter = .all
+                }
+                statusBadge("Online", count: onlineCount, tint: .mint) {
+                    statusFilter = .online
+                }
+                statusBadge("Recording", count: recordingCount, tint: .green) {
+                    statusFilter = .recording
+                }
+                statusBadge("Paused", count: pausedCount, tint: .orange) {
+                    statusFilter = .paused
+                }
+                Spacer(minLength: 0)
+            }
+            HStack(spacing: 8) {
+                statusBadge("Offline", count: offlineCount, tint: .secondary) {
+                    statusFilter = .offline
+                }
+                statusBadge("Invalid", count: invalidCount, tint: .red) {
+                    statusFilter = .invalid
+                }
+                statusBadge("Showing", count: filteredCount, tint: .blue) {
+                    statusFilter = .all
+                }
+                Spacer(minLength: 0)
+            }
+        }
+    }
+
+    private func statusBadge(_ title: String, count: Int, tint: Color, action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            HStack(spacing: 6) {
+                Text(title)
+                    .font(.caption)
+                    .lineLimit(1)
+                Text("\(count)")
+                    .font(.caption)
+                    .fontWeight(.semibold)
+                    .lineLimit(1)
+            }
+            .padding(.horizontal, 9)
+            .padding(.vertical, 4)
+        }
+        .buttonStyle(StatusBadgeButtonStyle(tint: tint))
+    }
+}
+
+struct StatusBadgeButtonStyle: ButtonStyle {
+    let tint: Color
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(tint)
+            .background(tint.opacity(configuration.isPressed ? 0.2 : 0.12))
+            .clipShape(Capsule())
+            .transition(.opacity)
+    }
+}
+
+struct GenderFilterButtonStyle: ButtonStyle {
+    let isSelected: Bool
+
+    func makeBody(configuration: Configuration) -> some View {
+        configuration.label
+            .foregroundColor(isSelected ? .blue : .secondary)
+            .background(isSelected ? Color.blue.opacity(0.2) : Color.secondary.opacity(0.08))
+            .clipShape(Capsule())
+            .opacity(configuration.isPressed ? 0.7 : 1.0)
     }
 }
 
@@ -374,6 +1157,7 @@ struct ChannelPreviewCard: View {
     private var isOffline: Bool { !info.isOnline }
     private var isInvalid: Bool { info.isInvalid }
     private var isDegraded: Bool { info.consecutiveSegmentFailures > 0 }
+    private var showNoPersonBadge: Bool { info.isOnline && info.isNoPersonDetected && !info.isInvalid }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -497,6 +1281,8 @@ struct ChannelPreviewCard: View {
                 Text(info.username)
                     .font(.headline)
                     .lineLimit(1)
+                    .minimumScaleFactor(0.85)
+                    .layoutPriority(1)
                 Spacer()
 
                 Group {
@@ -525,6 +1311,9 @@ struct ChannelPreviewCard: View {
                             )
                                 .font(.caption)
                                 .foregroundColor(info.isInvalid ? .red : .secondary)
+                                .lineLimit(1)
+                                .truncationMode(.tail)
+                                .minimumScaleFactor(0.9)
 
                             if isDegraded {
                                 Text("Degraded")
@@ -536,10 +1325,22 @@ struct ChannelPreviewCard: View {
                                     .background(Color.orange.opacity(0.14))
                                     .cornerRadius(6)
                             }
+
+                            if showNoPersonBadge {
+                                Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.orange)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.14))
+                                    .cornerRadius(6)
+                                    .lineLimit(1)
+                            }
                         }
+                        .fixedSize(horizontal: true, vertical: false)
                     }
                 }
-                .frame(minWidth: 98, alignment: .trailing)
             }
 
             HStack(spacing: 10) {
@@ -582,6 +1383,7 @@ struct ChannelListView: View {
 
     private struct StatusCounts {
         let total: Int
+        let online: Int
         let recording: Int
         let paused: Int
         let offline: Int
@@ -590,11 +1392,11 @@ struct ChannelListView: View {
 
     @ObservedObject var manager: ChannelManager
     @Binding var selectedChannel: String?
+    let channelInfos: [ChannelInfo]
     @Binding var searchText: String
     @Binding var statusFilter: ChannelStatusFilter
+    @Binding var genderFilter: String?
     var onActivateChannel: ((String) -> Void)? = nil
-    @State private var channelInfos: [ChannelInfo] = []
-    @State private var timer: Timer?
     @State private var showingCombinedLog = true
     
     var body: some View {
@@ -620,28 +1422,68 @@ struct ChannelListView: View {
                                 .textFieldStyle(.roundedBorder)
                                 .frame(minWidth: 190, idealWidth: 250, maxWidth: 320)
 
-                            Picker("Status", selection: $statusFilter) {
-                                ForEach(ChannelStatusFilter.allCases) { filter in
-                                    Text(filter.rawValue).tag(filter)
-                                }
-                            }
-                            .pickerStyle(.menu)
-                            .frame(width: 150, alignment: .leading)
-
                             Spacer(minLength: 0)
                         }
 
-                        ScrollView(.horizontal, showsIndicators: false) {
-                            HStack(spacing: 8) {
-                                countChip("Total", count: statusCounts.total, tint: .primary)
-                                countChip("Recording", count: statusCounts.recording, tint: .green)
-                                countChip("Paused", count: statusCounts.paused, tint: .orange)
-                                countChip("Offline", count: statusCounts.offline, tint: .secondary)
-                                countChip("Invalid", count: statusCounts.invalid, tint: .red)
-                                countChip("Showing", count: filteredChannelInfos.count, tint: .blue)
+                        WrappingStatusBadgesView(
+                            statusFilter: $statusFilter,
+                            totalCount: statusCounts.total,
+                            onlineCount: statusCounts.online,
+                            recordingCount: statusCounts.recording,
+                            pausedCount: statusCounts.paused,
+                            offlineCount: statusCounts.offline,
+                            invalidCount: statusCounts.invalid,
+                            filteredCount: filteredChannelInfos.count
+                        )
+
+                        VStack(alignment: .leading, spacing: 8) {
+                            Text("Gender")
+                                .font(.caption)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.secondary)
+                            
+                            if availableGenders.isEmpty {
+                                Text("Fetching bio data...")
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            } else {
+                                HStack(spacing: 8) {
+                                    Button(action: { genderFilter = nil }) {
+                                        HStack(spacing: 4) {
+                                            Text("All")
+                                                .font(.caption)
+                                            if genderFilter == nil {
+                                                Image(systemName: "checkmark")
+                                                    .font(.caption2)
+                                            }
+                                        }
+                                        .padding(.horizontal, 9)
+                                        .padding(.vertical, 4)
+                                    }
+                                    .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == nil))
+                                    
+                                    ForEach(availableGenders, id: \.self) { gender in
+                                        Button(action: { genderFilter = gender }) {
+                                            HStack(spacing: 4) {
+                                                Text(gender)
+                                                    .font(.caption)
+                                                    .lineLimit(1)
+                                                if genderFilter == gender {
+                                                    Image(systemName: "checkmark")
+                                                        .font(.caption2)
+                                                }
+                                            }
+                                            .padding(.horizontal, 9)
+                                            .padding(.vertical, 4)
+                                        }
+                                        .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == gender))
+                                    }
+                                    
+                                    Spacer(minLength: 0)
+                                }
                             }
-                            .padding(.vertical, 1)
                         }
+                        .padding(.vertical, 6)
 
                         if manager.runtimeDiagnostics.requestQueueSaturated ||
                             manager.runtimeDiagnostics.queuedRecordings > 0 ||
@@ -753,25 +1595,6 @@ struct ChannelListView: View {
             }
         }
         .navigationTitle("Channels")
-        .onAppear {
-            startTimer()
-        }
-        .onDisappear {
-            timer?.invalidate()
-        }
-    }
-    
-    private func startTimer() {
-        updateChannelInfos()
-        timer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { _ in
-            updateChannelInfos()
-        }
-    }
-    
-    private func updateChannelInfos() {
-        Task { @MainActor in
-            channelInfos = await manager.getAllChannelInfo()
-        }
     }
 
     private var combinedLogEntries: [CombinedLogEntry] {
@@ -805,14 +1628,16 @@ struct ChannelListView: View {
             }
 
             let matchesStatus = matchesStatusFilter(info, filter: statusFilter)
+            let matchesGender = matchesGenderFilter(info, filter: genderFilter)
 
-            return matchesSearch && matchesStatus
+            return matchesSearch && matchesStatus && matchesGender
         }
     }
 
     private var statusCounts: StatusCounts {
         StatusCounts(
             total: channelInfos.count,
+            online: channelInfos.filter { matchesStatusFilter($0, filter: .online) }.count,
             recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
             paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
             offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
@@ -824,6 +1649,8 @@ struct ChannelListView: View {
         switch filter {
         case .all:
             return true
+        case .online:
+            return info.isOnline && !info.isInvalid
         case .recording:
             return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
         case .paused:
@@ -835,13 +1662,30 @@ struct ChannelListView: View {
         }
     }
 
+    private func matchesGenderFilter(_ info: ChannelInfo, filter: String?) -> Bool {
+        guard let filter = filter, !filter.isEmpty else {
+            return true
+        }
+        guard let gender = info.bioMetadata?.gender else {
+            return false
+        }
+        return gender.localizedCaseInsensitiveContains(filter)
+    }
+
+    private var availableGenders: [String] {
+        let genders = Set(channelInfos.compactMap { $0.bioMetadata?.gender })
+        return genders.sorted()
+    }
+
     private func countChip(_ title: String, count: Int, tint: Color) -> some View {
         HStack(spacing: 6) {
             Text(title)
                 .font(.caption)
+                .lineLimit(1)
             Text("\(count)")
                 .font(.caption)
                 .fontWeight(.semibold)
+                .lineLimit(1)
         }
         .padding(.horizontal, 9)
         .padding(.vertical, 4)
@@ -905,6 +1749,10 @@ struct ChannelRowView: View {
         info.consecutiveSegmentFailures > 0
     }
 
+    private var showNoPersonBadge: Bool {
+        info.isOnline && info.isNoPersonDetected && !info.isInvalid
+    }
+
     private var hasCloudflarePressure: Bool {
         info.cloudflareBlockCount > 0
     }
@@ -958,6 +1806,17 @@ struct ChannelRowView: View {
                                 .padding(.vertical, 2)
                                 .background(Color.orange.opacity(0.14))
                                 .cornerRadius(6)
+                        }
+                        if showNoPersonBadge {
+                            Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
+                                .font(.caption2)
+                                .fontWeight(.semibold)
+                                .foregroundColor(.orange)
+                                .padding(.horizontal, 6)
+                                .padding(.vertical, 2)
+                                .background(Color.orange.opacity(0.14))
+                                .cornerRadius(6)
+                                .lineLimit(1)
                         }
                         if hasCloudflarePressure {
                             Text("CF x\(info.cloudflareBlockCount)")
@@ -1095,11 +1954,11 @@ struct ChannelDetailView: View {
 
     @ViewBuilder
     private func channelContent(info: ChannelInfo) -> some View {
-        VStack(alignment: .leading, spacing: 20) {
-            GeometryReader { geometry in
-                let detailWidth = responsiveDetailWidth(totalWidth: geometry.size.width)
+        GeometryReader { geometry in
+            let detailWidth = responsiveDetailWidth(totalWidth: geometry.size.width)
 
-                HStack(alignment: .top, spacing: 14) {
+            HStack(alignment: .top, spacing: 14) {
+                VStack(alignment: .leading, spacing: 20) {
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Live Preview")
                             .font(.headline)
@@ -1110,38 +1969,41 @@ struct ChannelDetailView: View {
                                     .stroke(info.isOnline ? Color.green : Color.gray.opacity(0.35), lineWidth: 2)
                             )
                     }
-                    .frame(maxWidth: .infinity, alignment: .leading)
 
-                    channelDetailsPanel(info: info)
-                        .frame(width: detailWidth)
+                    activityLogSection(info: info)
                 }
-            }
-            .frame(minHeight: 360)
+                .frame(maxWidth: .infinity, alignment: .leading)
 
-            Divider()
-
-            VStack(alignment: .leading, spacing: 10) {
-                Text("Activity Log")
-                    .font(.headline)
-
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 4) {
-                        ForEach(Array(info.logs.enumerated()), id: \.offset) { _, log in
-                            Text(log)
-                                .font(.system(.caption, design: .monospaced))
-                                .foregroundColor(colorForDetailLog(log, info: info))
-                                .textSelection(.enabled)
-                        }
-                    }
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                }
-                .frame(height: 180)
-                .padding(12)
-                .background(Color(NSColor.textBackgroundColor))
-                .cornerRadius(8)
+                channelDetailsPanel(info: info)
+                    .frame(width: detailWidth)
             }
         }
+        .frame(minHeight: 540)
         .padding(20)
+    }
+
+    @ViewBuilder
+    private func activityLogSection(info: ChannelInfo) -> some View {
+        VStack(alignment: .leading, spacing: 10) {
+            Text("Activity Log")
+                .font(.headline)
+
+            ScrollView {
+                VStack(alignment: .leading, spacing: 4) {
+                    ForEach(Array(info.logs.enumerated()), id: \.offset) { _, log in
+                        Text(log)
+                            .font(.system(.caption, design: .monospaced))
+                            .foregroundColor(colorForDetailLog(log, info: info))
+                            .textSelection(.enabled)
+                    }
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            .frame(height: 180)
+            .padding(12)
+            .background(Color(NSColor.textBackgroundColor))
+            .cornerRadius(8)
+        }
     }
 
     @ViewBuilder
@@ -1184,9 +2046,23 @@ struct ChannelDetailView: View {
                         .background(Color.orange.opacity(0.14))
                         .cornerRadius(7)
                 }
+
+                if info.isOnline && info.isNoPersonDetected && !info.isInvalid {
+                    Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
+                        .font(.caption)
+                        .fontWeight(.semibold)
+                        .foregroundColor(.orange)
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 3)
+                        .background(Color.orange.opacity(0.14))
+                        .cornerRadius(7)
+                        .lineLimit(1)
+                }
             }
 
             ChannelInfoView(info: info)
+
+            BioMetadataView(info: info, manager: manager, username: username)
 
             recordingsSection(info: info)
 
@@ -1513,6 +2389,9 @@ struct RecordingPreviewSheet: View {
     @State private var timeControlObserver: NSKeyValueObservation?
     @State private var timeObserverToken: Any?
     @State private var timeoutTask: Task<Void, Never>?
+    @State private var currentChannelName = "Unknown"
+    @State private var currentFileSize = "Unknown"
+    @State private var currentModifiedAt = "Unknown"
 
     private var currentURL: URL? {
         guard paths.indices.contains(currentIndex) else { return nil }
@@ -1572,11 +2451,21 @@ struct RecordingPreviewSheet: View {
             .cornerRadius(10)
 
             if let currentURL {
-                Text(currentURL.path)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 14) {
+                        Label(currentChannelName, systemImage: "person.crop.square")
+                        Label(currentModifiedAt, systemImage: "calendar")
+                        Label(currentFileSize, systemImage: "doc")
+                    }
                     .font(.caption)
                     .foregroundColor(.secondary)
-                    .textSelection(.enabled)
-                    .lineLimit(1)
+
+                    Text(currentURL.path)
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .textSelection(.enabled)
+                        .lineLimit(1)
+                }
             }
 
             HStack(spacing: 10) {
@@ -1676,6 +2565,8 @@ struct RecordingPreviewSheet: View {
             player = nil
             return
         }
+
+        refreshCurrentMetadata(for: currentURL)
         
         // Verify file exists
         guard FileManager.default.fileExists(atPath: currentURL.path) else {
@@ -1826,6 +2717,29 @@ struct RecordingPreviewSheet: View {
             player.play()
         }
     }
+
+    private func refreshCurrentMetadata(for url: URL) {
+        currentChannelName = url.deletingLastPathComponent().lastPathComponent
+
+        let resourceKeys: Set<URLResourceKey> = [.fileSizeKey, .contentModificationDateKey]
+        if let values = try? url.resourceValues(forKeys: resourceKeys),
+           let size = values.fileSize {
+            let sizeFormatter = ByteCountFormatter()
+            sizeFormatter.countStyle = .file
+            currentFileSize = sizeFormatter.string(fromByteCount: Int64(size))
+        } else {
+            currentFileSize = "Unknown"
+        }
+
+        if let modified = try? url.resourceValues(forKeys: resourceKeys).contentModificationDate {
+            let dateFormatter = DateFormatter()
+            dateFormatter.dateStyle = .short
+            dateFormatter.timeStyle = .short
+            currentModifiedAt = dateFormatter.string(from: modified)
+        } else {
+            currentModifiedAt = "Unknown"
+        }
+    }
 }
 
 private struct RecordingPlayerView: NSViewRepresentable {
@@ -1901,6 +2815,19 @@ struct ChannelInfoView: View {
                 .padding(.horizontal, 4)
             }
 
+            if info.isOnline {
+                HStack {
+                    Text("Person Detection:")
+                        .foregroundColor(.secondary)
+                    Spacer()
+                    Text(info.isNoPersonDetected
+                         ? "No person detected for \(formatNoPersonDuration(info.noPersonDurationSeconds))"
+                         : "Person detected")
+                        .foregroundColor(info.isNoPersonDetected ? .orange : .primary)
+                }
+                .padding(.horizontal, 4)
+            }
+
             HStack {
                 Text("Segment Retries:")
                     .foregroundColor(.secondary)
@@ -1953,30 +2880,129 @@ struct InfoCard: View {
     }
 }
 
-struct AddChannelView: View {
+struct BioMetadataView: View {
+    let info: ChannelInfo
+    let manager: ChannelManager
+    let username: String
+    @State private var isFetchingBio = false
+    @State private var localBioMetadata: BioMetadata?
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Bio Metadata")
+                .font(.headline)
+            
+            if let bioMetadata = localBioMetadata ?? info.bioMetadata {
+                VStack(alignment: .leading, spacing: 10) {
+                    if let gender = bioMetadata.gender {
+                        metadataRow("Gender", value: gender)
+                    }
+
+                    if let followers = bioMetadata.followers {
+                        metadataRow("Followers", value: String(followers))
+                    }
+
+                    if let location = bioMetadata.location {
+                        metadataRow("Location", value: location)
+                    }
+
+                    if let body = bioMetadata.body {
+                        metadataRow("Body", value: body)
+                    }
+
+                    if let language = bioMetadata.language {
+                        metadataRow("Language", value: language)
+                    }
+
+                    if let lastBioRefresh = bioMetadata.lastBioRefresh {
+                        metadataRow("Last Refreshed", value: formatTimestamp(lastBioRefresh), labelFont: .caption, valueFont: .caption)
+                    }
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor))
+                .cornerRadius(8)
+            } else {
+                VStack(alignment: .leading, spacing: 10) {
+                    Text("No bio data yet")
+                        .foregroundColor(.secondary)
+                    Button(action: fetchBio) {
+                        if isFetchingBio {
+                            HStack(spacing: 8) {
+                                ProgressView().scaleEffect(0.7)
+                                Text("Fetching...")
+                            }
+                            .frame(maxWidth: .infinity)
+                        } else {
+                            Label("Fetch Bio Data", systemImage: "arrow.down.circle")
+                                .frame(maxWidth: .infinity)
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(isFetchingBio)
+                }
+                .padding(12)
+                .frame(maxWidth: .infinity, alignment: .leading)
+                .background(Color(NSColor.controlBackgroundColor).opacity(0.5))
+                .cornerRadius(8)
+            }
+        }
+        .onAppear {
+            localBioMetadata = info.bioMetadata
+        }
+        .onChange(of: info.bioMetadata?.lastBioRefresh) { _ in
+            if localBioMetadata == nil {
+                localBioMetadata = info.bioMetadata
+            }
+        }
+    }
+
+    private func metadataRow(_ label: String, value: String, labelFont: Font = .body, valueFont: Font = .body) -> some View {
+        HStack(alignment: .firstTextBaseline) {
+            Text(label)
+                .font(labelFont)
+                .foregroundColor(.secondary)
+            Spacer(minLength: 12)
+            Text(value)
+                .font(valueFont)
+                .fontWeight(.medium)
+                .multilineTextAlignment(.trailing)
+        }
+    }
+    
+    private func fetchBio() {
+        isFetchingBio = true
+        Task { @MainActor in
+            await manager.refreshBioMetadata(username: username)
+            if let updated = await manager.getChannelInfo(username: username) {
+                localBioMetadata = updated.bioMetadata
+            }
+            isFetchingBio = false
+        }
+    }
+    
+    private func formatTimestamp(_ timestamp: Int64) -> String {
+        let date = Date(timeIntervalSince1970: TimeInterval(timestamp))
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
+    }
+}
+
+struct ImportChannelsView: View {
     @ObservedObject var manager: ChannelManager
     @Environment(\.dismiss) var dismiss
-    @Binding var errorMessage: String?
-    @Binding var showingError: Bool
-    
-    @State private var username = ""
-    @State private var resolution = 1080
-    @State private var framerate = 30
-    @State private var maxDuration = 0
-    @State private var maxFilesize = 0
-    @State private var outputDirectory = ""
-    @State private var pattern = "{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
     @State private var importStatusMessage: String?
     @State private var isImporting = false
     @State private var importErrorMessage: String?
     @State private var showingImportError = false
     @State private var followedImportPreview: FollowedImportPreview?
-    
+
     var body: some View {
         VStack(spacing: 0) {
-            // Header
             HStack {
-                Text("Add Channel")
+                Text("Import Channels")
                     .font(.title2)
                     .fontWeight(.semibold)
                 Spacer()
@@ -1989,9 +3015,9 @@ struct AddChannelView: View {
             }
             .padding(24)
             .background(Color(NSColor.controlBackgroundColor))
-            
+
             Divider()
-            
+
             ScrollView {
                 VStack(alignment: .leading, spacing: 28) {
                     VStack(alignment: .leading, spacing: 10) {
@@ -2021,6 +3047,10 @@ struct AddChannelView: View {
                         }
 
                         Text("Import from folders or directly from your followed cams list (online + offline).")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+
+                        Text("Bio metadata refresh is available in Settings.")
                             .font(.caption)
                             .foregroundColor(.secondary)
 
@@ -2055,7 +3085,7 @@ struct AddChannelView: View {
                                         }
                                     }
                                 }
-                                .frame(maxHeight: 130)
+                                .frame(maxHeight: 180)
                                 .padding(8)
                                 .background(Color(NSColor.textBackgroundColor))
                                 .cornerRadius(6)
@@ -2082,7 +3112,128 @@ struct AddChannelView: View {
                     .padding(16)
                     .background(Color(NSColor.controlBackgroundColor))
                     .cornerRadius(10)
+                }
+                .padding(24)
+            }
 
+            Divider()
+
+            HStack {
+                Spacer()
+                Button("Done") {
+                    dismiss()
+                }
+                .keyboardShortcut(.defaultAction)
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+            }
+            .padding(24)
+            .background(Color(NSColor.controlBackgroundColor))
+        }
+        .frame(width: 700, height: 520)
+        .alert("Import Error", isPresented: $showingImportError) {
+            Button("OK") { }
+        } message: {
+            Text(importErrorMessage ?? "Unknown import error")
+        }
+    }
+
+    private func importChannelsFromFolder() {
+        followedImportPreview = nil
+        let panel = NSOpenPanel()
+        panel.canChooseFiles = false
+        panel.canChooseDirectories = true
+        panel.allowsMultipleSelection = false
+        panel.canCreateDirectories = false
+        panel.prompt = "Import"
+        panel.message = "Select the parent folder that contains channel subfolders"
+        panel.directoryURL = URL(fileURLWithPath: manager.appConfig.getOutputPath())
+
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+
+        isImporting = true
+        importStatusMessage = "Scanning folders..."
+
+        Task { @MainActor in
+            let result = await manager.importChannelsFromFolders(parentDirectory: url.path)
+            isImporting = false
+            importStatusMessage = "Imported \(result.imported) channel\(result.imported == 1 ? "" : "s"), skipped \(result.skipped)."
+        }
+    }
+
+    private func importFollowedCams() {
+        followedImportPreview = nil
+        isImporting = true
+        importStatusMessage = "Loading followed cams preview..."
+
+        Task { @MainActor in
+            do {
+                let preview = try await manager.prepareFollowedImport(progress: { message in
+                    Task { @MainActor in
+                        importStatusMessage = message
+                    }
+                })
+                isImporting = false
+                followedImportPreview = preview
+                importStatusMessage = "Preview ready: \(preview.toAdd.count) new, \(preview.existing.count) existing. Confirm to add."
+            } catch {
+                isImporting = false
+                importStatusMessage = nil
+                importErrorMessage = error.localizedDescription
+                showingImportError = true
+            }
+        }
+    }
+
+    private func confirmFollowedImport(_ preview: FollowedImportPreview) {
+        isImporting = true
+        importStatusMessage = "Adding selected followed channels..."
+
+        Task { @MainActor in
+            let result = await manager.importFollowedChannelsFromPreview(preview)
+            isImporting = false
+            followedImportPreview = nil
+            importStatusMessage = "Imported \(result.imported) followed channel\(result.imported == 1 ? "" : "s"), skipped \(result.skipped)."
+        }
+    }
+}
+
+struct AddChannelView: View {
+    @ObservedObject var manager: ChannelManager
+    @Environment(\.dismiss) var dismiss
+    @Binding var errorMessage: String?
+    @Binding var showingError: Bool
+    
+    @State private var username = ""
+    @State private var resolution = 1080
+    @State private var framerate = 30
+    @State private var maxDuration = 0
+    @State private var maxFilesize = 0
+    @State private var outputDirectory = ""
+    @State private var pattern = "{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
+    
+    var body: some View {
+        VStack(spacing: 0) {
+            // Header
+            HStack {
+                Text("Add Channel")
+                    .font(.title2)
+                    .fontWeight(.semibold)
+                Spacer()
+                Button(action: { dismiss() }) {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.title2)
+                        .foregroundColor(.secondary)
+                }
+                .buttonStyle(.plain)
+            }
+            .padding(24)
+            .background(Color(NSColor.controlBackgroundColor))
+            
+            Divider()
+            
+            ScrollView {
+                VStack(alignment: .leading, spacing: 28) {
                     // Channel Section
                     VStack(alignment: .leading, spacing: 12) {
                         Text("Channel")
@@ -2289,12 +3440,7 @@ struct AddChannelView: View {
             .padding(24)
             .background(Color(NSColor.controlBackgroundColor))
         }
-        .frame(width: 600, height: 700)
-        .alert("Import Error", isPresented: $showingImportError) {
-            Button("OK") { }
-        } message: {
-            Text(importErrorMessage ?? "Unknown import error")
-        }
+        .frame(width: 600, height: 640)
     }
     
     private func addChannel() {
@@ -2331,65 +3477,6 @@ struct AddChannelView: View {
 
         if panel.runModal() == .OK, let url = panel.url {
             outputDirectory = url.path
-        }
-    }
-
-    private func importChannelsFromFolder() {
-        followedImportPreview = nil
-        let panel = NSOpenPanel()
-        panel.canChooseFiles = false
-        panel.canChooseDirectories = true
-        panel.allowsMultipleSelection = false
-        panel.canCreateDirectories = false
-        panel.prompt = "Import"
-        panel.message = "Select the parent folder that contains channel subfolders"
-        panel.directoryURL = URL(fileURLWithPath: manager.appConfig.getOutputPath())
-
-        guard panel.runModal() == .OK, let url = panel.url else { return }
-
-        isImporting = true
-        importStatusMessage = "Scanning folders..."
-
-        Task { @MainActor in
-            let result = await manager.importChannelsFromFolders(parentDirectory: url.path)
-            isImporting = false
-            importStatusMessage = "Imported \(result.imported) channel\(result.imported == 1 ? "" : "s"), skipped \(result.skipped)."
-        }
-    }
-
-    private func importFollowedCams() {
-        followedImportPreview = nil
-        isImporting = true
-        importStatusMessage = "Loading followed cams preview..."
-
-        Task { @MainActor in
-            do {
-                let preview = try await manager.prepareFollowedImport(progress: { message in
-                    Task { @MainActor in
-                        importStatusMessage = message
-                    }
-                })
-                isImporting = false
-                followedImportPreview = preview
-                importStatusMessage = "Preview ready: \(preview.toAdd.count) new, \(preview.existing.count) existing. Confirm to add."
-            } catch {
-                isImporting = false
-                importStatusMessage = nil
-                importErrorMessage = error.localizedDescription
-                showingImportError = true
-            }
-        }
-    }
-
-    private func confirmFollowedImport(_ preview: FollowedImportPreview) {
-        isImporting = true
-        importStatusMessage = "Adding selected followed channels..."
-
-        Task { @MainActor in
-            let result = await manager.importFollowedChannelsFromPreview(preview)
-            isImporting = false
-            followedImportPreview = nil
-            importStatusMessage = "Imported \(result.imported) followed channel\(result.imported == 1 ? "" : "s"), skipped \(result.skipped)."
         }
     }
 }

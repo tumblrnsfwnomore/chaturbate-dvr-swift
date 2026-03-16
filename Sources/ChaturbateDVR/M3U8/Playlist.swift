@@ -117,6 +117,23 @@ struct M3U8Parser {
         
         return segments
     }
+
+    static func parseInitSegmentURI(_ content: String) -> String? {
+        let lines = content.components(separatedBy: .newlines)
+
+        for line in lines {
+            let trimmed = line.trimmingCharacters(in: .whitespaces)
+            guard trimmed.hasPrefix("#EXT-X-MAP:") else {
+                continue
+            }
+
+            if let uri = try? extractValue(from: trimmed, key: "URI"), !uri.isEmpty {
+                return uri
+            }
+        }
+
+        return nil
+    }
     
     private static func extractValue(from line: String, key: String) throws -> String {
         let pattern = "\(key)=([^,]+)"

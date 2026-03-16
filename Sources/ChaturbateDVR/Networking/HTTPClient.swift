@@ -17,6 +17,31 @@ actor HTTPClient {
         let (data, _) = try await getDataWithStatus(url)
         return String(data: data, encoding: .utf8) ?? ""
     }
+
+    func getHTML(_ url: String) async throws -> String {
+        guard let url = URL(string: url) else {
+            throw ChaturbateError.networkError("Invalid URL: \(url)")
+        }
+        var request = URLRequest(url: url)
+        // Plain browser-style request — no XHR header, so the server returns full HTML
+        request.setValue("text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8", forHTTPHeaderField: "Accept")
+        request.setValue("en-US,en;q=0.9", forHTTPHeaderField: "Accept-Language")
+
+        let userAgent = config.getUserAgent()
+        if !userAgent.isEmpty {
+            request.setValue(userAgent, forHTTPHeaderField: "User-Agent")
+        }
+
+        let cookies = await config.getCookies()
+        if !cookies.isEmpty {
+            request.setValue(cookies, forHTTPHeaderField: "Cookie")
+        }
+
+        let (data, httpResponse) = try await execute(request: request)
+        let body = String(data: data, encoding: .utf8) ?? ""
+        await FileLogger.shared.log("[http] getHTML status=\(httpResponse.statusCode) url=\(httpResponse.url?.absoluteString ?? "nil") bytes=\(body.count) title=\(body.components(separatedBy: "<title>").dropFirst().first?.components(separatedBy: "</title>").first ?? "none")")
+        return body
+    }
     
     func getData(_ url: String) async throws -> Data {
         let (data, _) = try await getDataWithStatus(url)

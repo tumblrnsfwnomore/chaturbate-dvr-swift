@@ -22,11 +22,7 @@ actor ChaturbateClient {
         }
 
         let body = String(data: data, encoding: .utf8) ?? ""
-        
-        if !body.contains("playlist.m3u8") {
-            throw ChaturbateError.channelOffline
-        }
-        
+
         return try parseStream(body)
     }
 
@@ -219,15 +215,32 @@ actor ChaturbateClient {
     
     private func parseRoomDossier(from data: Data) throws -> Stream {
         struct RoomDossier: Codable {
-            let hlsSource: String
+            let hlsSource: String?
+            let roomStatus: String?
             
             enum CodingKeys: String, CodingKey {
                 case hlsSource = "hls_source"
+                case roomStatus = "room_status"
             }
         }
-        
+
         let room = try JSONDecoder().decode(RoomDossier.self, from: data)
-        return Stream(hlsSource: room.hlsSource)
+
+        if let status = room.roomStatus?.lowercased() {
+            if status == "offline" {
+                throw ChaturbateError.channelOffline
+            }
+            if status == "private" {
+                throw ChaturbateError.privateStream
+            }
+        }
+
+        guard let hlsSource = room.hlsSource?.trimmingCharacters(in: .whitespacesAndNewlines),
+              !hlsSource.isEmpty else {
+            throw ChaturbateError.channelOffline
+        }
+
+        return Stream(hlsSource: hlsSource)
     }
 
     private func fetchFollowedUsernamesFromRoomList(showType: String, debugLines: inout [String], progress: (@Sendable (String) -> Void)? = nil) async throws -> Set<String> {
@@ -887,5 +900,203 @@ actor ChaturbateClient {
         let header = "Followed Import Debug Report"
         let body = lines.map { "- \($0)" }.joined(separator: "\n")
         return "\(header)\n\(body)"
+    }
+
+    func getBioMetadata(username: String) async throws -> BioMetadata {
+        let url = "\(config.domain)\(username)/"
+        
+        // Log the cookies being sent so we can verify auth is working
+        let cookies = await config.getCookies()
+        await FileLogger.shared.log("[client] bio fetch for \(username): cookies=\(cookies.isEmpty ? "NONE" : "\(cookies.count) chars") url=\(url)")
+        
+        let body = try await httpClient.getHTML(url)
+        
+        return parseBioMetadata(body)
+    }
+
+    private func parseBioMetadata(_ html: String) -> BioMetadata {
+        var metadata = BioMetadata()
+        
+        // Parse the new structure: <div class="attribute"> with <div class="label"> and <div class="data">
+        // Extract all label-data pairs
+        var attributes: [String: String] = [:]
+        
+        // Pattern to find attribute blocks: <div class="attribute">...<div class="label">TEXT</div>...<div class="data">TEXT</div>...</div>
+        let attributePattern = "<div class=\"attribute[^\"]*\">\\s*<div class=\"label\">([^<]*)</div>\\s*<div class=\"data\">([^<]*)</div>"
+        
+        guard let regex = try? NSRegularExpression(pattern: attributePattern, options: [.dotMatchesLineSeparators]) else {
+            return metadata
+        }
+        
+        let nsString = html as NSString
+        let matches = regex.matches(in: html, options: [], range: NSRange(location: 0, length: nsString.length))
+        
+        for match in matches {
+            if match.numberOfRanges >= 3,
+               let labelRange = Range(match.range(at: 1), in: html),
+               let dataRange = Range(match.range(at: 2), in: html) {
+                let label = String(html[labelRange]).trimmingCharacters(in: .whitespaces)
+                let value = String(html[dataRange]).trimmingCharacters(in: .whitespaces)
+                attributes[label] = value
+            }
+        }
+        
+        // Map extracted attributes to BioMetadata fields
+        if let iAm = normalizedBioValue(attributes["I am:"]) {
+            metadata.gender = iAm
+        }
+        
+        if let location = normalizedBioValue(attributes["Location:"]) {
+            metadata.location = location
+        }
+        
+        if let bodyType = normalizedBioValue(attributes["Body Type:"]) {
+            metadata.body = bodyType
+        }
+        
+        if let languages = normalizedBioValue(attributes["Languages:"]) {
+            metadata.language = languages
+        }
+
+        if metadata.language == nil,
+           let fallbackLanguage = extractLanguageFromInitialRoomDossier(html) {
+            metadata.language = fallbackLanguage
+        }
+        
+        // For followers, we'd need to find it differently - may not be in bio page
+        // Check for "Followers:" if it exists
+        if let followers = normalizedBioValue(attributes["Followers:"]) {
+            let cleanedFollowers = followers.replacingOccurrences(of: ",", with: "")
+            if let followersInt = Int(cleanedFollowers) {
+                metadata.followers = followersInt
+            }
+        }
+        
+        metadata.lastBioRefresh = Int64(Date().timeIntervalSince1970)
+        
+        // Log the parsed attributes for debugging
+        Task {
+            var attrList = "parsed attributes: "
+            for (label, value) in attributes.sorted(by: { $0.key < $1.key }) {
+                attrList += "[\(label)=\(value)] "
+            }
+            await FileLogger.shared.log("[client] bio parse result: \(attrList)")
+            // Log key presence indicators to diagnose parsing failures
+            if attributes.isEmpty {
+                let hasAttr = html.contains("class=\"attribute\"")
+                let hasBio = html.contains("class=\"bio\"")
+                let hasIAm = html.contains("I am:")
+                let hasLabel = html.contains("class=\"label\"")
+                await FileLogger.shared.log("[client] bio HTML indicators: has_attribute_class=\(hasAttr) has_bio_class=\(hasBio) has_i_am=\(hasIAm) has_label_class=\(hasLabel) total_bytes=\(html.count)")
+            }
+        }
+        
+        return metadata
+    }
+
+    private func normalizedBioValue(_ raw: String?) -> String? {
+        guard let raw else { return nil }
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        let lower = trimmed.lowercased()
+        let placeholders: Set<String> = [
+            "loading",
+            "loading...",
+            "n/a",
+            "na",
+            "unknown",
+            "-",
+            "--"
+        ]
+
+        if placeholders.contains(lower) {
+            return nil
+        }
+
+        return trimmed
+    }
+
+    private func extractLanguageFromInitialRoomDossier(_ html: String) -> String? {
+        let pattern = #"window\.initialRoomDossier = "(.*?)""#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.dotMatchesLineSeparators]) else {
+            return nil
+        }
+
+        let nsString = html as NSString
+        guard let match = regex.firstMatch(in: html, options: [], range: NSRange(location: 0, length: nsString.length)),
+              let range = Range(match.range(at: 1), in: html) else {
+            return nil
+        }
+
+        var encodedJSON = String(html[range])
+        encodedJSON = encodedJSON.replacingOccurrences(of: "\\\\u", with: "\\u")
+
+        var decoded = encodedJSON
+        let unicodePattern = #"\\u([0-9a-fA-F]{4})"#
+        if let unicodeRegex = try? NSRegularExpression(pattern: unicodePattern, options: []) {
+            let unicodeNSString = encodedJSON as NSString
+            let matches = unicodeRegex.matches(in: encodedJSON, options: [], range: NSRange(location: 0, length: unicodeNSString.length))
+
+            for match in matches.reversed() {
+                guard match.numberOfRanges > 1,
+                      let hexRange = Range(match.range(at: 1), in: encodedJSON),
+                      let codePoint = UInt32(String(encodedJSON[hexRange]), radix: 16),
+                      let scalar = UnicodeScalar(codePoint),
+                      let matchRange = Range(match.range, in: decoded) else {
+                    continue
+                }
+                decoded.replaceSubrange(matchRange, with: String(Character(scalar)))
+            }
+        }
+
+        guard let data = decoded.data(using: .utf8),
+              let room = try? JSONSerialization.jsonObject(with: data, options: []) as? [String: Any],
+              let languageCode = normalizedBioValue(room["language"] as? String) else {
+            return nil
+        }
+
+        return displayLanguage(from: languageCode)
+    }
+
+    private func displayLanguage(from rawLanguage: String) -> String {
+        let code = rawLanguage.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let known: [String: String] = [
+            "en": "English",
+            "ru": "Russian",
+            "es": "Spanish",
+            "fr": "French",
+            "de": "German",
+            "it": "Italian",
+            "pt": "Portuguese",
+            "pl": "Polish",
+            "ja": "Japanese",
+            "ko": "Korean",
+            "zh-hans": "Chinese (Simplified)",
+            "zh-hant": "Chinese (Traditional)"
+        ]
+
+        return known[code] ?? rawLanguage
+    }
+
+    private func extractBioField(html: String, dataTestid: String) -> String? {
+        // Pattern to extract content from <td> with specific data-testid
+        // We need to be flexible with attribute ordering and formatting
+        let escapedTestid = NSRegularExpression.escapedPattern(for: dataTestid)
+        let pattern = "<td[^>]*data-testid=\"\(escapedTestid)\"[^>]*>([^<]*)</td>"
+        
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
+            return nil
+        }
+        
+        let nsString = html as NSString
+        let matches = regex.matches(in: html, options: [], range: NSRange(location: 0, length: nsString.length))
+        
+        if let firstMatch = matches.first, let range = Range(firstMatch.range(at: 1), in: html) {
+            return String(html[range])
+        }
+        
+        // Field not found - this is normal, not all sections exist for all users/profiles
+        return nil
     }
 }

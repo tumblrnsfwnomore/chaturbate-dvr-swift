@@ -8,6 +8,12 @@ struct FollowedImportPreview {
     let toAdd: [String]
 }
 
+struct BioBackfillProgress {
+    let completed: Int
+    let total: Int
+    let currentChannel: String
+}
+
 actor RequestCoordinator {
     struct Stats {
         let activeRequests: Int
@@ -166,13 +172,20 @@ class ChannelManager: ObservableObject {
     @Published var channels: [String: Channel] = [:]
     @Published var appConfig = AppConfig()
     @Published var runtimeDiagnostics: RuntimeDiagnostics = .empty
+    @Published var isHydratingChannels: Bool = true
+    
+    var channelCount: Int {
+        channels.count
+    }
     
     private let configURL: URL
     private let appConfigURL: URL
     private var pausedStatusCheckTask: Task<Void, Never>?
     private var offlineThumbnailBackfillTask: Task<Void, Never>?
+    private var bioBackfillTask: Task<Void, Never>?
     private var pausedProbeIndex: Int = 0
     private var thumbnailBackfillIndex: Int = 0
+    private var bioBackfillIndex: Int = 0
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
     
@@ -198,6 +211,8 @@ class ChannelManager: ObservableObject {
         loadConfig()
         startPausedStatusChecks()
         startOfflineThumbnailBackfill()
+        // Bio backfill is manual via on-demand refresh controls in Add Channel and Settings
+        // startBioBackfill()
 
         Task {
             await FileLogger.shared.log("[manager] initialized")
@@ -207,6 +222,7 @@ class ChannelManager: ObservableObject {
     deinit {
         pausedStatusCheckTask?.cancel()
         offlineThumbnailBackfillTask?.cancel()
+        bioBackfillTask?.cancel()
     }
     
     private func loadAppConfig() {
@@ -239,9 +255,13 @@ class ChannelManager: ObservableObject {
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
             await recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
+            for (_, channel) in channels {
+                await channel.updateAppConfig(appConfig)
+            }
             await FileLogger.shared.log("[manager] updated max concurrent requests to \(appConfig.maxConcurrentRequests)")
             let recordingsCap = appConfig.maxConcurrentRecordings == 0 ? "unlimited" : String(appConfig.maxConcurrentRecordings)
             await FileLogger.shared.log("[manager] updated max concurrent recordings to \(recordingsCap)")
+            await FileLogger.shared.log("[manager] updated break detection settings: static=\(appConfig.breakStaticThresholdMinutes)m no_person=\(appConfig.breakNoPersonNoMotionThresholdMinutes)m analysis=\(appConfig.breakAnalysisIntervalSeconds)s")
         }
     }
     
@@ -281,6 +301,12 @@ class ChannelManager: ObservableObject {
         }
 
         await FileLogger.shared.log("[manager] channel created", channel: config.username)
+        
+        // Fetch bio metadata asynchronously (non-blocking)
+        let username = config.username
+        Task {
+            await self.refreshBioMetadata(username: username)
+        }
     }
     
     func pauseChannel(username: String) async {
@@ -665,6 +691,7 @@ class ChannelManager: ObservableObject {
     private func loadConfig() {
         guard let data = try? Data(contentsOf: configURL),
               let configs = try? JSONDecoder().decode([ChannelConfig].self, from: data) else {
+            isHydratingChannels = false
             Task {
                 await FileLogger.shared.log("[manager] no saved channels config found")
             }
@@ -696,6 +723,9 @@ class ChannelManager: ObservableObject {
                     pausedChannels.append(channel)
                 }
             }
+
+            // Mark initial hydration complete once channels are loaded into memory.
+            isHydratingChannels = false
 
             // Priority 1: On launch, detect paused-online channels first.
             // Use bounded concurrency and bypass normal rate limiting so the UI
@@ -756,6 +786,51 @@ class ChannelManager: ObservableObject {
             configs.append(config)
         }
         return configs
+    }
+
+    func refreshBioMetadata(username: String) async {
+        guard let channel = channels[username] else { return }
+        
+        await FileLogger.shared.log("[manager] fetching bio metadata for channel", channel: username)
+        
+        let client = ChaturbateClient(config: appConfig)
+        do {
+            var bioMetadata = try await client.getBioMetadata(username: username)
+            var config = await channel.config
+            let existingBio = config.bioMetadata
+
+            // Preserve previously known values when a refresh returns placeholders or partial data.
+            if bioMetadata.gender == nil { bioMetadata.gender = existingBio?.gender }
+            if bioMetadata.followers == nil { bioMetadata.followers = existingBio?.followers }
+            if bioMetadata.location == nil { bioMetadata.location = existingBio?.location }
+            if bioMetadata.body == nil { bioMetadata.body = existingBio?.body }
+            if bioMetadata.language == nil { bioMetadata.language = existingBio?.language }
+
+            config.bioMetadata = bioMetadata
+            await channel.updateConfig(config)
+            await saveConfig()
+            let genderStr = bioMetadata.gender ?? "unknown"
+            await FileLogger.shared.log("[manager] bio metadata updated: gender=\(genderStr)", channel: username)
+        } catch {
+            await FileLogger.shared.log("[manager] failed to fetch bio metadata: \(error.localizedDescription)", channel: username, level: "WARN")
+        }
+    }
+
+    func backfillAllChannelsBioMetadata(progress: @escaping (BioBackfillProgress) -> Void) async throws {
+        let channelList = Array(channels.keys).sorted()
+        await FileLogger.shared.log("[manager] starting bio metadata backfill for all \(channelList.count) channels")
+        
+        for (index, username) in channelList.enumerated() {
+            try Task.checkCancellation()
+            progress(BioBackfillProgress(completed: index, total: channelList.count, currentChannel: username))
+            await refreshBioMetadata(username: username)
+            
+            // Small delay between requests to avoid overwhelming the server
+            try await Task.sleep(nanoseconds: 2 * 1_000_000_000) // 2 seconds
+        }
+        
+        progress(BioBackfillProgress(completed: channelList.count, total: channelList.count, currentChannel: ""))
+        await FileLogger.shared.log("[manager] bio metadata backfill complete for all channels")
     }
 
     private func startPausedStatusChecks() {
@@ -849,6 +924,53 @@ class ChannelManager: ObservableObject {
                 await FileLogger.shared.log("Thumbnail backfill: unexpected error - \(error.localizedDescription)", channel: username, level: "WARN")
             }
         }
+    }
+
+    private func startBioBackfill() {
+        bioBackfillTask?.cancel()
+        Task {
+            await FileLogger.shared.log("[manager] started bio metadata backfill")
+        }
+        bioBackfillTask = Task { [weak self] in
+            guard let self else { return }
+
+            // Wait a bit before starting bio backfill to avoid startup resource contention
+            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+
+            while !Task.isCancelled {
+                await self.backfillOneBioMetadata()
+                // One channel at a time to avoid overwhelming the network
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            }
+        }
+    }
+
+    private func backfillOneBioMetadata() async {
+        var candidates: [(String, Channel)] = []
+
+        for (username, channel) in channels {
+            let config = await channel.config
+            // Only backfill if bio metadata doesn't exist or is too old (>90 days)
+            let shouldBackfill: Bool
+            if let lastRefresh = config.bioMetadata?.lastBioRefresh {
+                let daysSinceRefresh = (Int64(Date().timeIntervalSince1970) - lastRefresh) / (24 * 3600)
+                shouldBackfill = daysSinceRefresh > 90
+            } else {
+                shouldBackfill = true
+            }
+            
+            if shouldBackfill {
+                candidates.append((username, channel))
+            }
+        }
+
+        guard !candidates.isEmpty else { return }
+
+        // Round-robin to give all channels a fair chance
+        let (username, _) = candidates[bioBackfillIndex % candidates.count]
+        bioBackfillIndex = (bioBackfillIndex + 1) % candidates.count
+
+        await refreshBioMetadata(username: username)
     }
 
     private func checkPausedChannelStatusBatch(maxChecks: Int) async {
