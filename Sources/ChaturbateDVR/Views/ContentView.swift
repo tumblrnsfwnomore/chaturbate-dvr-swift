@@ -1956,6 +1956,7 @@ struct ChannelDetailView: View {
     private func channelContent(info: ChannelInfo) -> some View {
         GeometryReader { geometry in
             let detailWidth = responsiveDetailWidth(totalWidth: geometry.size.width)
+            let activityLogHeight = min(max(geometry.size.height * 0.22, 120), 190)
 
             HStack(alignment: .top, spacing: 12) {
                 VStack(alignment: .leading, spacing: 16) {
@@ -1971,7 +1972,7 @@ struct ChannelDetailView: View {
                     }
 
                     activityLogSection(info: info)
-                        .frame(maxHeight: .infinity, alignment: .top)
+                        .frame(height: activityLogHeight)
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
                 .frame(maxHeight: .infinity, alignment: .top)
@@ -2289,8 +2290,8 @@ struct ChannelDetailView: View {
     }
 
     private func responsiveDetailWidth(totalWidth: CGFloat) -> CGFloat {
-        let target = totalWidth * 0.36
-        return min(max(target, 350), 470)
+        let target = totalWidth * 0.29
+        return min(max(target, 300), 380)
     }
 
     private static func recordingsOnDisk(info: ChannelInfo) -> [String] {
@@ -2371,22 +2372,27 @@ struct ChannelDetailView: View {
         if let thumbnailPath = info.thumbnailPath,
            FileManager.default.fileExists(atPath: thumbnailPath),
            let nsImage = NSImage(contentsOfFile: thumbnailPath) {
-            Image(nsImage: nsImage)
-                .resizable()
-                .aspectRatio(contentMode: .fit)
-                .frame(maxWidth: .infinity)
-                .aspectRatio(16/9, contentMode: .fit)
-                .saturation(info.isOnline ? 1.0 : 0.0)
-                .opacity(info.isOnline ? 1.0 : 0.45)
-                .overlay(
-                    Group {
-                        if !info.isOnline {
-                            Color.black.opacity(0.2)
+            ZStack {
+                Color(NSColor.controlBackgroundColor).opacity(0.3)
+
+                Image(nsImage: nsImage)
+                    .resizable()
+                    .scaledToFill()
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                    .saturation(info.isOnline ? 1.0 : 0.0)
+                    .opacity(info.isOnline ? 1.0 : 0.45)
+                    .overlay(
+                        Group {
+                            if !info.isOnline {
+                                Color.black.opacity(0.2)
+                            }
                         }
-                    }
-                )
-                .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
-                .cornerRadius(10)
+                    )
+            }
+            .frame(maxWidth: .infinity)
+            .aspectRatio(16/9, contentMode: .fit)
+            .clipped()
+            .cornerRadius(10)
         } else if info.isOnline {
             ZStack {
                 Rectangle()
@@ -2400,6 +2406,7 @@ struct ChannelDetailView: View {
                         .foregroundColor(.secondary)
                 }
             }
+            .frame(maxWidth: .infinity)
             .aspectRatio(16/9, contentMode: .fit)
             .cornerRadius(10)
         } else {
@@ -2410,6 +2417,7 @@ struct ChannelDetailView: View {
                     .font(.title)
                     .foregroundColor(.secondary)
             }
+            .frame(maxWidth: .infinity)
             .aspectRatio(16/9, contentMode: .fit)
             .cornerRadius(10)
         }
