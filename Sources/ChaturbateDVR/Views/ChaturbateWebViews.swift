@@ -1,6 +1,27 @@
 import SwiftUI
 import WebKit
 
+// Injects a flat [name: value] cookie map into a WKHTTPCookieStore.
+// All cookies are scoped to .chaturbate.com / path /.
+private func injectChaturbateCookies(_ cookieMap: [String: String], into store: WKHTTPCookieStore, completion: @escaping () -> Void) {
+    guard !cookieMap.isEmpty else { completion(); return }
+    let group = DispatchGroup()
+    for (name, value) in cookieMap {
+        let properties: [HTTPCookiePropertyKey: Any] = [
+            .domain:  ".chaturbate.com",
+            .path:    "/",
+            .name:    name,
+            .value:   value,
+            .secure:  "TRUE",
+        ]
+        if let cookie = HTTPCookie(properties: properties) {
+            group.enter()
+            store.setCookie(cookie) { group.leave() }
+        }
+    }
+    group.notify(queue: .main, execute: completion)
+}
+
 struct ChaturbateLoginSheet: View {
     @ObservedObject var manager: ChannelManager
     @Binding var isPresented: Bool
@@ -38,7 +59,7 @@ struct ChaturbateLoginSheet: View {
 
             Divider()
 
-            ChaturbateLoginWebView { cookies, userAgent, username in
+            ChaturbateLoginWebView(existingCookies: manager.appConfig.inAppCookies) { cookies, userAgent, username in
                 guard !isSaving else { return }
                 isSaving = true
                 statusMessage = "Saving authenticated session..."
@@ -53,6 +74,7 @@ struct ChaturbateLoginSheet: View {
 }
 
 private struct ChaturbateLoginWebView: NSViewRepresentable {
+    let existingCookies: [String: String]
     let onAuthenticated: (_ cookies: [String: String], _ userAgent: String, _ username: String?) -> Void
 
     func makeCoordinator() -> Coordinator {
@@ -73,8 +95,11 @@ private struct ChaturbateLoginWebView: NSViewRepresentable {
         webView.navigationDelegate = context.coordinator
         context.coordinator.attach(webView)
 
-        if let url = URL(string: "https://chaturbate.com/auth/login/") {
-            webView.load(URLRequest(url: url))
+        let targetURL = URL(string: "https://chaturbate.com/auth/login/")
+        injectChaturbateCookies(existingCookies, into: configuration.websiteDataStore.httpCookieStore) {
+            if let url = targetURL {
+                webView.load(URLRequest(url: url))
+            }
         }
 
         return webView
@@ -168,6 +193,7 @@ private struct ChaturbateLoginWebView: NSViewRepresentable {
 
 struct ChaturbateChannelPageSheet: View {
     let username: String
+    let cookies: [String: String]
     @Binding var isPresented: Bool
 
     var body: some View {
@@ -192,7 +218,7 @@ struct ChaturbateChannelPageSheet: View {
 
             Divider()
 
-            ChaturbatePageWebView(urlString: "https://chaturbate.com/\(username)")
+            ChaturbatePageWebView(urlString: "https://chaturbate.com/\(username)", cookies: cookies)
         }
         .frame(minWidth: 1040, minHeight: 720)
     }
@@ -200,6 +226,7 @@ struct ChaturbateChannelPageSheet: View {
 
 private struct ChaturbatePageWebView: NSViewRepresentable {
     let urlString: String
+    let cookies: [String: String]
 
     private static let desktopUserAgent =
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) " +
@@ -211,8 +238,11 @@ private struct ChaturbatePageWebView: NSViewRepresentable {
         let webView = WKWebView(frame: .zero, configuration: configuration)
         webView.customUserAgent = Self.desktopUserAgent
 
-        if let url = URL(string: urlString) {
-            webView.load(URLRequest(url: url))
+        let targetURL = URL(string: urlString)
+        injectChaturbateCookies(cookies, into: configuration.websiteDataStore.httpCookieStore) {
+            if let url = targetURL {
+                webView.load(URLRequest(url: url))
+            }
         }
 
         return webView

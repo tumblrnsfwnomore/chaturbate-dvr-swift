@@ -2480,7 +2480,7 @@ struct ChannelDetailView: View {
             }
         }
         .sheet(isPresented: $showingChannelPage) {
-            ChaturbateChannelPageSheet(username: username, isPresented: $showingChannelPage)
+            ChaturbateChannelPageSheet(username: username, cookies: manager.appConfig.inAppCookies, isPresented: $showingChannelPage)
         }
     }
 
