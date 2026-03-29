@@ -3,6 +3,72 @@ import AVFoundation
 import AppKit
 import Vision
 
+private actor MP4Finalizer {
+    private var inFlightPaths: Set<String> = []
+    private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func enqueue(path: String, channel: String) {
+        guard inFlightPaths.insert(path).inserted else { return }
+
+        Task.detached(priority: .utility) { [weak self] in
+            await self?.finalize(path: path, channel: channel)
+        }
+    }
+
+    private func finalize(path: String, channel: String) async {
+        defer {
+            inFlightPaths.remove(path)
+            if inFlightPaths.isEmpty, !idleWaiters.isEmpty {
+                let waiters = idleWaiters
+                idleWaiters.removeAll(keepingCapacity: false)
+                for waiter in waiters {
+                    waiter.resume(returning: ())
+                }
+            }
+        }
+
+        let sourceURL = URL(fileURLWithPath: path)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else { return }
+
+        let tempURL = sourceURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(sourceURL.deletingPathExtension().lastPathComponent)_finalizing_\(UUID().uuidString).mp4")
+
+        do {
+            try await exportPassthrough(sourceURL: sourceURL, destinationURL: tempURL)
+
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try FileManager.default.removeItem(at: sourceURL)
+            }
+            try FileManager.default.moveItem(at: tempURL, to: sourceURL)
+            await FileLogger.shared.log("[recording] finalized mp4 for fast open/seek", channel: channel)
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            await FileLogger.shared.log("[recording] mp4 finalization skipped: \(error.localizedDescription)", channel: channel, level: "WARN")
+        }
+    }
+
+    private func exportPassthrough(sourceURL: URL, destinationURL: URL) async throws {
+        let asset = AVURLAsset(url: sourceURL)
+        guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
+            throw ChaturbateError.fileError("Could not create export session")
+        }
+
+        export.shouldOptimizeForNetworkUse = true
+        try await export.export(to: destinationURL, as: .mp4)
+    }
+
+    func waitUntilIdle() async {
+        if inFlightPaths.isEmpty {
+            return
+        }
+
+        await withCheckedContinuation { continuation in
+            idleWaiters.append(continuation)
+        }
+    }
+}
+
 actor Channel {
     private static let pausedPreviewMinInterval: TimeInterval = 180
     private static let pausedOnlineStickyDuration: TimeInterval = 60
@@ -10,8 +76,9 @@ actor Channel {
     private static let pausedPreviewMaxSegmentBytes = 6 * 1024 * 1024
     private static let recordingPreviewWindowSeconds: TimeInterval = 30
     private static let recordingPreviewMaxBytes = 12 * 1024 * 1024
-    private static let waitingStatusCheckIntervalSeconds: TimeInterval = 12
-    private static let waitingPreviewMinInterval: TimeInterval = 20
+    private static let waitingStatusCheckIntervalSeconds: TimeInterval = 30
+    private static let waitingPreviewMinInterval: TimeInterval = 120
+    private static let waitingOfflineConfirmAttempts: Int = 2
     private static let breakStaticMotionThreshold: Double = 0.003
     private static let breakLowMotionThreshold: Double = 0.015
     private static let breakAnalysisImageSize: Int = 64
@@ -19,6 +86,7 @@ actor Channel {
     private static let noPersonThenStaticConfirmSeconds: TimeInterval = 45
     private static let recordingStartNoPersonSamples: Int = 3
     private static let recordingStartNoPersonRequiredMisses: Int = 3
+    private static let mp4Finalizer = MP4Finalizer()
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -36,8 +104,12 @@ actor Channel {
     private(set) var duration: Double = 0 // seconds
     private(set) var filesize: Int = 0 // bytes
     private(set) var sequence: Int = 0
+    private(set) var sessionDurationSeconds: TimeInterval = 0 // seconds since session started
+    private(set) var sessionFilesizeBytes: Int = 0 // bytes written in current online session
+    private(set) var isPausedBySessionLimit: Bool = false
     private(set) var logs: [String] = []
     private(set) var currentFilename: String?
+    private(set) var pendingFilenameBase: String?
     private(set) var thumbnailPath: String?
     private(set) var isChecking: Bool = false
     private(set) var isWaitingForRecordingSlot: Bool = false
@@ -53,6 +125,7 @@ actor Channel {
     private var lastWaitingPreviewTime: Date = Date.distantPast
     private var isRefreshingPausedPreview: Bool = false
     private var isRefreshingWaitingPreview: Bool = false
+    private var waitingOfflineProbeFailures: Int = 0
     private var pausedOnlineStickyUntil: Date?
     private var recentPreviewSegments: [PreviewSegmentChunk] = []
     private var recentPreviewDuration: Double = 0
@@ -61,6 +134,8 @@ actor Channel {
     private var activeInitSegmentURI: String?
     private var activeInitSegmentData: Data?
     private var currentFileDecodeTimeOffset: UInt64?
+    private var pendingTimestampDiscontinuity: Bool = false
+    private var sessionStartedAt: Date? // tracks session start for session duration limits
     private var lastPreviewFailureLogAt: Date = Date.distantPast
     private var cloudflareBlockCount: Int = 0
     private var segmentRetryCount: Int = 0
@@ -116,15 +191,14 @@ actor Channel {
     func pause() {
         let wasOnline = isOnline
         config.isPaused = true
+        isPausedBySessionLimit = false
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
         resetBreakDetectionState()
         monitoringTask?.cancel()
         monitoringTask = nil
-        waitingForSlotStatusTask?.cancel()
-        waitingForSlotStatusTask = nil
+        endWaitingForSlotMonitoring()
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
-        isWaitingForRecordingSlot = false
         if wasOnline {
             addLog("Channel paused (kept as paused-online for up to 1 minute)")
         } else {
@@ -132,9 +206,27 @@ actor Channel {
         }
     }
     
+    func pauseForSessionLimit(reason: String) {
+        let wasOnline = isOnline
+        config.isPaused = true
+        isPausedBySessionLimit = true
+        pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
+        resetBreakDetectionState()
+        monitoringTask?.cancel()
+        monitoringTask = nil
+        endWaitingForSlotMonitoring()
+        closeCurrentFile(resetStats: true)
+        clearRecordingPreviewState(removeTempFile: true)
+        addLog("Session limit reached (\(reason)). Channel paused until it goes offline and comes back for a new session.")
+    }
+    
     func resume() {
         config.isPaused = false
+        isPausedBySessionLimit = false
         pausedOnlineStickyUntil = nil
+        sessionDurationSeconds = 0
+        sessionFilesizeBytes = 0
+        sessionStartedAt = nil
         guard monitoringTask == nil else { return }
         
         monitoringTask = Task {
@@ -149,14 +241,29 @@ actor Channel {
         resetBreakDetectionState()
         monitoringTask?.cancel()
         monitoringTask = nil
-        waitingForSlotStatusTask?.cancel()
-        waitingForSlotStatusTask = nil
+        endWaitingForSlotMonitoring()
         isOnline = false
-        isWaitingForRecordingSlot = false
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
         cleanupThumbnail()
         addLog("Channel deleted")
+    }
+
+    func shutdownForTermination() {
+        config.isPaused = true
+        pausedOnlineStickyUntil = nil
+        resetBreakDetectionState()
+        monitoringTask?.cancel()
+        monitoringTask = nil
+        endWaitingForSlotMonitoring()
+        isOnline = false
+        closeCurrentFile(resetStats: true)
+        clearRecordingPreviewState(removeTempFile: true)
+    }
+
+    static func waitForMP4FinalizationToComplete() async {
+        await Task.yield()
+        await mp4Finalizer.waitUntilIdle()
     }
     
     func updateConfig(_ newConfig: ChannelConfig) {
@@ -169,6 +276,8 @@ actor Channel {
         config.pattern = newConfig.pattern
         config.maxDuration = newConfig.maxDuration
         config.maxFilesize = newConfig.maxFilesize
+        config.maxSessionDuration = newConfig.maxSessionDuration
+        config.maxSessionFilesize = newConfig.maxSessionFilesize
         config.bioMetadata = newConfig.bioMetadata
         
         // If settings changed while recording, log it
@@ -209,6 +318,7 @@ actor Channel {
         return ChannelInfo(
             isOnline: isOnline,
             isPaused: config.isPaused,
+            isPausedBySessionLimit: isPausedBySessionLimit,
             username: config.username,
             duration: formatDuration(duration),
             filesize: formatFilesize(filesize),
@@ -232,7 +342,8 @@ actor Channel {
             segmentRetryCount: segmentRetryCount,
             consecutiveSegmentFailures: consecutiveSegmentFailures,
             lastSegmentFailureAt: lastSegmentFailureAt.map { formatter.string(from: $0) },
-            bioMetadata: config.bioMetadata
+            bioMetadata: config.bioMetadata,
+            globalRecordingEnabled: appConfig.recordingEnabled
         )
     }
 
@@ -527,6 +638,9 @@ actor Channel {
                     endWaitingForSlotMonitoring()
 
                     streamedAt = Date()
+                    sessionStartedAt = Date()
+                    sessionDurationSeconds = 0
+                    sessionFilesizeBytes = 0
                     sequence = 0
 
                     try await nextFile()
@@ -588,6 +702,7 @@ actor Channel {
     private func beginWaitingForSlotMonitoring(initialHlsSource: String) {
         waitingForSlotStatusTask?.cancel()
         isWaitingForRecordingSlot = true
+        waitingOfflineProbeFailures = 0
         // We already confirmed stream availability before queueing for a slot.
         isOnline = true
         markLastOnlineNow()
@@ -615,6 +730,10 @@ actor Channel {
         waitingForSlotStatusTask?.cancel()
         waitingForSlotStatusTask = nil
         isWaitingForRecordingSlot = false
+        waitingOfflineProbeFailures = 0
+        Task { [recordingCoordinator, username = config.username] in
+            await recordingCoordinator.cancelPendingSlotRequest(for: username)
+        }
     }
 
     // Returns an updated HLS source when stream probing succeeds.
@@ -623,13 +742,17 @@ actor Channel {
 
         isChecking = true
         do {
+            let wasOnline = isOnline
             let stream = try await withRequestSlot {
                 try await client.getStream(username: config.username)
             }
             isChecking = false
+            waitingOfflineProbeFailures = 0
             markChannelValid()
             isOnline = true
-            markLastOnlineNow()
+            if !wasOnline {
+                markLastOnlineNow()
+            }
             return stream.hlsSource
         } catch {
             isChecking = false
@@ -638,12 +761,17 @@ actor Channel {
                 switch cbError {
                 case .invalidChannel:
                     markChannelInvalid()
-                    markOfflineAndClearDegradedState()
+                    endWaitingForSlotMonitoring()
                     addLog("Waiting for slot: channel returned 404 (marked invalid)")
                 case .channelOffline, .privateStream:
-                    markOfflineAndClearDegradedState()
+                    waitingOfflineProbeFailures += 1
+                    if waitingOfflineProbeFailures >= Self.waitingOfflineConfirmAttempts {
+                        endWaitingForSlotMonitoring()
+                        markOfflineAndClearDegradedState()
+                    }
                 default:
                     // Keep previous online state for transient failures.
+                    waitingOfflineProbeFailures = 0
                     break
                 }
             }
@@ -709,6 +837,11 @@ actor Channel {
             try previewData.write(to: tempSegmentURL, options: .atomic)
             defer { try? FileManager.default.removeItem(at: tempSegmentURL) }
 
+            let personDetected = await detectHumanPresence(inVideoAtPath: tempSegmentPath)
+            if personDetected {
+                clearNoPersonIndicatorStateAfterWaitingRecovery()
+            }
+
             let success = await generateThumbnail(from: tempSegmentPath)
             if success {
                 await FileLogger.shared.logLiveThumbnailSuccess(channel: config.username)
@@ -717,6 +850,16 @@ actor Channel {
             // Waiting previews are best-effort and should not affect queue progression.
             await FileLogger.shared.logLiveThumbnailFailure(channel: config.username, error: error.localizedDescription)
         }
+    }
+
+    private func clearNoPersonIndicatorStateAfterWaitingRecovery() {
+        latestPersonDetected = true
+        lastPersonSeenAt = Date()
+        isNoPersonLikely = false
+        noPersonStreakSeconds = 0
+        noPersonNoMotionStreakSeconds = 0
+        noPersonCarryExpiryAt = nil
+        noPersonEvidenceExpiryAt = nil
     }
 
     private func withRequestSlot<T>(_ operation: () async throws -> T) async throws -> T {
@@ -732,14 +875,17 @@ actor Channel {
     }
 
     private func withRecordingSlot<T>(_ operation: () async throws -> T) async throws -> T {
-        await recordingCoordinator.acquireSlot()
+        let slotGranted = await recordingCoordinator.acquireSlot(for: config.username)
+        guard slotGranted else {
+            throw ChaturbateError.paused
+        }
         do {
             try Task.checkCancellation()
             let result = try await operation()
-            await recordingCoordinator.releaseSlot()
+            await recordingCoordinator.releaseSlot(for: config.username)
             return result
         } catch {
-            await recordingCoordinator.releaseSlot()
+            await recordingCoordinator.releaseSlot(for: config.username)
             throw error
         }
     }
@@ -748,7 +894,7 @@ actor Channel {
         var lastSeq = -1
         let httpClient = HTTPClient(config: appConfig)
         
-        while !Task.isCancelled && !config.isPaused {
+        while !Task.isCancelled && !config.isPaused && appConfig.recordingEnabled {
             let content = try await httpClient.get(playlist.playlistURL)
             try await refreshActiveInitSegment(
                 mediaPlaylistContent: content,
@@ -766,6 +912,9 @@ actor Channel {
             for segment in segments {
                 if Task.isCancelled || config.isPaused {
                     throw ChaturbateError.paused
+                }
+                if !appConfig.recordingEnabled {
+                    break
                 }
                 
                 let seq = segment.sequenceNumber
@@ -789,6 +938,10 @@ actor Channel {
             }
             
             try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
+        }
+
+        if !appConfig.recordingEnabled && !Task.isCancelled && !config.isPaused {
+            addLog("Recording globally disabled, waiting for recording to be re-enabled")
         }
     }
 
@@ -836,6 +989,24 @@ actor Channel {
         isOnline = false
         preserveNoPersonStateAcrossTransientOffline()
         clearDegradedState()
+        
+        // When channel goes offline, clear session limit pause so it can
+        // record fresh when it comes back with a new session
+        if isPausedBySessionLimit && !config.isPaused {
+            // Only clear if it's not manually paused; manual pauses take precedence
+            isPausedBySessionLimit = false
+            config.isPaused = false
+            sessionDurationSeconds = 0
+            sessionFilesizeBytes = 0
+            sessionStartedAt = nil
+            addLog("Channel went offline - session limit pause cleared, ready to record on next session")
+        } else if isPausedBySessionLimit && config.isPaused {
+            // Clear the session limit flag but keep the manual pause
+            isPausedBySessionLimit = false
+            sessionDurationSeconds = 0
+            sessionFilesizeBytes = 0
+            sessionStartedAt = nil
+        }
     }
 
     private func clearDegradedState() {
@@ -879,13 +1050,13 @@ actor Channel {
             throw ChaturbateError.paused
         }
 
-        guard currentFile != nil else {
-            throw ChaturbateError.fileError("No file open")
+        if pendingTimestampDiscontinuity && filesize > 0 {
+            addLog("Timestamp discontinuity detected, rolling to a new recording file")
+            try await nextFile()
         }
+        pendingTimestampDiscontinuity = false
 
-        if filesize == 0, activeInitSegmentData != nil {
-            try migrateActiveRecordingFileToMP4IfNeeded()
-        }
+        try await ensureCurrentFileOpenForWrite()
 
         guard let file = currentFile else {
             throw ChaturbateError.fileError("No file open")
@@ -900,8 +1071,28 @@ actor Channel {
         try file.synchronize()
         
         filesize += data.count
+        sessionFilesizeBytes += data.count
         self.duration += duration
+        sessionDurationSeconds += duration
         appendSegmentToRecordingPreviewBuffer(data: data, duration: duration)
+        
+        // Check session duration limit
+        if config.maxSessionDuration > 0 {
+            let sessionLimitSeconds = TimeInterval(config.maxSessionDuration * 60)
+            if sessionDurationSeconds >= sessionLimitSeconds && !isPausedBySessionLimit {
+                pauseForSessionLimit(reason: "\(config.maxSessionDuration) minutes")
+                throw ChaturbateError.paused
+            }
+        }
+
+        // Check session total filesize limit across split files
+        if config.maxSessionFilesize > 0 {
+            let sessionFilesizeLimitBytes = config.maxSessionFilesize * 1024 * 1024
+            if sessionFilesizeBytes >= sessionFilesizeLimitBytes && !isPausedBySessionLimit {
+                pauseForSessionLimit(reason: "\(config.maxSessionFilesize) MB")
+                throw ChaturbateError.paused
+            }
+        }
         
         // Generate thumbnail every 5 seconds
         let now = Date()
@@ -920,20 +1111,38 @@ actor Channel {
         
         if shouldSwitchFile() {
             try await nextFile()
-            addLog("Max filesize or duration exceeded, new file created: \(currentFilename ?? "unknown")")
+            addLog("Max filesize or duration exceeded, next file queued")
         }
     }
     
     private func nextFile() async throws {
         closeCurrentFile(resetStats: true)
-        let filename = try generateFilename()
+        pendingFilenameBase = try generateFilename()
+        sequence += 1
+    }
+
+    private func ensureCurrentFileOpenForWrite() async throws {
+        if currentFile != nil {
+            return
+        }
+
+        if pendingFilenameBase == nil {
+            pendingFilenameBase = try generateFilename()
+            sequence += 1
+        }
+
+        guard let filenameBase = pendingFilenameBase else {
+            throw ChaturbateError.fileError("No pending filename available")
+        }
+
         let fileExtension = activeInitSegmentData == nil ? "ts" : "mp4"
-        let isFirstFileInSession = (sequence == 0)
-        try await createNewFile(filename: filename, fileExtension: fileExtension)
+        let isFirstFileInSession = (sequence == 1)
+        try await createNewFile(filename: filenameBase, fileExtension: fileExtension)
+        pendingFilenameBase = nil
+
         if isFirstFileInSession {
             addLog("Recording container selected: .\(fileExtension)")
         }
-        sequence += 1
     }
     
     private func generateFilename() throws -> String {
@@ -1010,45 +1219,10 @@ actor Channel {
         }
     }
 
-    private func migrateActiveRecordingFileToMP4IfNeeded() throws {
-        guard let existingPath = currentFilename,
-              existingPath.lowercased().hasSuffix(".ts"),
-              let existingHandle = currentFile else {
-            return
-        }
-
-        let sourceURL = URL(fileURLWithPath: existingPath)
-        let destinationURL = sourceURL.deletingPathExtension().appendingPathExtension("mp4")
-
-        do {
-            try existingHandle.synchronize()
-            try existingHandle.close()
-        } catch {
-            // Continue with rename attempt; some handles can still be moved safely.
-        }
-        currentFile = nil
-
-        if FileManager.default.fileExists(atPath: destinationURL.path) {
-            try FileManager.default.removeItem(at: destinationURL)
-        }
-
-        try FileManager.default.moveItem(at: sourceURL, to: destinationURL)
-
-        guard let reopenedHandle = FileHandle(forWritingAtPath: destinationURL.path) else {
-            throw ChaturbateError.fileError("Could not reopen file after switching to .mp4: \(destinationURL.path)")
-        }
-        reopenedHandle.seekToEndOfFile()
-        currentFile = reopenedHandle
-        currentFilename = destinationURL.path
-
-        if let historyIndex = config.recordingHistory.lastIndex(of: sourceURL.path) {
-            config.recordingHistory[historyIndex] = destinationURL.path
-        }
-
-        addLog("Detected fragmented MP4 stream, saving recording as .mp4")
-    }
-    
     private func closeCurrentFile(resetStats: Bool) {
+        let closedPath = currentFilename
+        let shouldFinalizeMP4 = (closedPath as NSString?)?.pathExtension.lowercased() == "mp4"
+
         if let file = currentFile {
             do {
                 try file.synchronize()
@@ -1060,10 +1234,18 @@ actor Channel {
             currentFile = nil
         }
 
+        if shouldFinalizeMP4, let closedPath {
+            let channelName = config.username
+            Task {
+                await Self.mp4Finalizer.enqueue(path: closedPath, channel: channelName)
+            }
+        }
+
         if resetStats {
             filesize = 0
             duration = 0
             currentFilename = nil
+            pendingFilenameBase = nil
             currentFileDecodeTimeOffset = nil
         }
     }
@@ -1075,12 +1257,18 @@ actor Channel {
 
         var bytes = [UInt8](data)
         var changed = false
+        var discontinuityDetected = false
         rewriteTFDTBoxes(
             in: &bytes,
             range: 0..<bytes.count,
             decodeTimeOffset: &currentFileDecodeTimeOffset,
+            discontinuityDetected: &discontinuityDetected,
             changed: &changed
         )
+
+        if discontinuityDetected {
+            pendingTimestampDiscontinuity = true
+        }
 
         if changed {
             return Data(bytes)
@@ -1088,7 +1276,13 @@ actor Channel {
         return data
     }
 
-    private func rewriteTFDTBoxes(in bytes: inout [UInt8], range: Range<Int>, decodeTimeOffset: inout UInt64?, changed: inout Bool) {
+    private func rewriteTFDTBoxes(
+        in bytes: inout [UInt8],
+        range: Range<Int>,
+        decodeTimeOffset: inout UInt64?,
+        discontinuityDetected: inout Bool,
+        changed: inout Bool
+    ) {
         var cursor = range.lowerBound
 
         while cursor + 8 <= range.upperBound {
@@ -1133,7 +1327,13 @@ actor Channel {
                     if decodeTimeOffset == nil {
                         decodeTimeOffset = decodeTime
                     }
-                    let adjusted = decodeTime &- (decodeTimeOffset ?? 0)
+                    if let offset = decodeTimeOffset, decodeTime < offset {
+                        // Stream restarts/discontinuities can reset tfdt. Avoid unsigned
+                        // underflow, then force a clean file boundary for the next segment.
+                        decodeTimeOffset = decodeTime
+                        discontinuityDetected = true
+                    }
+                    let adjusted = decodeTime - (decodeTimeOffset ?? 0)
                     if adjusted != decodeTime {
                         writeUInt64(adjusted, to: &bytes, at: valueOffset)
                         changed = true
@@ -1149,7 +1349,11 @@ actor Channel {
                     if decodeTimeOffset == nil {
                         decodeTimeOffset = decodeTime
                     }
-                    let adjusted = decodeTime &- (decodeTimeOffset ?? 0)
+                    if let offset = decodeTimeOffset, decodeTime < offset {
+                        decodeTimeOffset = decodeTime
+                        discontinuityDetected = true
+                    }
+                    let adjusted = decodeTime - (decodeTimeOffset ?? 0)
                     if adjusted <= UInt64(UInt32.max) {
                         let adjusted32 = UInt32(adjusted)
                         if adjusted32 != decodeTime32 {
@@ -1163,6 +1367,7 @@ actor Channel {
                     in: &bytes,
                     range: payloadStart..<payloadEnd,
                     decodeTimeOffset: &decodeTimeOffset,
+                    discontinuityDetected: &discontinuityDetected,
                     changed: &changed
                 )
             }
@@ -1328,6 +1533,14 @@ actor Channel {
 
         if activeInitSegmentURI == initURI, activeInitSegmentData != nil {
             return
+        }
+
+        if let previousInit = activeInitSegmentURI,
+           previousInit != initURI,
+           currentFile != nil,
+           filesize > 0 {
+            addLog("Init segment changed, rolling to a new recording file")
+            try await nextFile()
         }
 
         let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
@@ -1600,11 +1813,11 @@ actor Channel {
             pendingBreakOfflineReason = "Break hold: still waiting for clear person+motion recovery"
             return true
         } catch {
-            // Fail open on recheck errors. If the stream is still on break,
-            // active recording analysis will enforce the break again quickly.
-            pendingBreakOfflineReason = nil
-            addLog("Break hold: recheck failed (\(error.localizedDescription)); allowing recording attempt")
-            return false
+            // Fail closed while break is enforced to avoid short record/re-offline
+            // flaps when recheck probes are transiently failing.
+            pendingBreakOfflineReason = "Break hold: recheck failed (\(error.localizedDescription)); keeping stream offline"
+            addLog(pendingBreakOfflineReason ?? "Break hold: recheck failed; keeping stream offline")
+            return true
         }
     }
 
@@ -1735,11 +1948,14 @@ actor Channel {
 
     private func evaluateBreakSignalIfNeeded(frameImage: CGImage) -> Bool {
         let analysisIntervalSeconds = TimeInterval(max(5, min(60, appConfig.breakAnalysisIntervalSeconds)))
+        // Break analysis currently runs via thumbnail refresh (~5s cadence).
+        // Cap the effective interval to this cadence to avoid extra lag.
+        let effectiveAnalysisIntervalSeconds = min(analysisIntervalSeconds, 5.0)
         let staticThresholdSeconds = TimeInterval(max(1, min(180, appConfig.breakStaticThresholdMinutes))) * 60
         let noPersonThresholdSeconds = TimeInterval(max(1, min(60, appConfig.breakNoPersonNoMotionThresholdMinutes))) * 60
         let noPersonBadgeThresholdSeconds = min(90.0, max(20.0, noPersonThresholdSeconds / 3.0))
         let sustainedNoPersonEvidenceThresholdSeconds = min(noPersonThresholdSeconds, max(120.0, noPersonBadgeThresholdSeconds * 2.0))
-        let personDetectionGraceSeconds = max(30.0, analysisIntervalSeconds * 6.0)
+        let personDetectionGraceSeconds = max(30.0, effectiveAnalysisIntervalSeconds * 6.0)
 
         let now = Date()
         if let carryExpiry = noPersonCarryExpiryAt, now > carryExpiry {
@@ -1759,13 +1975,13 @@ actor Channel {
         }
 
         if let last = lastBreakAnalysisAt,
-           now.timeIntervalSince(last) < analysisIntervalSeconds {
+           now.timeIntervalSince(last) < effectiveAnalysisIntervalSeconds {
             return false
         }
 
         let elapsed = max(
-            analysisIntervalSeconds,
-            lastBreakAnalysisAt.map { now.timeIntervalSince($0) } ?? analysisIntervalSeconds
+            effectiveAnalysisIntervalSeconds,
+            lastBreakAnalysisAt.map { now.timeIntervalSince($0) } ?? effectiveAnalysisIntervalSeconds
         )
         lastBreakAnalysisAt = now
 

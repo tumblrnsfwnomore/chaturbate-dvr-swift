@@ -11,6 +11,8 @@ final class WebServer {
     var pauseAction:     ((String) async -> Void)?
     var resumeAction:    ((String) async -> Void)?
     var getThumbnailPath: ((String) async -> String?)?
+    var getRecordingEnabled: (() async -> Bool)?
+    var setRecordingEnabled: ((Bool) async -> Void)?
 
     // MARK: - Private state
 
@@ -94,7 +96,16 @@ final class WebServer {
 
         case ("GET", "/api/channels"):
             let infos = (await getChannelInfos?()) ?? []
-            sendChannelsJSON(infos, connection: connection)
+            let recEnabled = (await getRecordingEnabled?()) ?? true
+            sendChannelsJSON(infos, recordingEnabled: recEnabled, connection: connection)
+
+        case ("POST", "/api/recording/enable"):
+            await setRecordingEnabled?(true)
+            sendJSON(#"{"ok":true,"recordingEnabled":true}"#, connection: connection)
+
+        case ("POST", "/api/recording/disable"):
+            await setRecordingEnabled?(false)
+            sendJSON(#"{"ok":true,"recordingEnabled":false}"#, connection: connection)
 
         case ("POST", _) where path.hasPrefix("/api/channels/"):
             let rest = String(path.dropFirst("/api/channels/".count))
@@ -127,7 +138,7 @@ final class WebServer {
 
     // MARK: - JSON serialisation
 
-    private func sendChannelsJSON(_ infos: [ChannelInfo], connection: NWConnection) {
+    private func sendChannelsJSON(_ infos: [ChannelInfo], recordingEnabled: Bool, connection: NWConnection) {
         struct Row: Encodable {
             let username: String
             let isOnline: Bool
@@ -142,12 +153,16 @@ final class WebServer {
             let isNoPersonDetected: Bool
             let noPersonDurationSeconds: Int
         }
+        struct Response: Encodable {
+            let recordingEnabled: Bool
+            let channels: [Row]
+        }
         let rows = infos.map { i in
             Row(
                 username: i.username,
                 isOnline: i.isOnline,
                 isPaused: i.isPaused,
-                isRecording: i.isOnline && !i.isPaused && !i.isWaitingForRecordingSlot,
+                isRecording: (i.isOnline && !i.isPaused && !i.isWaitingForRecordingSlot) && recordingEnabled,
                 isWaiting: i.isWaitingForRecordingSlot,
                 duration: i.duration,
                 filesize: i.filesize,
@@ -158,7 +173,8 @@ final class WebServer {
                 noPersonDurationSeconds: i.noPersonDurationSeconds
             )
         }
-        let body = (try? JSONEncoder().encode(rows)) ?? Data("[]".utf8)
+        let response = Response(recordingEnabled: recordingEnabled, channels: rows)
+        let body = (try? JSONEncoder().encode(response)) ?? Data(#"{"recordingEnabled":true,"channels":[]}"#.utf8)
         sendResponse(status: 200, contentType: "application/json", body: body, connection: connection)
     }
 

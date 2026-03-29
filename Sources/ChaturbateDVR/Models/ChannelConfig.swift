@@ -35,6 +35,8 @@ struct ChannelConfig: Codable, Identifiable {
     var pattern: String
     var maxDuration: Int // minutes
     var maxFilesize: Int // MB
+    var maxSessionDuration: Int // minutes, 0 = unlimited
+    var maxSessionFilesize: Int // MB, 0 = unlimited
     var createdAt: Int64
     var lastOnlineAt: Int64?
     var recordingHistory: [String]
@@ -50,6 +52,8 @@ struct ChannelConfig: Codable, Identifiable {
         pattern: String = "{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}",
         maxDuration: Int = 0,
         maxFilesize: Int = 0,
+        maxSessionDuration: Int = 0,
+        maxSessionFilesize: Int = 0,
         createdAt: Int64? = nil,
         lastOnlineAt: Int64? = nil,
         recordingHistory: [String] = [],
@@ -64,6 +68,8 @@ struct ChannelConfig: Codable, Identifiable {
         self.pattern = pattern
         self.maxDuration = maxDuration
         self.maxFilesize = maxFilesize
+        self.maxSessionDuration = maxSessionDuration
+        self.maxSessionFilesize = maxSessionFilesize
         self.createdAt = createdAt ?? Int64(Date().timeIntervalSince1970)
         self.lastOnlineAt = lastOnlineAt
         self.recordingHistory = recordingHistory
@@ -80,6 +86,8 @@ struct ChannelConfig: Codable, Identifiable {
         case pattern
         case maxDuration
         case maxFilesize
+        case maxSessionDuration
+        case maxSessionFilesize
         case createdAt
         case lastOnlineAt
         case recordingHistory
@@ -97,6 +105,8 @@ struct ChannelConfig: Codable, Identifiable {
         pattern = try container.decode(String.self, forKey: .pattern)
         maxDuration = try container.decode(Int.self, forKey: .maxDuration)
         maxFilesize = try container.decode(Int.self, forKey: .maxFilesize)
+        maxSessionDuration = try container.decodeIfPresent(Int.self, forKey: .maxSessionDuration) ?? 0
+        maxSessionFilesize = try container.decodeIfPresent(Int.self, forKey: .maxSessionFilesize) ?? 0
         createdAt = try container.decode(Int64.self, forKey: .createdAt)
         lastOnlineAt = try container.decodeIfPresent(Int64.self, forKey: .lastOnlineAt)
         recordingHistory = try container.decodeIfPresent([String].self, forKey: .recordingHistory) ?? []
@@ -115,6 +125,7 @@ struct ChannelInfo: Identifiable {
     var id: String { username }
     var isOnline: Bool
     var isPaused: Bool
+    var isPausedBySessionLimit: Bool
     var username: String
     var duration: String
     var filesize: String
@@ -139,6 +150,7 @@ struct ChannelInfo: Identifiable {
     var consecutiveSegmentFailures: Int
     var lastSegmentFailureAt: String?
     var bioMetadata: BioMetadata?
+    var globalRecordingEnabled: Bool
 }
 
 struct RuntimeDiagnostics {
@@ -188,6 +200,7 @@ struct AppConfig: Codable {
     var breakAnalysisIntervalSeconds: Int = 10
     var webServerEnabled: Bool = false
     var webServerPort: Int = 8888
+    var recordingEnabled: Bool = true
     
     // Custom decoding to handle missing selectedBrowser from old configs
     init(from decoder: Decoder) throws {
@@ -208,6 +221,7 @@ struct AppConfig: Codable {
         breakAnalysisIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .breakAnalysisIntervalSeconds) ?? 10
         webServerEnabled = try container.decodeIfPresent(Bool.self, forKey: .webServerEnabled) ?? false
         webServerPort = try container.decodeIfPresent(Int.self, forKey: .webServerPort) ?? 8888
+        recordingEnabled = try container.decodeIfPresent(Bool.self, forKey: .recordingEnabled) ?? true
     }
     
     init() {
@@ -224,6 +238,7 @@ struct AppConfig: Codable {
         case breakAnalysisIntervalSeconds
         case webServerEnabled
         case webServerPort
+        case recordingEnabled
     }
     
     func getOutputPath() -> String {

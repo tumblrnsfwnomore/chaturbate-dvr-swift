@@ -101,6 +101,56 @@ The app uses modern Swift concurrency features:
 - Check file permissions in the output directory
 - Verify the filename pattern is valid
 
+### Batch Convert Recordings to Smaller MP4 Files
+
+For large backlogs (hundreds or thousands of files), use the included batch conversion script:
+
+```bash
+chmod +x ./scripts/batch-handbrake-convert.sh
+./scripts/batch-handbrake-convert.sh --input ~/Recordings --dry-run
+```
+
+Then run a real conversion with parallel workers:
+
+```bash
+./scripts/batch-handbrake-convert.sh --input ~/Recordings
+```
+
+The script defaults are intentionally conservative for long unattended runs:
+
+- `workers=1`
+- lower CPU priority (`nice=12`)
+- short pause between launches (`sleep-between=2`)
+
+If your machine still feels busy, reduce impact even more:
+
+```bash
+./scripts/batch-handbrake-convert.sh --input ~/Recordings --workers 1 --nice 15 --sleep-between 4
+```
+
+If your machine can handle more, increase workers gradually:
+
+```bash
+./scripts/batch-handbrake-convert.sh --input ~/Recordings --workers 2
+```
+
+If results look good and you want to reclaim space, remove originals after each verified conversion:
+
+```bash
+./scripts/batch-handbrake-convert.sh --input ~/Recordings --delete-source
+```
+
+To replace source files directly after verification (in-place workflow):
+
+```bash
+./scripts/batch-handbrake-convert.sh --input ~/Recordings --replace-source
+```
+
+Requirements:
+
+- `HandBrakeCLI` (required)
+- `ffprobe` (optional, used for duration-based verification)
+
 ## Development
 
 ### Project Structure

@@ -3,6 +3,8 @@ import AppKit
 
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let minimumMainWindowSize = NSSize(width: 1200, height: 820)
+    var gracefulShutdownHandler: (() async -> Void)?
+    private var hasStartedTermination = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupTemporaryPreviewFiles()
@@ -17,6 +19,25 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationWillTerminate(_ notification: Notification) {
         cleanupTemporaryPreviewFiles()
+    }
+
+    func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        guard !hasStartedTermination else {
+            return .terminateLater
+        }
+
+        guard let gracefulShutdownHandler else {
+            return .terminateNow
+        }
+
+        hasStartedTermination = true
+
+        Task { @MainActor in
+            await gracefulShutdownHandler()
+            NSApp.reply(toApplicationShouldTerminate: true)
+        }
+
+        return .terminateLater
     }
 
     private func cleanupTemporaryPreviewFiles() {

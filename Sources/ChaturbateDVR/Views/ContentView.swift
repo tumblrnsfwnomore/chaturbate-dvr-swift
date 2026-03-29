@@ -14,6 +14,7 @@ enum ChannelStatusFilter: String, CaseIterable, Identifiable {
     case online = "Online"
     case recording = "Recording"
     case paused = "Paused"
+    case limitReached = "Limit Reached"
     case offline = "Offline"
     case invalid = "Invalid"
 
@@ -50,20 +51,37 @@ struct ContentView: View {
     
     var body: some View {
         NavigationSplitView {
-            ChannelListView(
+            ActivitySidebarView(
                 manager: manager,
-                selectedChannel: $selectedChannel,
                 channelInfos: channelInfos,
-                searchText: $searchText,
-                statusFilter: $statusFilter,
-                genderFilter: $genderFilter,
-                onActivateChannel: { username in
+                onSelectChannel: { username in
                     selectedChannel = username
                     selectedDetailTab = .channel
                 }
             )
         } detail: {
             VStack(spacing: 0) {
+                if !manager.appConfig.recordingEnabled {
+                    HStack(spacing: 8) {
+                        Image(systemName: "record.circle")
+                            .foregroundColor(.orange)
+                        Text("Recording is globally paused. Channels are monitored but nothing is being recorded.")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                        Button("Resume") {
+                            manager.appConfig.recordingEnabled = true
+                            manager.saveAppConfig()
+                        }
+                        .font(.caption)
+                        .buttonStyle(.bordered)
+                        .controlSize(.mini)
+                    }
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 8)
+                    .background(Color.orange.opacity(0.08))
+                }
+
                 Picker("View", selection: $selectedDetailTab) {
                     Text("All Channels").tag(DetailTab.allChannels)
                     Text("Channel").tag(DetailTab.channel)
@@ -117,7 +135,7 @@ struct ContentView: View {
                             Text("No Channel Selected")
                                 .font(.title2)
                                 .foregroundColor(.secondary)
-                            Text("Pick a channel from the list or All Channels grid")
+                            Text("Open a channel from the All Channels grid")
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -170,10 +188,18 @@ struct ContentView: View {
         }
         .frame(minWidth: 1200, minHeight: 820)
         .onAppear {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.gracefulShutdownHandler = { [manager] in
+                    await manager.shutdownForTermination()
+                }
+            }
             startChannelInfoTimer()
         }
         .onDisappear {
             channelInfoTimer?.invalidate()
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.gracefulShutdownHandler = nil
+            }
         }
     }
 
@@ -223,6 +249,7 @@ struct AllChannelsGridView: View {
         let online: Int
         let recording: Int
         let paused: Int
+        let limitReached: Int
         let offline: Int
         let invalid: Int
     }
@@ -289,6 +316,9 @@ struct AllChannelsGridView: View {
                             }
                             countChip("Paused", count: statusCounts.paused, tint: .orange) {
                                 statusFilter = .paused
+                            }
+                            countChip("Limit Reached", count: statusCounts.limitReached, tint: .yellow) {
+                                statusFilter = .limitReached
                             }
                             countChip("Offline", count: statusCounts.offline, tint: .secondary) {
                                 statusFilter = .offline
@@ -405,6 +435,7 @@ struct AllChannelsGridView: View {
             online: channelInfos.filter { matchesStatusFilter($0, filter: .online) }.count,
             recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
             paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
+            limitReached: channelInfos.filter { matchesStatusFilter($0, filter: .limitReached) }.count,
             offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
             invalid: channelInfos.filter { matchesStatusFilter($0, filter: .invalid) }.count
         )
@@ -417,11 +448,13 @@ struct AllChannelsGridView: View {
         case .online:
             return info.isOnline && !info.isInvalid
         case .recording:
-            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
+            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid && info.globalRecordingEnabled
         case .paused:
-            return info.isPaused && !info.isInvalid
+            return info.isPaused && !info.isPausedBySessionLimit && !info.isInvalid
+        case .limitReached:
+            return info.isPausedBySessionLimit && !info.isInvalid
         case .offline:
-            return !info.isOnline && !info.isPaused && !info.isInvalid
+            return !info.isOnline && !info.isPaused && !info.isPausedBySessionLimit && !info.isInvalid
         case .invalid:
             return info.isInvalid
         }
@@ -460,6 +493,264 @@ struct AllChannelsGridView: View {
         .onTapGesture {
             action?()
         }
+    }
+}
+
+private struct ManualQueuePlannerSheet: View {
+    @ObservedObject var manager: ChannelManager
+    let channelInfos: [ChannelInfo]
+
+    @Environment(\.dismiss) private var dismiss
+
+    @State private var plannerOrder: [String] = []
+    @State private var activeRecordings: [String] = []
+    @State private var slotCapacity: Int = 1
+    @State private var recordingEnabledAtLoad = true
+    @State private var isLoading = true
+    @State private var isApplying = false
+    @State private var autoRefreshTimer: Timer?
+
+    private var infoByUsername: [String: ChannelInfo] {
+        Dictionary(uniqueKeysWithValues: channelInfos.map { ($0.username, $0) })
+    }
+
+    var body: some View {
+        NavigationStack {
+            VStack(alignment: .leading, spacing: 12) {
+                Text("Use arrows to change priority. Changes apply immediately: top rows are slot targets, rows below are queue order.")
+                    .font(.callout)
+                    .foregroundColor(.secondary)
+
+                HStack(spacing: 8) {
+                    queueStatChip("Slots", value: "\(slotCapacity)", color: .blue)
+                    queueStatChip("Recording", value: "\(activeRecordings.count)", color: .green)
+                    queueStatChip("Waiting", value: "\(max(0, plannerOrder.count - slotCapacity))", color: .orange)
+                    if !recordingEnabledAtLoad {
+                        queueStatChip("Global Recording", value: "Paused", color: .red)
+                    }
+                    Spacer()
+
+                    if isApplying {
+                        ProgressView()
+                            .controlSize(.small)
+                    }
+
+                    Button {
+                        Task {
+                            await loadSnapshot()
+                        }
+                    } label: {
+                        Label("Reload", systemImage: "arrow.clockwise")
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .disabled(isLoading || isApplying)
+                }
+
+                if !recordingEnabledAtLoad {
+                    Text("Global recording is paused. Queue order and slot targets will still be applied, but recordings will not start until recording is resumed.")
+                        .font(.caption)
+                        .foregroundColor(.orange)
+                }
+
+                if isLoading {
+                    VStack(spacing: 10) {
+                        ProgressView()
+                        Text("Loading queue state...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
+                } else {
+                    Text("Slot assignment order")
+                        .font(.headline)
+
+                    List {
+                        ForEach(Array(plannerOrder.enumerated()), id: \.element) { index, username in
+                            unifiedPlannerRow(index: index, username: username)
+                        }
+                    }
+                    .frame(minHeight: 360)
+
+                    Text("Tip: move a waiting-live channel into the top \(slotCapacity) rows to rotate it into a slot. Recording channels moved below slot rows are rotated out automatically.")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+            .padding(16)
+            .navigationTitle("Manage Recording Slots")
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Done") {
+                        dismiss()
+                    }
+                    .disabled(isApplying)
+                }
+            }
+        }
+        .frame(minWidth: 840, minHeight: 560)
+        .task {
+            await loadSnapshot()
+            startAutoRefreshTimer()
+        }
+        .onDisappear {
+            autoRefreshTimer?.invalidate()
+            autoRefreshTimer = nil
+        }
+    }
+
+    private func loadSnapshot() async {
+        isLoading = true
+        let snapshot = await manager.getRecordingQueueSnapshot()
+        recordingEnabledAtLoad = snapshot.recordingEnabled
+        activeRecordings = snapshot.activeUsernames
+        slotCapacity = max(1, snapshot.maxConcurrent == 0 ? snapshot.activeUsernames.count : snapshot.maxConcurrent)
+
+        var merged: [String] = []
+        for username in snapshot.activeUsernames + snapshot.waitingUsernames {
+            if !merged.contains(username) {
+                merged.append(username)
+            }
+        }
+        plannerOrder = merged
+
+        isLoading = false
+    }
+
+    private func startAutoRefreshTimer() {
+        autoRefreshTimer?.invalidate()
+        autoRefreshTimer = Timer.scheduledTimer(withTimeInterval: 4.0, repeats: true) { _ in
+            guard !isApplying else { return }
+            Task {
+                await loadSnapshot()
+            }
+        }
+    }
+
+    private func movePriority(username: String, direction: Int) {
+        guard !isApplying else { return }
+        guard let currentIndex = plannerOrder.firstIndex(of: username) else { return }
+
+        let targetIndex = currentIndex + direction
+        guard plannerOrder.indices.contains(targetIndex) else { return }
+
+        plannerOrder.swapAt(currentIndex, targetIndex)
+
+        Task {
+            await applyPlanLive()
+        }
+    }
+
+    private func applyPlanLive() async {
+        isApplying = true
+        let desiredInSlots = Array(plannerOrder.prefix(slotCapacity))
+        let desiredSlotSet = Set(desiredInSlots)
+        let activeSet = Set(activeRecordings)
+
+        let rotateOut = activeRecordings.filter { !desiredSlotSet.contains($0) }
+        let waitingOrder = plannerOrder.filter { !activeSet.contains($0) }
+
+        await manager.applyManualRecordingQueue(
+            waitingOrder: waitingOrder,
+            rotateOutRecordings: rotateOut,
+            releaseHoldAfterApply: false
+        )
+
+        isApplying = false
+        await loadSnapshot()
+    }
+
+    @ViewBuilder
+    private func unifiedPlannerRow(index: Int, username: String) -> some View {
+        let inSlot = index < slotCapacity
+        let showsBoundary = index == slotCapacity && slotCapacity > 0 && slotCapacity < plannerOrder.count
+
+        VStack(spacing: 6) {
+            if showsBoundary {
+                HStack(spacing: 8) {
+                    Divider()
+                    Text("Queue starts below")
+                        .font(.caption2)
+                        .foregroundColor(.orange)
+                    Divider()
+                }
+                .padding(.vertical, 2)
+            }
+
+            HStack(spacing: 8) {
+                Text(inSlot ? "Slot \(index + 1)" : "Queue \(index - slotCapacity + 1)")
+                    .font(.caption)
+                    .foregroundColor(inSlot ? .green : .orange)
+                    .frame(width: 64, alignment: .leading)
+
+                Text(username)
+                    .font(.body.monospaced())
+                    .lineLimit(1)
+                Spacer()
+
+                if let info = infoByUsername[username] {
+                    if activeRecordings.contains(username) {
+                        Text("Recording")
+                            .font(.caption)
+                            .foregroundColor(.green)
+                    } else if info.isOnline {
+                        Text("Waiting Live")
+                            .font(.caption)
+                            .foregroundColor(.blue)
+                    } else {
+                        Text("Waiting Offline")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+
+                    if info.isNoPersonDetected {
+                        Text(formatNoPersonDuration(info.noPersonDurationSeconds))
+                            .font(.caption)
+                            .foregroundColor(.orange)
+                    }
+                } else {
+                    Text("Unknown")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+
+                HStack(spacing: 4) {
+                    Button {
+                        movePriority(username: username, direction: -1)
+                    } label: {
+                        Image(systemName: "chevron.up")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isApplying || index == 0)
+
+                    Button {
+                        movePriority(username: username, direction: 1)
+                    } label: {
+                        Image(systemName: "chevron.down")
+                    }
+                    .buttonStyle(.borderless)
+                    .disabled(isApplying || index >= plannerOrder.count - 1)
+                }
+            }
+            .contentShape(Rectangle())
+        }
+        .padding(.vertical, 1)
+        .listRowBackground((inSlot ? Color.green.opacity(0.06) : Color.orange.opacity(0.05)))
+    }
+
+    private func queueStatChip(_ title: String, value: String, color: Color) -> some View {
+        HStack(spacing: 6) {
+            Text(title)
+                .font(.caption)
+            Text(value)
+                .font(.caption)
+                .fontWeight(.semibold)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(color.opacity(0.13))
+        .foregroundColor(color)
+        .clipShape(Capsule())
     }
 }
 
@@ -1152,7 +1443,8 @@ struct ChannelPreviewCard: View {
 
     private var isWaitingForRecordingSlot: Bool { info.isWaitingForRecordingSlot }
     private var isWaitingOnline: Bool { isWaitingForRecordingSlot && info.isOnline }
-    private var isRecording: Bool { info.isOnline && !info.isPaused && !isWaitingForRecordingSlot }
+    private var isLive: Bool { info.isOnline && !info.isPaused && !isWaitingForRecordingSlot }
+    private var isRecording: Bool { isLive && info.globalRecordingEnabled }
     private var isPausedOnline: Bool { info.isOnline && info.isPaused }
     private var isOffline: Bool { !info.isOnline }
     private var isInvalid: Bool { info.isInvalid }
@@ -1168,8 +1460,8 @@ struct ChannelPreviewCard: View {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .saturation((isRecording || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
-                        .opacity((isRecording || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
+                        .saturation((isLive || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
+                        .opacity((isLive || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
                         .overlay(
@@ -1307,7 +1599,7 @@ struct ChannelPreviewCard: View {
                                         ? (info.isOnline ? "Paused (Online)" : "Paused")
                                         : (isWaitingForRecordingSlot
                                             ? (info.isOnline ? "Waiting (Online)" : "Waiting (Rechecking)")
-                                            : (info.isOnline ? "Recording" : "Offline")))
+                                            : (isRecording ? "Recording" : (info.isOnline ? "Online" : "Offline"))))
                             )
                                 .font(.caption)
                                 .foregroundColor(info.isInvalid ? .red : .secondary)
@@ -1374,231 +1666,250 @@ struct ChannelPreviewCard: View {
     }
 }
 
-struct ChannelListView: View {
+struct ActivitySidebarView: View {
     private struct CombinedLogEntry {
         let sortOrder: Int
         let line: String
         let color: Color
     }
 
-    private struct StatusCounts {
-        let total: Int
-        let online: Int
-        let recording: Int
-        let paused: Int
-        let offline: Int
-        let invalid: Int
+    private enum SlotState {
+        case active(ChannelInfo)
+        case busyUnknown
+        case idle
     }
 
     @ObservedObject var manager: ChannelManager
-    @Binding var selectedChannel: String?
     let channelInfos: [ChannelInfo]
-    @Binding var searchText: String
-    @Binding var statusFilter: ChannelStatusFilter
-    @Binding var genderFilter: String?
-    var onActivateChannel: ((String) -> Void)? = nil
+    var onSelectChannel: ((String) -> Void)? = nil
+    @State private var slotColumnCount: Int = 1
     @State private var showingCombinedLog = true
+    @State private var showingManualQueuePlanner = false
     
     var body: some View {
-        Group {
-            if channelInfos.isEmpty {
-                VStack(spacing: 12) {
-                    Image(systemName: "list.bullet")
-                        .font(.system(size: 40))
-                        .foregroundColor(.secondary)
-                    Text("No Channels")
-                        .font(.headline)
-                        .foregroundColor(.secondary)
-                    Text("Add a channel to get started")
-                        .font(.caption)
-                        .foregroundColor(.secondary)
-                }
-                .frame(maxWidth: .infinity, maxHeight: .infinity)
-            } else {
-                VStack(spacing: 0) {
-                    VStack(spacing: 10) {
-                        HStack(alignment: .firstTextBaseline, spacing: 10) {
-                            TextField("Filter by username", text: $searchText)
-                                .textFieldStyle(.roundedBorder)
-                                .frame(minWidth: 190, idealWidth: 250, maxWidth: 320)
+        VStack(spacing: 0) {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Recording")
+                            .font(.headline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.primary)
+
+                        Toggle(isOn: recordingEnabledBinding) {
+                            Label(
+                                manager.appConfig.recordingEnabled ? "Recording Enabled" : "Recording Paused",
+                                systemImage: manager.appConfig.recordingEnabled ? "record.circle.fill" : "record.circle"
+                            )
+                            .font(.title3)
+                            .foregroundStyle(manager.appConfig.recordingEnabled ? Color.red : Color.orange)
+                        }
+                        .toggleStyle(.switch)
+
+                        VStack(alignment: .leading, spacing: 6) {
+                            HStack {
+                                Text("Recording Slots")
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                                Spacer()
+                                Text(slotCountLabel)
+                                    .font(.subheadline)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            HStack(spacing: 8) {
+                                Button {
+                                    adjustSlotLimit(by: -1)
+                                } label: {
+                                    Image(systemName: "minus")
+                                        .frame(width: 18)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(isUnlimitedSlots || finiteSlotCount <= 1)
+
+                                Text("Max concurrent recordings: \(finiteSlotCount)")
+                                    .font(.callout)
+
+                                Button {
+                                    adjustSlotLimit(by: 1)
+                                } label: {
+                                    Image(systemName: "plus")
+                                        .frame(width: 18)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .disabled(isUnlimitedSlots || finiteSlotCount >= 12)
+
+                                Spacer(minLength: 0)
+
+                                Button {
+                                    toggleUnlimitedSlots()
+                                } label: {
+                                    Text("Unlimited")
+                                        .font(.caption)
+                                }
+                                .buttonStyle(.bordered)
+                                .controlSize(.small)
+                                .tint(isUnlimitedSlots ? .accentColor : .secondary)
+                            }
+
+                            if isUnlimitedSlots {
+                                Text("Unlimited mode: visualizing first \(visualizedSlotCount) slots")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
+                        LazyVGrid(columns: slotGridColumns, spacing: 6) {
+                            ForEach(0..<visualizedSlotCount, id: \.self) { index in
+                                recordingSlotRow(for: index)
+                            }
+                        }
+
+                        VStack(spacing: 6) {
+                            HStack {
+                                Text("In use: \(activeRecordingCount)")
+                                    .font(.footnote)
+                                    .foregroundColor(.green)
+                                Spacer()
+                                Text("Idle: \(idleSlotCount)")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Text("Queued: \(manager.runtimeDiagnostics.queuedRecordings)")
+                                .font(.footnote)
+                                .foregroundColor(manager.runtimeDiagnostics.queuedRecordings > 0 ? .blue : .secondary)
+
+                            Button {
+                                showingManualQueuePlanner = true
+                            } label: {
+                                Label("Manage Slots & Queue", systemImage: "arrow.up.arrow.down.circle")
+                                    .font(.caption)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+                    }
+                    .padding(10)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+
+                    VStack(alignment: .leading, spacing: 10) {
+                        Text("Request Slots")
+                            .font(.headline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.primary)
+
+                        HStack(spacing: 8) {
+                            Button {
+                                adjustRequestSlotLimit(by: -1)
+                            } label: {
+                                Image(systemName: "minus")
+                                    .frame(width: 18)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(requestSlotLimit <= 1)
+
+                            Text("Max concurrent requests: \(requestSlotLimit)")
+                                .font(.callout)
+
+                            Button {
+                                adjustRequestSlotLimit(by: 1)
+                            } label: {
+                                Image(systemName: "plus")
+                                    .frame(width: 18)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                            .disabled(requestSlotLimit >= 24)
 
                             Spacer(minLength: 0)
                         }
 
-                        WrappingStatusBadgesView(
-                            statusFilter: $statusFilter,
-                            totalCount: statusCounts.total,
-                            onlineCount: statusCounts.online,
-                            recordingCount: statusCounts.recording,
-                            pausedCount: statusCounts.paused,
-                            offlineCount: statusCounts.offline,
-                            invalidCount: statusCounts.invalid,
-                            filteredCount: filteredChannelInfos.count
-                        )
-
-                        VStack(alignment: .leading, spacing: 8) {
-                            Text("Gender")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.secondary)
-                            
-                            if availableGenders.isEmpty {
-                                Text("Fetching bio data...")
-                                    .font(.caption2)
-                                    .foregroundColor(.secondary)
-                            } else {
-                                HStack(spacing: 8) {
-                                    Button(action: { genderFilter = nil }) {
-                                        HStack(spacing: 4) {
-                                            Text("All")
-                                                .font(.caption)
-                                            if genderFilter == nil {
-                                                Image(systemName: "checkmark")
-                                                    .font(.caption2)
-                                            }
-                                        }
-                                        .padding(.horizontal, 9)
-                                        .padding(.vertical, 4)
-                                    }
-                                    .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == nil))
-                                    
-                                    ForEach(availableGenders, id: \.self) { gender in
-                                        Button(action: { genderFilter = gender }) {
-                                            HStack(spacing: 4) {
-                                                Text(gender)
-                                                    .font(.caption)
-                                                    .lineLimit(1)
-                                                if genderFilter == gender {
-                                                    Image(systemName: "checkmark")
-                                                        .font(.caption2)
-                                                }
-                                            }
-                                            .padding(.horizontal, 9)
-                                            .padding(.vertical, 4)
-                                        }
-                                        .buttonStyle(GenderFilterButtonStyle(isSelected: genderFilter == gender))
-                                    }
-                                    
-                                    Spacer(minLength: 0)
-                                }
+                        LazyVGrid(columns: slotGridColumns, spacing: 6) {
+                            ForEach(0..<visualizedRequestSlotCount, id: \.self) { index in
+                                requestSlotRow(for: index)
                             }
                         }
-                        .padding(.vertical, 6)
 
-                        if manager.runtimeDiagnostics.requestQueueSaturated ||
-                            manager.runtimeDiagnostics.queuedRecordings > 0 ||
-                            manager.runtimeDiagnostics.cloudflareBlockedChannels > 0 ||
-                            manager.runtimeDiagnostics.degradedChannels > 0 {
-                            HStack(spacing: 8) {
-                                Image(systemName: "gauge.with.dots.needle.33percent")
-                                    .foregroundColor(.orange)
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("Queued: \(manager.runtimeDiagnostics.queuedRequests)")
+                                .font(.footnote)
+                                .foregroundColor(manager.runtimeDiagnostics.queuedRequests > 0 ? .blue : .secondary)
 
-                                Text("Request pressure: \(manager.runtimeDiagnostics.activeRequests)/\(manager.runtimeDiagnostics.maxConcurrentRequests) active, \(manager.runtimeDiagnostics.queuedRequests) queued")
-                                    .font(.caption2)
-                                    .lineLimit(1)
-
-                                let recordingCap = manager.runtimeDiagnostics.maxConcurrentRecordings == 0 ? "unlimited" : String(manager.runtimeDiagnostics.maxConcurrentRecordings)
-                                Text("Recordings: \(manager.runtimeDiagnostics.activeRecordings)/\(recordingCap), \(manager.runtimeDiagnostics.queuedRecordings) waiting")
-                                    .font(.caption2)
-                                    .lineLimit(1)
-
-                                if manager.runtimeDiagnostics.cloudflareBlockedChannels > 0 {
-                                    Text("Cloudflare: \(manager.runtimeDiagnostics.cloudflareBlockedChannels)")
-                                        .font(.caption2)
-                                        .foregroundColor(.orange)
-                                }
-
-                                if manager.runtimeDiagnostics.degradedChannels > 0 {
-                                    Text("Degraded: \(manager.runtimeDiagnostics.degradedChannels)")
-                                        .font(.caption2)
-                                        .foregroundColor(.orange)
-                                }
-
-                                Spacer(minLength: 0)
-                            }
-                            .padding(.horizontal, 8)
-                            .padding(.vertical, 6)
-                            .background(Color.orange.opacity(0.12))
-                            .cornerRadius(8)
-                            .help("Avg queue wait: \(manager.runtimeDiagnostics.averageQueueWaitMs)ms, max observed: \(manager.runtimeDiagnostics.maxQueueWaitMs)ms")
-                        }
-                    }
-                    .padding(.horizontal, 10)
-                    .padding(.top, 10)
-                    .padding(.bottom, 6)
-
-                    if filteredChannelInfos.isEmpty {
-                        VStack(spacing: 8) {
-                            Image(systemName: "line.3.horizontal.decrease.circle")
-                                .font(.title2)
-                                .foregroundColor(.secondary)
-                            Text("No matching channels")
-                                .font(.headline)
-                                .foregroundColor(.secondary)
-                            Text("Adjust the search text or status filter")
-                                .font(.caption)
-                                .foregroundColor(.secondary)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: .infinity)
-                    } else {
-                        List(selection: $selectedChannel) {
-                            ForEach(filteredChannelInfos) { info in
-                                NavigationLink(value: info.username) {
-                                    ChannelRowView(info: info)
-                                }
-                                .simultaneousGesture(TapGesture().onEnded {
-                                    onActivateChannel?(info.username)
-                                })
-                            }
-                        }
-                    }
-
-                    Divider()
-
-                    DisclosureGroup(isExpanded: $showingCombinedLog) {
-                        ScrollView {
-                            VStack(alignment: .leading, spacing: 4) {
-                                if combinedLogEntries.isEmpty {
-                                    Text("No activity yet")
-                                        .font(.caption)
-                                        .foregroundColor(.secondary)
-                                } else {
-                                    ForEach(Array(combinedLogEntries.enumerated()), id: \.offset) { _, entry in
-                                        Text(entry.line)
-                                            .font(.system(.caption2, design: .monospaced))
-                                            .foregroundColor(entry.color)
-                                            .textSelection(.enabled)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
-                                    }
-                                }
-                            }
-                            .padding(.horizontal, 10)
-                            .padding(.vertical, 8)
-                        }
-                        .frame(maxWidth: .infinity, maxHeight: 170)
-                        .background(Color(NSColor.textBackgroundColor))
-                        .cornerRadius(8)
-                    } label: {
-                        HStack {
-                            Text("Combined Activity")
-                                .font(.caption)
-                                .fontWeight(.semibold)
-                            Spacer()
-                            Text("\(combinedLogEntries.count)")
-                                .font(.caption2)
+                            Text("Avg wait: \(manager.runtimeDiagnostics.averageQueueWaitMs)ms")
+                                .font(.footnote)
                                 .foregroundColor(.secondary)
                         }
                     }
                     .padding(10)
                     .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(10)
+                }
+                .padding(10)
+            }
+            .background(
+                GeometryReader { geometry in
+                    Color.clear
+                        .onAppear {
+                            updateSlotColumnCount(for: geometry.size.width)
+                        }
+                        .onChange(of: geometry.size.width) { newWidth in
+                            updateSlotColumnCount(for: newWidth)
+                        }
+                }
+            )
+
+            Divider()
+
+            DisclosureGroup(isExpanded: $showingCombinedLog) {
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 4) {
+                        if combinedLogEntries.isEmpty {
+                            Text("No activity yet")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                        } else {
+                            ForEach(Array(combinedLogEntries.enumerated()), id: \.offset) { _, entry in
+                                Text(entry.line)
+                                    .font(.system(.footnote, design: .monospaced))
+                                    .foregroundColor(entry.color)
+                                    .textSelection(.enabled)
+                                    .frame(maxWidth: .infinity, alignment: .leading)
+                            }
+                        }
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 8)
+                }
+                .frame(maxWidth: .infinity, maxHeight: 220)
+                .background(Color(NSColor.textBackgroundColor))
+                .cornerRadius(8)
+            } label: {
+                HStack {
+                    Text("Activity Feed")
+                        .font(.headline)
+                        .fontWeight(.semibold)
+                    Spacer()
+                    Text("\(combinedLogEntries.count)")
+                        .font(.subheadline)
+                        .foregroundColor(.secondary)
                 }
             }
+            .padding(10)
+            .background(Color(NSColor.controlBackgroundColor))
         }
-        .navigationTitle("Channels")
+        .navigationTitle("Activity")
+        .sheet(isPresented: $showingManualQueuePlanner) {
+            ManualQueuePlannerSheet(manager: manager, channelInfos: channelInfos)
+        }
     }
 
     private var combinedLogEntries: [CombinedLogEntry] {
-        let merged = filteredChannelInfos.flatMap { info in
+        let merged = channelInfos.flatMap { info in
             info.logs.suffix(5).map { log in
                 CombinedLogEntry(
                     sortOrder: sortKey(from: log),
@@ -1616,82 +1927,6 @@ struct ChannelListView: View {
                 return lhs.sortOrder > rhs.sortOrder
             }
             .suffix(60)
-    }
-
-    private var filteredChannelInfos: [ChannelInfo] {
-        channelInfos.filter { info in
-            let matchesSearch: Bool
-            if searchText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
-                matchesSearch = true
-            } else {
-                matchesSearch = info.username.localizedCaseInsensitiveContains(searchText)
-            }
-
-            let matchesStatus = matchesStatusFilter(info, filter: statusFilter)
-            let matchesGender = matchesGenderFilter(info, filter: genderFilter)
-
-            return matchesSearch && matchesStatus && matchesGender
-        }
-    }
-
-    private var statusCounts: StatusCounts {
-        StatusCounts(
-            total: channelInfos.count,
-            online: channelInfos.filter { matchesStatusFilter($0, filter: .online) }.count,
-            recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
-            paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
-            offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
-            invalid: channelInfos.filter { matchesStatusFilter($0, filter: .invalid) }.count
-        )
-    }
-
-    private func matchesStatusFilter(_ info: ChannelInfo, filter: ChannelStatusFilter) -> Bool {
-        switch filter {
-        case .all:
-            return true
-        case .online:
-            return info.isOnline && !info.isInvalid
-        case .recording:
-            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid
-        case .paused:
-            return info.isPaused && !info.isInvalid
-        case .offline:
-            return !info.isOnline && !info.isPaused && !info.isInvalid
-        case .invalid:
-            return info.isInvalid
-        }
-    }
-
-    private func matchesGenderFilter(_ info: ChannelInfo, filter: String?) -> Bool {
-        guard let filter = filter, !filter.isEmpty else {
-            return true
-        }
-        guard let gender = info.bioMetadata?.gender else {
-            return false
-        }
-        return gender.localizedCaseInsensitiveContains(filter)
-    }
-
-    private var availableGenders: [String] {
-        let genders = Set(channelInfos.compactMap { $0.bioMetadata?.gender })
-        return genders.sorted()
-    }
-
-    private func countChip(_ title: String, count: Int, tint: Color) -> some View {
-        HStack(spacing: 6) {
-            Text(title)
-                .font(.caption)
-                .lineLimit(1)
-            Text("\(count)")
-                .font(.caption)
-                .fontWeight(.semibold)
-                .lineLimit(1)
-        }
-        .padding(.horizontal, 9)
-        .padding(.vertical, 4)
-        .background(tint.opacity(0.12))
-        .foregroundColor(tint)
-        .clipShape(Capsule())
     }
 
     private func sortKey(from log: String) -> Int {
@@ -1731,6 +1966,253 @@ struct ChannelListView: View {
             return .green
         }
         return .secondary
+    }
+
+    private var recordingEnabledBinding: Binding<Bool> {
+        Binding(
+            get: { manager.appConfig.recordingEnabled },
+            set: { newValue in
+                manager.appConfig.recordingEnabled = newValue
+                manager.saveAppConfig()
+            }
+        )
+    }
+
+    private var activeRecordingCount: Int {
+        manager.runtimeDiagnostics.activeRecordings
+    }
+
+    private var recordingChannels: [ChannelInfo] {
+        channelInfos
+            .filter {
+                $0.isOnline &&
+                !$0.isPaused &&
+                !$0.isWaitingForRecordingSlot &&
+                !$0.isInvalid &&
+                $0.globalRecordingEnabled
+            }
+            .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
+    }
+
+    private var requestActiveChannels: [ChannelInfo] {
+        channelInfos
+            .filter { $0.isChecking }
+            .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
+    }
+
+    private var isUnlimitedSlots: Bool {
+        manager.appConfig.maxConcurrentRecordings == 0
+    }
+
+    private var finiteSlotCount: Int {
+        isUnlimitedSlots ? 4 : max(manager.appConfig.maxConcurrentRecordings, 1)
+    }
+
+    private var displayedSlotCapacity: Int {
+        if manager.appConfig.maxConcurrentRecordings == 0 {
+            return max(4, activeRecordingCount)
+        }
+        return max(manager.appConfig.maxConcurrentRecordings, 1)
+    }
+
+    private var visualizedSlotCount: Int {
+        min(displayedSlotCapacity, 12)
+    }
+
+    private var idleSlotCount: Int {
+        max(0, visualizedSlotCount - min(activeRecordingCount, visualizedSlotCount))
+    }
+
+    private var requestSlotLimit: Int {
+        max(1, manager.appConfig.maxConcurrentRequests)
+    }
+
+    private var visualizedRequestSlotCount: Int {
+        min(requestSlotLimit, 12)
+    }
+
+    private var slotCountLabel: String {
+        isUnlimitedSlots ? "Unlimited" : "\(manager.appConfig.maxConcurrentRecordings)"
+    }
+
+    private var slotGridColumns: [GridItem] {
+        Array(
+            repeating: GridItem(.flexible(minimum: 150), spacing: 6, alignment: .top),
+            count: slotColumnCount
+        )
+    }
+
+    private func recordingSlotState(at index: Int) -> SlotState {
+        if index < recordingChannels.count {
+            return .active(recordingChannels[index])
+        }
+        if index < min(activeRecordingCount, visualizedSlotCount) {
+            return .busyUnknown
+        }
+        return .idle
+    }
+
+    private func requestSlotState(at index: Int) -> SlotState {
+        if index < requestActiveChannels.count {
+            return .active(requestActiveChannels[index])
+        }
+        if index < min(manager.runtimeDiagnostics.activeRequests, visualizedRequestSlotCount) {
+            return .busyUnknown
+        }
+        return .idle
+    }
+
+    @ViewBuilder
+    private func recordingSlotRow(for index: Int) -> some View {
+        let state = recordingSlotState(at: index)
+        switch state {
+        case .active(let info):
+            Button {
+                onSelectChannel?(info.username)
+            } label: {
+                slotRowContent(
+                    primary: info.username,
+                    secondary: "recording",
+                    trailing: "\(info.duration) • \(info.filesize)",
+                    accent: .green,
+                    isInteractive: true
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Open \(info.username)")
+        case .busyUnknown:
+            slotRowContent(
+                primary: "Recording in progress",
+                secondary: "syncing details",
+                trailing: nil,
+                accent: .green,
+                isInteractive: false
+            )
+        case .idle:
+            slotRowContent(
+                primary: "Idle",
+                secondary: "available",
+                trailing: nil,
+                accent: .secondary,
+                isInteractive: false
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func requestSlotRow(for index: Int) -> some View {
+        let state = requestSlotState(at: index)
+        switch state {
+        case .active(let info):
+            Button {
+                onSelectChannel?(info.username)
+            } label: {
+                slotRowContent(
+                    primary: info.username,
+                    secondary: "checking",
+                    trailing: info.isOnline ? "online" : "offline",
+                    accent: .accentColor,
+                    isInteractive: true
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Open \(info.username)")
+        case .busyUnknown:
+            slotRowContent(
+                primary: "Busy",
+                secondary: "request in progress",
+                trailing: nil,
+                accent: .accentColor,
+                isInteractive: false
+            )
+        case .idle:
+            slotRowContent(
+                primary: "Idle",
+                secondary: "available",
+                trailing: nil,
+                accent: .secondary,
+                isInteractive: false
+            )
+        }
+    }
+
+    private func slotRowContent(
+        primary: String,
+        secondary: String,
+        trailing: String?,
+        accent: Color,
+        isInteractive: Bool
+    ) -> some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(accent.opacity(0.9))
+                .frame(width: 8, height: 8)
+
+            HStack(spacing: 8) {
+                Text(primary)
+                    .font(.subheadline)
+                    .fontWeight(.medium)
+                    .foregroundColor(.primary)
+                    .lineLimit(1)
+
+                Text(secondary)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            Spacer(minLength: 0)
+
+            if let trailing {
+                Text(trailing)
+                    .font(.footnote)
+                    .foregroundColor(.secondary)
+                    .lineLimit(1)
+            }
+
+            if isInteractive {
+                Image(systemName: "chevron.right")
+                    .font(.caption2)
+                    .foregroundColor(.secondary)
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 5)
+        .background(Color(NSColor.textBackgroundColor))
+        .overlay(
+            RoundedRectangle(cornerRadius: 8, style: .continuous)
+                .stroke(Color(NSColor.separatorColor).opacity(0.35), lineWidth: 1)
+        )
+        .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+    }
+
+    private func adjustSlotLimit(by delta: Int) {
+        let next = max(1, min(12, finiteSlotCount + delta))
+        manager.appConfig.maxConcurrentRecordings = next
+        manager.saveAppConfig()
+    }
+
+    private func adjustRequestSlotLimit(by delta: Int) {
+        let next = max(1, min(24, requestSlotLimit + delta))
+        manager.appConfig.maxConcurrentRequests = next
+        manager.saveAppConfig()
+    }
+
+    private func toggleUnlimitedSlots() {
+        if isUnlimitedSlots {
+            manager.appConfig.maxConcurrentRecordings = 4
+        } else {
+            manager.appConfig.maxConcurrentRecordings = 0
+        }
+        manager.saveAppConfig()
+    }
+
+    private func updateSlotColumnCount(for width: CGFloat) {
+        let nextCount = width >= 520 ? 2 : 1
+        guard nextCount != slotColumnCount else { return }
+        withAnimation(.easeInOut(duration: 0.18)) {
+            slotColumnCount = nextCount
+        }
     }
 }
 
@@ -2049,9 +2531,9 @@ struct ChannelDetailView: View {
 
                     HStack(spacing: 8) {
                         Circle()
-                            .fill(info.isInvalid ? Color.red : (info.isPaused ? Color.orange : (info.isOnline ? Color.green : Color.gray)))
+                            .fill(statusIndicatorColor(info: info))
                             .frame(width: 10, height: 10)
-                        Text(info.isInvalid ? "Invalid (404)" : (info.isPaused ? (info.isOnline ? "Paused (Online)" : "Paused") : (info.isOnline ? "Recording" : "Offline")))
+                        Text(statusLabel(info: info))
                             .font(.subheadline)
                             .fontWeight(.semibold)
                             .foregroundColor(info.isInvalid ? .red : .primary)
@@ -2157,6 +2639,38 @@ struct ChannelDetailView: View {
             .padding(.horizontal, sidebarHorizontalInset)
         }
         .frame(maxHeight: .infinity, alignment: .top)
+    }
+
+    private func statusLabel(info: ChannelInfo) -> String {
+        if info.isInvalid {
+            return "Invalid (404)"
+        }
+        if info.isWaitingForRecordingSlot {
+            return info.isOnline ? "Waiting Live" : "Offline"
+        }
+        if info.isPaused {
+            return info.isOnline ? "Paused (Online)" : "Paused"
+        }
+        if info.isOnline {
+            return info.globalRecordingEnabled ? "Recording" : "Online"
+        }
+        return "Offline"
+    }
+
+    private func statusIndicatorColor(info: ChannelInfo) -> Color {
+        if info.isInvalid {
+            return .red
+        }
+        if info.isWaitingForRecordingSlot {
+            return info.isOnline ? .blue : .gray
+        }
+        if info.isPaused {
+            return .orange
+        }
+        if info.isOnline {
+            return info.globalRecordingEnabled ? .green : .mint
+        }
+        return .gray
     }
     
     private func updateInfo() {
@@ -2826,8 +3340,8 @@ struct ChannelInfoView: View {
             ], spacing: 8) {
                 InfoCard(title: "Duration", value: info.duration, icon: "clock")
                 InfoCard(title: "File Size", value: info.filesize, icon: "doc")
-                InfoCard(title: "Max Duration", value: info.maxDuration, icon: "timer")
-                InfoCard(title: "Max File Size", value: info.maxFilesize, icon: "externaldrive")
+                InfoCard(title: "Split After Duration", value: info.maxDuration, icon: "timer")
+                InfoCard(title: "Split After File Size", value: info.maxFilesize, icon: "externaldrive")
             }
             
             if let filename = info.filename {
@@ -3247,6 +3761,8 @@ struct AddChannelView: View {
     @State private var framerate = 30
     @State private var maxDuration = 0
     @State private var maxFilesize = 0
+    @State private var maxSessionDuration = 0
+    @State private var maxSessionFilesize = 0
     @State private var outputDirectory = ""
     @State private var pattern = "{{.Username}}_{{.Year}}-{{.Month}}-{{.Day}}_{{.Hour}}-{{.Minute}}-{{.Second}}{{if .Sequence}}_{{.Sequence}}{{end}}"
     
@@ -3345,7 +3861,7 @@ struct AddChannelView: View {
                         VStack(spacing: 12) {
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("Max Duration")
+                                    Text("Split After Duration")
                                         .font(.subheadline)
                                         .fontWeight(.medium)
                                     Text("Split recording after duration limit")
@@ -3364,7 +3880,7 @@ struct AddChannelView: View {
                             
                             HStack {
                                 VStack(alignment: .leading, spacing: 4) {
-                                    Text("Max File Size")
+                                    Text("Split After File Size")
                                         .font(.subheadline)
                                         .fontWeight(.medium)
                                     Text("Split recording after file size limit")
@@ -3377,6 +3893,48 @@ struct AddChannelView: View {
                                         .foregroundColor(maxFilesize == 0 ? .secondary : .primary)
                                         .frame(minWidth: 80, alignment: .trailing)
                                     Stepper("", value: $maxFilesize, in: 0...10240, step: 100)
+                                        .labelsHidden()
+                                }
+                            }
+                            
+                            Divider()
+                            
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Max Session Duration")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Text("Pause recording after session duration limit")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                HStack(spacing: 12) {
+                                    Text(maxSessionDuration == 0 ? "Unlimited" : "\(maxSessionDuration) min")
+                                        .foregroundColor(maxSessionDuration == 0 ? .secondary : .primary)
+                                        .frame(minWidth: 80, alignment: .trailing)
+                                    Stepper("", value: $maxSessionDuration, in: 0...1440, step: 15)
+                                        .labelsHidden()
+                                }
+                            }
+
+                            Divider()
+
+                            HStack {
+                                VStack(alignment: .leading, spacing: 4) {
+                                    Text("Max Session File Size")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Text("Pause recording after total session file size limit")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                                Spacer()
+                                HStack(spacing: 12) {
+                                    Text(maxSessionFilesize == 0 ? "Unlimited" : "\(maxSessionFilesize) MB")
+                                        .foregroundColor(maxSessionFilesize == 0 ? .secondary : .primary)
+                                        .frame(minWidth: 80, alignment: .trailing)
+                                    Stepper("", value: $maxSessionFilesize, in: 0...102400, step: 500)
                                         .labelsHidden()
                                 }
                             }
@@ -3492,7 +4050,9 @@ struct AddChannelView: View {
             resolution: resolution,
             pattern: pattern,
             maxDuration: maxDuration,
-            maxFilesize: maxFilesize
+            maxFilesize: maxFilesize,
+            maxSessionDuration: maxSessionDuration,
+            maxSessionFilesize: maxSessionFilesize
         )
         
         Task { @MainActor in
@@ -3532,6 +4092,8 @@ struct EditChannelView: View {
     @State private var framerate = 30
     @State private var maxDuration = 0
     @State private var maxFilesize = 0
+    @State private var maxSessionDuration = 0
+    @State private var maxSessionFilesize = 0
     @State private var outputDirectory = ""
     @State private var pattern = ""
     @State private var isLoading = true
@@ -3653,7 +4215,7 @@ struct EditChannelView: View {
                             VStack(spacing: 12) {
                                 HStack {
                                     VStack(alignment: .leading, spacing: 4) {
-                                        Text("Max Duration")
+                                        Text("Split After Duration")
                                             .font(.subheadline)
                                             .fontWeight(.medium)
                                         Text("Split recording after duration limit")
@@ -3674,7 +4236,7 @@ struct EditChannelView: View {
                                 
                                 HStack {
                                     VStack(alignment: .leading, spacing: 4) {
-                                        Text("Max File Size")
+                                        Text("Split After File Size")
                                             .font(.subheadline)
                                             .fontWeight(.medium)
                                         Text("Split recording after file size limit")
@@ -3687,6 +4249,48 @@ struct EditChannelView: View {
                                             .foregroundColor(maxFilesize == 0 ? .secondary : .primary)
                                             .frame(minWidth: 80, alignment: .trailing)
                                         Stepper("", value: $maxFilesize, in: 0...10240, step: 100)
+                                            .labelsHidden()
+                                    }
+                                }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Max Session Duration")
+                                            .font(.subheadline)
+                                            .fontWeight(.medium)
+                                        Text("Pause recording after session duration limit")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    HStack(spacing: 12) {
+                                        Text(maxSessionDuration == 0 ? "Unlimited" : "\(maxSessionDuration) min")
+                                            .foregroundColor(maxSessionDuration == 0 ? .secondary : .primary)
+                                            .frame(minWidth: 80, alignment: .trailing)
+                                        Stepper("", value: $maxSessionDuration, in: 0...1440, step: 15)
+                                            .labelsHidden()
+                                    }
+                                }
+
+                                Divider()
+
+                                HStack {
+                                    VStack(alignment: .leading, spacing: 4) {
+                                        Text("Max Session File Size")
+                                            .font(.subheadline)
+                                            .fontWeight(.medium)
+                                        Text("Pause recording after total session file size limit")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    Spacer()
+                                    HStack(spacing: 12) {
+                                        Text(maxSessionFilesize == 0 ? "Unlimited" : "\(maxSessionFilesize) MB")
+                                            .foregroundColor(maxSessionFilesize == 0 ? .secondary : .primary)
+                                            .frame(minWidth: 80, alignment: .trailing)
+                                        Stepper("", value: $maxSessionFilesize, in: 0...102400, step: 500)
                                             .labelsHidden()
                                     }
                                 }
@@ -3805,6 +4409,8 @@ struct EditChannelView: View {
                     framerate = config.framerate
                     maxDuration = config.maxDuration
                     maxFilesize = config.maxFilesize
+                    maxSessionDuration = config.maxSessionDuration
+                    maxSessionFilesize = config.maxSessionFilesize
                     outputDirectory = config.outputDirectory
                     pattern = config.pattern
                     canEditUsername = !(channelInfo?.isOnline == true && channelInfo?.isPaused == false)
@@ -3843,6 +4449,8 @@ struct EditChannelView: View {
                     pattern: pattern,
                     maxDuration: maxDuration,
                     maxFilesize: maxFilesize,
+                    maxSessionDuration: maxSessionDuration,
+                    maxSessionFilesize: maxSessionFilesize,
                     createdAt: currentConfig.createdAt,
                     lastOnlineAt: currentConfig.lastOnlineAt,
                     recordingHistory: currentConfig.recordingHistory

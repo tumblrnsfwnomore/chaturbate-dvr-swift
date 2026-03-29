@@ -14,15 +14,22 @@
 <style>
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
-body{background:#0f0f0f;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-top:60px;padding-bottom:60px}
-header{background:#1a1a1a;padding:14px 16px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #252525;position:fixed;top:0;left:0;right:0;z-index:20}
+body{background:#0f0f0f;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-top:calc(60px + env(safe-area-inset-top, 0px));padding-bottom:60px}
+header{background:#1a1a1a;padding:calc(14px + env(safe-area-inset-top, 0px)) 16px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #252525;position:fixed;top:0;left:0;right:0;z-index:20}
 header h1{font-size:16px;font-weight:600;flex:1}
 #meta{font-size:12px;color:#666;display:flex;align-items:center;gap:6px}
 #dot{width:6px;height:6px;border-radius:50%;background:#ef4444;flex-shrink:0;transition:background .3s}
 #dot.ok{background:#22c55e}
+#recBtn{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;flex-shrink:0}
+#recBtn.enabled{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.4)}
+#recBtn.disabled{background:rgba(249,115,22,.18);color:#fb923c;border:1px solid rgba(249,115,22,.5)}
+#recBtn .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+#recBtn.enabled .dot{background:#ef4444;animation:pulse 1.4s ease-in-out infinite}
+#recBtn.disabled .dot{background:#f97316}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
 #filterBtn{background:transparent;border:1px solid #383838;color:#999;padding:6px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:all .15s}
 #filterBtn:hover{border-color:#666;color:#ccc}
-#filterPanel{position:fixed;top:60px;left:0;right:0;background:#1a1a1a;border-bottom:1px solid #252525;padding:16px;display:none;z-index:19}
+#filterPanel{position:fixed;top:calc(60px + env(safe-area-inset-top, 0px));left:0;right:0;background:#1a1a1a;border-bottom:1px solid #252525;padding:16px;display:none;z-index:19}
 #filterPanel.open{display:block}
 .filter-group{margin-bottom:14px}
 .filter-group:last-child{margin-bottom:0}
@@ -81,8 +88,7 @@ body{scroll-padding-top:140px}
   <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
     <circle cx="12" cy="12" r="10"/><polygon points="10,8 16,12 10,16"/>
   </svg>
-  <h1>ChaturbateDVR</h1>
-  <div id="meta"><span id="updated">Connecting…</span><span id="dot"></span></div>
+  <h1>ChaturbateDVR</h1>  <button id="recBtn" class="enabled" title="Toggle global recording on/off"><span class="dot"></span><span id="recLabel">On</span></button>  <div id="meta"><span id="updated">Connecting…</span><span id="dot"></span></div>
   <button id="filterBtn">≋ Filter</button>
 </header>
 <div id="filterPanel">
@@ -103,6 +109,8 @@ body{scroll-padding-top:140px}
 const grid = document.getElementById('grid');
 const updated = document.getElementById('updated');
 const dot = document.getElementById('dot');
+const recBtn = document.getElementById('recBtn');
+const recLabel = document.getElementById('recLabel');
 const filterBtn = document.getElementById('filterBtn');
 const filterPanel = document.getElementById('filterPanel');
 const searchBox = document.getElementById('searchBox');
@@ -110,6 +118,14 @@ const toTopBtn = document.getElementById('toTop');
 
 let allChannels = [];
 let statusFilter = '';
+let recordingEnabled = true;
+
+function setRecordingUI(enabled) {
+  recordingEnabled = enabled;
+  recBtn.className = enabled ? 'enabled' : 'disabled';
+  recLabel.textContent = enabled ? 'On' : 'Off';
+  recBtn.title = enabled ? 'Click to pause all recordings' : 'Click to resume all recordings';
+}
 
 function esc(s) {
   return String(s)
@@ -143,12 +159,12 @@ function renderCard(ch) {
   const noPerson = ch.isNoPersonDetected
     ? '<span class="badge b-np">No Person</span>' : '';
 
-  const tv = Math.floor(Date.now() / 30000);
+  const tv = Math.floor(Date.now() / 10000);
   const thumbSrc = ch.hasThumbnail
     ? '/thumbnails/' + encodeURIComponent(ch.username) + '?v=' + tv
     : '';
   const thumbHtml = thumbSrc
-    ? '<img src="' + thumbSrc + '" alt="" loading="lazy">'
+    ? '<img src="' + thumbSrc + '" alt="" loading="lazy" data-thumb-username="' + esc(ch.username) + '">'
     : '<div class="placeholder"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>';
 
   const meta = [];
@@ -178,13 +194,30 @@ function render() {
   grid.innerHTML = filtered.length
     ? filtered.map(renderCard).join('')
     : '<div id="empty">No channels match your filters</div>';
+  
+  // Set up error handlers for thumbnail images
+  grid.querySelectorAll('img[data-thumb-username]').forEach(img => {
+    let retryCount = 0;
+    img.onerror = function() {
+      retryCount++;
+      if (retryCount < 3) {
+        // Retry with a fresh cache-buster after a short delay
+        setTimeout(() => {
+          const tv = Math.floor(Date.now() / 10000);
+          this.src = '/thumbnails/' + encodeURIComponent(this.dataset.thumbUsername) + '?v=' + tv;
+        }, 500);
+      }
+    };
+  });
 }
 
 async function fetchChannels() {
   try {
     const r = await fetch('/api/channels');
     if (!r.ok) throw new Error('HTTP ' + r.status);
-    allChannels = await r.json();
+    const data = await r.json();
+    setRecordingUI(data.recordingEnabled !== false);
+    allChannels = data.channels || [];
     dot.className = 'ok';
     updated.textContent = new Date().toLocaleTimeString();
     render();
@@ -197,6 +230,17 @@ async function fetchChannels() {
 filterBtn.addEventListener('click', () => {
   filterPanel.classList.toggle('open');
 });
+
+recBtn.addEventListener('click', async () => {
+  const newEnabled = !recordingEnabled;
+  recBtn.disabled = true;
+  try {
+    await fetch(newEnabled ? '/api/recording/enable' : '/api/recording/disable', {method:'POST'});
+    await fetchChannels();
+  } catch(_) {}
+  recBtn.disabled = false;
+});
+
 
 document.querySelectorAll('[data-filter]').forEach(btn => {
   btn.addEventListener('click', e => {
