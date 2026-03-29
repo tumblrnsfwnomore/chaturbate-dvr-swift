@@ -67,6 +67,9 @@ body{scroll-padding-top:140px}
 #empty{text-align:center;color:#444;padding:60px 20px;font-size:15px}
 #toTop{position:fixed;bottom:20px;right:20px;width:40px;height:40px;background:#a78bfa;color:#0f0f0f;border:none;border-radius:50%;cursor:pointer;font-size:18px;display:none;z-index:15;font-weight:600;transition:all .2s}
 #toTop:active{transform:scale(.95)}
+.card-dyn{display:flex;flex-direction:column;flex:1}
+#recBtn.loading{opacity:.65;cursor:wait}
+#recBtn.loading .dot{animation:none !important}
 @media (min-width:768px) {
   body{padding-top:0;padding-bottom:20px}
   header{position:sticky;top:0;padding:14px 20px}
@@ -119,6 +122,7 @@ const toTopBtn = document.getElementById('toTop');
 let allChannels = [];
 let statusFilter = '';
 let recordingEnabled = true;
+let isFetching = false;
 
 function setRecordingUI(enabled) {
   recordingEnabled = enabled;
@@ -152,68 +156,124 @@ function matchesFilter(ch) {
   return true;
 }
 
-function renderCard(ch) {
+function cardDynHTML(ch) {
   const {cls, label} = badge(ch);
   const pausedBadge = (ch.isOnline && ch.isPaused)
     ? '<span class="badge b-paus">Paused</span>' : '';
   const noPerson = ch.isNoPersonDetected
     ? '<span class="badge b-np">No Person</span>' : '';
-
-  const tv = Math.floor(Date.now() / 10000);
-  const thumbSrc = ch.hasThumbnail
-    ? '/thumbnails/' + encodeURIComponent(ch.username) + '?v=' + tv
-    : '';
-  const thumbHtml = thumbSrc
-    ? '<img src="' + thumbSrc + '" alt="" loading="lazy" data-thumb-username="' + esc(ch.username) + '">'
-    : '<div class="placeholder"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>';
-
   const meta = [];
   if ((ch.isRecording || ch.isWaiting) && ch.duration && ch.duration !== '0:00')
     meta.push('🕐 ' + esc(ch.duration) + (ch.filesize ? ' · ' + esc(ch.filesize) : ''));
   if (ch.lastOnlineAt && !ch.isOnline)
     meta.push('Last: ' + esc(ch.lastOnlineAt));
   const metaHTML = meta.length ? '<div class="meta">' + meta.join('<br>') + '</div>' : '';
-
   const btn = ch.isPaused
     ? '<button class="btn-resume" data-user="' + esc(ch.username) + '" data-action="resume">Resume</button>'
     : '<button class="btn-pause" data-user="' + esc(ch.username) + '" data-action="pause">Pause</button>';
+  return '<div class="badges"><span class="badge ' + cls + '">' + label + '</span>' + pausedBadge + noPerson + '</div>' +
+    metaHTML + '<div class="actions">' + btn + '</div>';
+}
 
-  return '<div class="card">' +
-    '<div class="thumb-wrap">' + thumbHtml + '</div>' +
+function thumbHTML(ch) {
+  if (ch.hasThumbnail) {
+    const tv = Math.floor(Date.now() / 10000);
+    return '<img src="/thumbnails/' + encodeURIComponent(ch.username) + '?v=' + tv +
+      '" alt="" loading="lazy" data-thumb-username="' + esc(ch.username) + '">';
+  }
+  return '<div class="placeholder"><svg width="38" height="38" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg></div>';
+}
+
+function setupImgRetry(img) {
+  let retryCount = 0;
+  img.onerror = function() {
+    retryCount++;
+    if (retryCount < 3) {
+      setTimeout(() => {
+        const tv = Math.floor(Date.now() / 10000);
+        this.src = '/thumbnails/' + encodeURIComponent(this.dataset.thumbUsername) + '?v=' + tv;
+      }, 500);
+    }
+  };
+}
+
+function createCard(ch) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.dataset.username = ch.username;
+  el.dataset.hasThumb = ch.hasThumbnail ? '1' : '0';
+  el.innerHTML =
+    '<div class="thumb-wrap">' + thumbHTML(ch) + '</div>' +
     '<div class="info">' +
       '<div class="username">' + esc(ch.username) + '</div>' +
-      '<div class="badges"><span class="badge ' + cls + '">' + label + '</span>' + pausedBadge + noPerson + '</div>' +
-      metaHTML +
-      '<div class="actions">' + btn + '</div>' +
-    '</div>' +
-  '</div>';
+      '<div class="card-dyn">' + cardDynHTML(ch) + '</div>' +
+    '</div>';
+  const img = el.querySelector('img[data-thumb-username]');
+  if (img) setupImgRetry(img);
+  return el;
 }
 
 function render() {
   const filtered = allChannels.filter(matchesFilter);
-  grid.innerHTML = filtered.length
-    ? filtered.map(renderCard).join('')
-    : '<div id="empty">No channels match your filters</div>';
-  
-  // Set up error handlers for thumbnail images
-  grid.querySelectorAll('img[data-thumb-username]').forEach(img => {
-    let retryCount = 0;
-    img.onerror = function() {
-      retryCount++;
-      if (retryCount < 3) {
-        // Retry with a fresh cache-buster after a short delay
-        setTimeout(() => {
-          const tv = Math.floor(Date.now() / 10000);
-          this.src = '/thumbnails/' + encodeURIComponent(this.dataset.thumbUsername) + '?v=' + tv;
-        }, 500);
+
+  // Index existing cards
+  const existing = new Map();
+  grid.querySelectorAll('.card[data-username]').forEach(el => existing.set(el.dataset.username, el));
+
+  const desiredSet = new Set(filtered.map(ch => ch.username));
+
+  // Remove cards no longer in the filtered list
+  existing.forEach((el, u) => { if (!desiredSet.has(u)) el.remove(); });
+
+  if (filtered.length === 0) {
+    if (!grid.querySelector('#empty'))
+      grid.innerHTML = '<div id="empty">No channels match your filters</div>';
+    return;
+  }
+
+  const emptyEl = grid.querySelector('#empty');
+  if (emptyEl) emptyEl.remove();
+
+  // Update or create each card, maintaining sort order
+  let prevEl = null;
+  for (const ch of filtered) {
+    let el = existing.get(ch.username);
+    if (el) {
+      // Patch only the dynamic section — thumbnails are untouched so they don't flash
+      const dynEl = el.querySelector('.card-dyn');
+      if (dynEl) dynEl.innerHTML = cardDynHTML(ch);
+      // Only replace thumb-wrap when hasThumbnail state actually changes
+      const hadThumb = el.dataset.hasThumb === '1';
+      if (hadThumb !== ch.hasThumbnail) {
+        const tw = el.querySelector('.thumb-wrap');
+        if (tw) {
+          tw.innerHTML = thumbHTML(ch);
+          const img = tw.querySelector('img[data-thumb-username]');
+          if (img) setupImgRetry(img);
+        }
+        el.dataset.hasThumb = ch.hasThumbnail ? '1' : '0';
       }
-    };
-  });
+    } else {
+      el = createCard(ch);
+    }
+    // Keep cards in correct order without a full rebuild
+    if (prevEl) {
+      if (el.previousElementSibling !== prevEl) prevEl.after(el);
+    } else {
+      if (grid.firstElementChild !== el) grid.prepend(el);
+    }
+    prevEl = el;
+  }
 }
 
 async function fetchChannels() {
+  if (isFetching) return;
+  isFetching = true;
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
   try {
-    const r = await fetch('/api/channels');
+    const r = await fetch('/api/channels', {signal: controller.signal});
+    clearTimeout(timer);
     if (!r.ok) throw new Error('HTTP ' + r.status);
     const data = await r.json();
     setRecordingUI(data.recordingEnabled !== false);
@@ -222,8 +282,11 @@ async function fetchChannels() {
     updated.textContent = new Date().toLocaleTimeString();
     render();
   } catch(e) {
+    clearTimeout(timer);
     dot.className = '';
-    updated.textContent = 'Error – retrying…';
+    updated.textContent = e.name === 'AbortError' ? 'Timeout – retrying…' : 'Error – retrying…';
+  } finally {
+    isFetching = false;
   }
 }
 
@@ -233,14 +296,20 @@ filterBtn.addEventListener('click', () => {
 
 recBtn.addEventListener('click', async () => {
   const newEnabled = !recordingEnabled;
+  setRecordingUI(newEnabled);           // optimistic update
+  recBtn.classList.add('loading');
   recBtn.disabled = true;
   try {
-    await fetch(newEnabled ? '/api/recording/enable' : '/api/recording/disable', {method:'POST'});
+    const r = await fetch(newEnabled ? '/api/recording/enable' : '/api/recording/disable', {method:'POST'});
+    if (!r.ok) throw new Error();
     await fetchChannels();
-  } catch(_) {}
-  recBtn.disabled = false;
+  } catch(_) {
+    setRecordingUI(!newEnabled);        // revert on failure
+  } finally {
+    recBtn.classList.remove('loading');
+    recBtn.disabled = false;
+  }
 });
-
 
 document.querySelectorAll('[data-filter]').forEach(btn => {
   btn.addEventListener('click', e => {
@@ -261,11 +330,13 @@ grid.addEventListener('click', async e => {
   const username = btn.dataset.user;
   const action   = btn.dataset.action;
   btn.disabled = true;
+  btn.textContent = '…';
   try {
     await fetch('/api/channels/' + encodeURIComponent(username) + '/' + action, {method:'POST'});
     await fetchChannels();
   } catch(_) {
     btn.disabled = false;
+    btn.textContent = action === 'pause' ? 'Pause' : 'Resume';
   }
 });
 

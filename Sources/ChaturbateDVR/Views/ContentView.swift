@@ -34,7 +34,7 @@ private func formatNoPersonDuration(_ seconds: Int) -> String {
 }
 
 struct ContentView: View {
-    @StateObject private var manager = ChannelManager()
+    @ObservedObject var manager: ChannelManager
     @State private var showingAddChannel = false
     @State private var showingImportChannels = false
     @State private var showingSettings = false
@@ -1690,6 +1690,62 @@ struct ActivitySidebarView: View {
         VStack(spacing: 0) {
             ScrollView {
                 VStack(alignment: .leading, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 6) {
+                        Text("Account")
+                            .font(.headline)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.primary)
+
+                        HStack(spacing: 10) {
+                            if manager.appConfig.authMode == .inAppWebView {
+                                if manager.appConfig.hasValidInAppSession() {
+                                    Image(systemName: "person.crop.circle.fill")
+                                        .font(.title2)
+                                        .foregroundColor(.green)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(manager.appConfig.loggedInUsername.isEmpty
+                                             ? "Signed In"
+                                             : "@\(manager.appConfig.loggedInUsername)")
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                        Text("In-App Session • Active")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                } else {
+                                    Image(systemName: "person.crop.circle.badge.xmark")
+                                        .font(.title2)
+                                        .foregroundColor(.orange)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text("Not Signed In")
+                                            .font(.subheadline)
+                                            .fontWeight(.semibold)
+                                        Text("Open Settings to sign in")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                            } else {
+                                Image(systemName: "globe")
+                                    .font(.title2)
+                                    .foregroundColor(.secondary)
+                                VStack(alignment: .leading, spacing: 2) {
+                                    Text("Legacy Mode")
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                    Text("Using \(manager.appConfig.selectedBrowser.displayName) cookies")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                }
+                            }
+                            Spacer()
+                        }
+                        .padding(10)
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                        .background(Color(NSColor.controlBackgroundColor))
+                        .cornerRadius(10)
+                    }
+
                     VStack(alignment: .leading, spacing: 10) {
                         Text("Recording")
                             .font(.headline)
@@ -2368,6 +2424,7 @@ struct ChannelDetailView: View {
     @State private var recordingsCache: [String] = []
     @State private var recordingsScanTask: Task<Void, Never>?
     @State private var lastRecordingsScanKey: String = ""
+    @State private var showingChannelPage = false
     
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -2421,6 +2478,9 @@ struct ChannelDetailView: View {
                     isPresented: $showingRecordingPreview
                 )
             }
+        }
+        .sheet(isPresented: $showingChannelPage) {
+            ChaturbateChannelPageSheet(username: username, isPresented: $showingChannelPage)
         }
     }
 
@@ -2575,9 +2635,9 @@ struct ChannelDetailView: View {
 
             VStack(spacing: 8) {
                 Button(action: {
-                    manager.openChannelPage(username: username)
+                    showingChannelPage = true
                 }) {
-                    Label("Open Channel Page", systemImage: "link")
+                    Label("Open Channel In App", systemImage: "safari")
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)

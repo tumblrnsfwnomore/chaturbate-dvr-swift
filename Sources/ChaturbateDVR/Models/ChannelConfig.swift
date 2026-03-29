@@ -183,6 +183,13 @@ struct RuntimeDiagnostics {
     )
 }
 
+enum AuthMode: String, Codable, CaseIterable, Identifiable {
+    case inAppWebView = "In-App Login"
+    case browserCookies = "Browser Cookies (Legacy)"
+
+    var id: String { rawValue }
+}
+
 struct AppConfig: Codable {
     var framerate: Int = 30
     var resolution: Int = 1080
@@ -191,7 +198,12 @@ struct AppConfig: Codable {
     var maxDuration: Int = 0
     var maxFilesize: Int = 0
     var interval: Int = 1 // minutes
+    var authMode: AuthMode = .inAppWebView
     var selectedBrowser: SupportedBrowser = .none
+    var inAppCookies: [String: String] = [:]
+    var inAppUserAgent: String = ""
+    var loggedInUsername: String = ""
+    var hasCompletedOnboarding: Bool = false
     var domain: String = "https://chaturbate.com/"
     var maxConcurrentRequests: Int = 6 // max concurrent API requests across all channels
     var maxConcurrentRecordings: Int = 0 // 0 means unlimited concurrent recordings
@@ -213,6 +225,12 @@ struct AppConfig: Codable {
         maxFilesize = try container.decodeIfPresent(Int.self, forKey: .maxFilesize) ?? 0
         interval = try container.decodeIfPresent(Int.self, forKey: .interval) ?? 1
         selectedBrowser = try container.decodeIfPresent(SupportedBrowser.self, forKey: .selectedBrowser) ?? .none
+        authMode = try container.decodeIfPresent(AuthMode.self, forKey: .authMode)
+            ?? (selectedBrowser == .none ? .inAppWebView : .browserCookies)
+        inAppCookies = try container.decodeIfPresent([String: String].self, forKey: .inAppCookies) ?? [:]
+        inAppUserAgent = try container.decodeIfPresent(String.self, forKey: .inAppUserAgent) ?? ""
+        loggedInUsername = try container.decodeIfPresent(String.self, forKey: .loggedInUsername) ?? ""
+        hasCompletedOnboarding = try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? true
         domain = try container.decodeIfPresent(String.self, forKey: .domain) ?? "https://chaturbate.com/"
         maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 6
         maxConcurrentRecordings = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecordings) ?? 0
@@ -230,7 +248,9 @@ struct AppConfig: Codable {
     
     private enum CodingKeys: String, CodingKey {
         case framerate, resolution, outputDirectory, pattern
-        case maxDuration, maxFilesize, interval, selectedBrowser
+        case maxDuration, maxFilesize, interval
+        case authMode, selectedBrowser
+        case inAppCookies, inAppUserAgent, loggedInUsername, hasCompletedOnboarding
         case domain, maxConcurrentRequests
         case maxConcurrentRecordings
         case breakStaticThresholdMinutes
@@ -250,11 +270,38 @@ struct AppConfig: Codable {
     }
     
     func getUserAgent() -> String {
-        selectedBrowser.userAgent
+        if authMode == .inAppWebView, !inAppUserAgent.isEmpty {
+            return inAppUserAgent
+        }
+        return selectedBrowser.userAgent
     }
     
     func getCookies() async -> String {
+        if authMode == .inAppWebView {
+            if inAppCookies.isEmpty {
+                return ""
+            }
+            return inAppCookies.keys.sorted().compactMap { name in
+                guard let value = inAppCookies[name], !value.isEmpty else { return nil }
+                return "\(name)=\(value)"
+            }.joined(separator: "; ")
+        }
+
         let extractor = BrowserCookieExtractor()
         return await extractor.extractCookies(for: selectedBrowser, domain: "chaturbate.com")
+    }
+
+    func hasValidInAppSession() -> Bool {
+        !inAppCookies["sessionid", default: ""].isEmpty
+            && !inAppCookies["csrftoken", default: ""].isEmpty
+    }
+
+    func isAuthenticated() -> Bool {
+        switch authMode {
+        case .inAppWebView:
+            return hasValidInAppSession()
+        case .browserCookies:
+            return selectedBrowser != .none
+        }
     }
 }

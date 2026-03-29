@@ -267,6 +267,10 @@ class ChannelManager: ObservableObject {
     private var webServerActivePort: Int = 0
     private var isShuttingDown = false
 
+    var isAuthenticated: Bool {
+        appConfig.isAuthenticated()
+    }
+
     init() {
         let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         let appFolder = appSupport.appendingPathComponent("ChaturbateDVR")
@@ -279,7 +283,7 @@ class ChannelManager: ObservableObject {
         recordingCoordinator = RecordingCoordinator(maxConcurrent: 0)
         
         loadAppConfig()
-        
+
         // Update with actual config value
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
@@ -389,6 +393,28 @@ class ChannelManager: ObservableObject {
         } else {
             stopWebServer()
         }
+    }
+
+    func setInAppSession(cookies: [String: String], userAgent: String, username: String?) {
+        appConfig.authMode = .inAppWebView
+        appConfig.inAppCookies = cookies
+        appConfig.inAppUserAgent = userAgent
+        appConfig.loggedInUsername = username ?? ""
+        appConfig.hasCompletedOnboarding = true
+        saveAppConfig()
+    }
+
+    func completeOnboardingWithoutLogin() {
+        appConfig.hasCompletedOnboarding = true
+        saveAppConfig()
+    }
+
+    func signOutInAppSession() {
+        appConfig.inAppCookies = [:]
+        appConfig.inAppUserAgent = ""
+        appConfig.loggedInUsername = ""
+        appConfig.authMode = .inAppWebView
+        saveAppConfig()
     }
     
     func createChannel(config: ChannelConfig) async throws {
@@ -771,7 +797,7 @@ class ChannelManager: ObservableObject {
             await saveConfig()
 
             let channelsToProbe = importedChannels
-            Task.detached(priority: .utility) {
+            Task.detached(priority: .utility) { [self] in
                 await FileLogger.shared.log("[manager] import followed cams post-check started: channels=\(channelsToProbe.count)")
 
                 // Run an initial probe for newly imported paused channels so online status
@@ -782,6 +808,13 @@ class ChannelManager: ObservableObject {
                             await channel.refreshPausedOnlineStatus(bypassRateLimit: true)
                         }
                     }
+                }
+
+                // Fetch bio metadata for each imported channel sequentially.
+                for channel in channelsToProbe {
+                    let username = await channel.config.username
+                    await self.refreshBioMetadata(username: username)
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
                 }
 
                 await FileLogger.shared.log("[manager] import followed cams post-check complete")
@@ -796,6 +829,7 @@ class ChannelManager: ObservableObject {
         let root = (parentDirectory as NSString).expandingTildeInPath
         var imported = 0
         var skipped = 0
+        var importedChannels: [Channel] = []
 
         await FileLogger.shared.log("[manager] import from folders started: \(root)")
 
@@ -853,11 +887,21 @@ class ChannelManager: ObservableObject {
                 recordingCoordinator: recordingCoordinator
             )
             channels[config.username] = channel
+            importedChannels.append(channel)
             imported += 1
         }
 
         if imported > 0 {
             await saveConfig()
+
+            let channelsToFetch = importedChannels
+            Task { [self] in
+                for channel in channelsToFetch {
+                    let username = await channel.config.username
+                    await self.refreshBioMetadata(username: username)
+                    try? await Task.sleep(nanoseconds: 1_000_000_000)
+                }
+            }
         }
 
         await FileLogger.shared.log("[manager] import complete: imported=\(imported), skipped=\(skipped)")

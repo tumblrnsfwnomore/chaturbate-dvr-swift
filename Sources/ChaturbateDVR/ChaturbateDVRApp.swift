@@ -74,7 +74,7 @@ struct ChaturbateDVRApp: App {
     
     var body: some Scene {
         WindowGroup {
-            ContentView()
+            RootView()
         }
         .commands {
             CommandGroup(replacing: .newItem) {}

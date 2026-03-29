@@ -72,6 +72,7 @@ actor ChaturbateClient {
         debugLines.append("debug_id=\(debugID)")
         debugLines.append("started_at=\(startedAt)")
         debugLines.append("domain=\(config.domain)")
+        debugLines.append("auth_mode=\(config.authMode.rawValue)")
         debugLines.append("selected_browser=\(config.selectedBrowser.displayName)")
 
         let userAgent = config.getUserAgent()
@@ -88,7 +89,7 @@ actor ChaturbateClient {
         debugLines.append("has_csrftoken_cookie=\(cookieNames.contains("csrftoken"))")
         progress?("Auth check: found \(cookieNames.count) cookies")
 
-        if cookieNames.isEmpty {
+        if cookieNames.isEmpty, config.authMode == .browserCookies {
             let extractor = BrowserCookieExtractor()
             let diagnostics = await extractor.diagnostics(for: config.selectedBrowser, domain: "chaturbate.com")
             for line in diagnostics.lines {

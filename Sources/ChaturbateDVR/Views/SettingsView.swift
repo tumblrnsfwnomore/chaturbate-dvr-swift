@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var bioBackfillTotal = 0
     @State private var bioBackfillTask: Task<Void, Never>?
     @State private var webServerPortString: String = ""
+    @State private var showingLoginSheet = false
     
     var body: some View {
         VStack(spacing: 0) {
@@ -243,6 +244,56 @@ struct SettingsView: View {
                             Divider()
 
                             VStack(alignment: .leading, spacing: 6) {
+                                Text("Authentication")
+                                    .font(.subheadline)
+                                    .fontWeight(.medium)
+
+                                Picker("", selection: Binding(
+                                    get: { manager.appConfig.authMode },
+                                    set: {
+                                        manager.appConfig.authMode = $0
+                                        manager.saveAppConfig()
+                                    }
+                                )) {
+                                    ForEach(AuthMode.allCases) { mode in
+                                        Text(mode.rawValue).tag(mode)
+                                    }
+                                }
+                                .pickerStyle(.menu)
+
+                                if manager.appConfig.authMode == .inAppWebView {
+                                    if manager.appConfig.hasValidInAppSession() {
+                                        Text(manager.appConfig.loggedInUsername.isEmpty
+                                             ? "Logged in with in-app session"
+                                             : "Logged in as @\(manager.appConfig.loggedInUsername)")
+                                            .font(.caption)
+                                            .foregroundColor(.green)
+
+                                        HStack(spacing: 10) {
+                                            Button("Re-Login") {
+                                                showingLoginSheet = true
+                                            }
+                                            .buttonStyle(.bordered)
+
+                                            Button("Sign Out", role: .destructive) {
+                                                manager.signOutInAppSession()
+                                            }
+                                            .buttonStyle(.bordered)
+                                        }
+                                    } else {
+                                        Text("No active in-app session")
+                                            .font(.caption)
+                                            .foregroundColor(.secondary)
+
+                                        Button("Login In App") {
+                                            showingLoginSheet = true
+                                        }
+                                        .buttonStyle(.borderedProminent)
+                                    }
+                                }
+
+                                Divider()
+
                                 Text("Browser for Cookies & User-Agent")
                                     .font(.subheadline)
                                     .fontWeight(.medium)
@@ -269,6 +320,10 @@ struct SettingsView: View {
                                 .pickerStyle(.menu)
                                 
                                 Text("Automatically uses cookies and user-agent from selected browser")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+
+                                Text("Browser settings are only used in Legacy mode.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                 
@@ -434,6 +489,9 @@ struct SettingsView: View {
             diagnosticsTimer = nil
             bioBackfillTask?.cancel()
             bioBackfillTask = nil
+        }
+        .sheet(isPresented: $showingLoginSheet) {
+            ChaturbateLoginSheet(manager: manager, isPresented: $showingLoginSheet)
         }
         .frame(width: 620, height: 640)
     }
