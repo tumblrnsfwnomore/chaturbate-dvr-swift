@@ -17,6 +17,16 @@ struct RootView: View {
                 ContentView(manager: manager)
             }
         }
+        .onAppear {
+            if let appDelegate = NSApp.delegate as? AppDelegate {
+                appDelegate.gracefulShutdownHandler = { [manager] in
+                    await manager.shutdownForTermination()
+                }
+                appDelegate.terminationBlockReasonProvider = { [manager] in
+                    manager.terminationBlockReason()
+                }
+            }
+        }
         .sheet(isPresented: $showingLoginSheet) {
             ChaturbateLoginSheet(manager: manager, isPresented: $showingLoginSheet)
         }

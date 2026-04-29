@@ -448,6 +448,25 @@ struct SettingsView: View {
                             .font(.caption)
                             .foregroundColor(.secondary)
 
+                        HStack {
+                            Text("Retention Period")
+                                .font(.subheadline)
+                                .fontWeight(.medium)
+                            Spacer()
+                            Stepper(value: Binding(
+                                get: { manager.appConfig.logRetentionDays },
+                                set: {
+                                    manager.appConfig.logRetentionDays = max(1, min(365, $0))
+                                    manager.saveAppConfig()
+                                    let days = manager.appConfig.logRetentionDays
+                                    Task { await FileLogger.shared.pruneOldLogs(keepingDays: days) }
+                                }
+                            ), in: 1...365) {
+                                Text("\(manager.appConfig.logRetentionDays) days")
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+
                         Button(action: openLogsFolder) {
                             HStack {
                                 Image(systemName: "folder.fill")

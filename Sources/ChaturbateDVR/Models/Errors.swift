@@ -3,6 +3,7 @@ import Foundation
 enum ChaturbateError: LocalizedError {
     case invalidChannel
     case channelOffline
+    case authenticationRequired
     case cloudflareBlocked
     case ageVerification
     case privateStream
@@ -17,6 +18,8 @@ enum ChaturbateError: LocalizedError {
             return "Channel does not exist (404)"
         case .channelOffline:
             return "Channel is offline"
+        case .authenticationRequired:
+            return "Authentication required (session expired)"
         case .cloudflareBlocked:
             return "Channel was blocked by Cloudflare"
         case .ageVerification:

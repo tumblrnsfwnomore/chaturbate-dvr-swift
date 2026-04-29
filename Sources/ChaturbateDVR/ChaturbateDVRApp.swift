@@ -4,6 +4,7 @@ import AppKit
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let minimumMainWindowSize = NSSize(width: 1200, height: 820)
     var gracefulShutdownHandler: (() async -> Void)?
+    var terminationBlockReasonProvider: (() -> String?)?
     private var hasStartedTermination = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
@@ -26,11 +27,29 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
 
+        if let reason = terminationBlockReasonProvider?() {
+            let alert = NSAlert()
+            alert.alertStyle = .informational
+            alert.messageText = "Please Wait"
+            alert.informativeText = reason
+            alert.addButton(withTitle: "OK")
+            alert.runModal()
+            return .terminateCancel
+        }
+
         guard let gracefulShutdownHandler else {
             return .terminateNow
         }
 
         hasStartedTermination = true
+
+        let reason = "ChaturbateDVR is finishing active recording cleanup. The app will quit automatically when it is safe."
+        let alert = NSAlert()
+        alert.alertStyle = .informational
+        alert.messageText = "Please Wait"
+        alert.informativeText = reason
+        alert.addButton(withTitle: "OK")
+        alert.runModal()
 
         Task { @MainActor in
             await gracefulShutdownHandler()

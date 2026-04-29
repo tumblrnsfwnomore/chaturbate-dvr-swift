@@ -40,9 +40,10 @@ actor HTTPClient {
         let (data, httpResponse) = try await execute(request: request)
         let body = String(data: data, encoding: .utf8) ?? ""
         await FileLogger.shared.log("[http] getHTML status=\(httpResponse.statusCode) url=\(httpResponse.url?.absoluteString ?? "nil") bytes=\(body.count) title=\(body.components(separatedBy: "<title>").dropFirst().first?.components(separatedBy: "</title>").first ?? "none")")
-        // Detect redirect to /roomlogin/ — treat as offline (same as getDataWithStatus).
+
+        // /roomlogin/ can mean password-protected room OR expired auth.
         if let finalURL = httpResponse.url, finalURL.path.hasPrefix("/roomlogin/") {
-            throw ChaturbateError.channelOffline
+            throw classifyRoomLogin(body: body)
         }
         return body
     }
@@ -58,18 +59,20 @@ actor HTTPClient {
         }
         let request = await buildRequest(url: url)
         let (data, httpResponse) = try await execute(request: request)
+        let bodyString = String(data: data, encoding: .utf8) ?? ""
 
-        // Detect redirect to /roomlogin/ — Chaturbate sends some offline/restricted
-        // channels here. The login page has no room dossier so treat this as offline.
+        // /roomlogin/ can mean password-protected room OR expired auth.
         if let finalURL = httpResponse.url, finalURL.path.hasPrefix("/roomlogin/") {
-            throw ChaturbateError.channelOffline
+            throw classifyRoomLogin(body: bodyString)
+        }
+
+        if httpResponse.statusCode == 401 {
+            throw ChaturbateError.authenticationRequired
         }
 
         if httpResponse.statusCode == 403 {
             throw ChaturbateError.privateStream
         }
-        
-        let bodyString = String(data: data, encoding: .utf8) ?? ""
         
         if bodyString.contains("<title>Just a moment...</title>") {
             throw ChaturbateError.cloudflareBlocked
@@ -80,6 +83,24 @@ actor HTTPClient {
         }
 
         return (data, httpResponse.statusCode)
+    }
+
+    private func classifyRoomLogin(body: String) -> ChaturbateError {
+        let lowerBody = body.lowercased()
+
+        // Password-gated rooms should stay in private/offline classification.
+        if lowerBody.contains("this room requires a password")
+            || (lowerBody.contains("password:") && lowerBody.contains("login to room")) {
+            return .privateStream
+        }
+
+        // Generic login prompts indicate missing/expired session auth.
+        if lowerBody.contains("sign in") || lowerBody.contains("log in") {
+            return .authenticationRequired
+        }
+
+        // Fail closed to privateStream to avoid false auth-expired spam.
+        return .privateStream
     }
 
     private func buildRequest(url: URL) async -> URLRequest {

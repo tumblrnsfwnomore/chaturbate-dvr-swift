@@ -140,15 +140,19 @@ struct ChannelInfo: Identifiable {
     var createdAt: Int64
     var logs: [String]
     var thumbnailPath: String?
+    var liveStreamURL: String?
     var isChecking: Bool
     var isWaitingForRecordingSlot: Bool
     var isInvalid: Bool
     var cloudflareBlockCount: Int
+    var isPersonDetected: Bool?
     var isNoPersonDetected: Bool
     var noPersonDurationSeconds: Int
     var segmentRetryCount: Int
     var consecutiveSegmentFailures: Int
     var lastSegmentFailureAt: String?
+    var timelineMismatchCount: Int
+    var lastTimelineMismatchAt: String?
     var bioMetadata: BioMetadata?
     var globalRecordingEnabled: Bool
 }
@@ -213,6 +217,7 @@ struct AppConfig: Codable {
     var webServerEnabled: Bool = false
     var webServerPort: Int = 8888
     var recordingEnabled: Bool = true
+    var logRetentionDays: Int = 30
     
     // Custom decoding to handle missing selectedBrowser from old configs
     init(from decoder: Decoder) throws {
@@ -240,6 +245,7 @@ struct AppConfig: Codable {
         webServerEnabled = try container.decodeIfPresent(Bool.self, forKey: .webServerEnabled) ?? false
         webServerPort = try container.decodeIfPresent(Int.self, forKey: .webServerPort) ?? 8888
         recordingEnabled = try container.decodeIfPresent(Bool.self, forKey: .recordingEnabled) ?? true
+        logRetentionDays = try container.decodeIfPresent(Int.self, forKey: .logRetentionDays) ?? 30
     }
     
     init() {
@@ -259,6 +265,7 @@ struct AppConfig: Codable {
         case webServerEnabled
         case webServerPort
         case recordingEnabled
+        case logRetentionDays
     }
     
     func getOutputPath() -> String {

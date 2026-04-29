@@ -14,6 +14,40 @@ struct BioBackfillProgress {
     let currentChannel: String
 }
 
+enum RecordingRepairState: Equatable {
+    case pendingScan
+    case scanning
+    case good
+    case needsRemux
+    case queued
+    case remuxing
+    case repaired
+    case failed(String)
+    case unsupported
+}
+
+struct RecordingRepairSummary: Equatable {
+    let pendingScan: Int
+    let scanning: Int
+    let good: Int
+    let needsRemux: Int
+    let queued: Int
+    let remuxing: Int
+    let repaired: Int
+    let failed: Int
+
+    static let empty = RecordingRepairSummary(
+        pendingScan: 0,
+        scanning: 0,
+        good: 0,
+        needsRemux: 0,
+        queued: 0,
+        remuxing: 0,
+        repaired: 0,
+        failed: 0
+    )
+}
+
 actor RequestCoordinator {
     struct Stats {
         let activeRequests: Int
@@ -123,8 +157,18 @@ actor RecordingCoordinator {
         maxConcurrent <= 0
     }
 
+    private func reconcileActiveRecordingCount() {
+        let derivedActiveCount = activeCountsByUsername.values.reduce(0, +)
+        if derivedActiveCount != activeRecordings {
+            activeRecordings = max(derivedActiveCount, 0)
+        }
+    }
+
     private func resumeWaitingTasksIfPossible() {
         guard recordingEnabled, !isManualHoldEnabled else { return }
+
+        // Keep totals consistent so stale counters cannot block queue wake-ups.
+        reconcileActiveRecordingCount()
 
         if isUnlimited {
             while !waitingTasks.isEmpty {
@@ -222,7 +266,8 @@ actor RecordingCoordinator {
     }
 
     func getQueueSnapshot() -> QueueSnapshot {
-        QueueSnapshot(
+        reconcileActiveRecordingCount()
+        return QueueSnapshot(
             activeUsernames: activeCountsByUsername
                 .sorted { $0.key < $1.key }
                 .map(\.key),
@@ -234,7 +279,8 @@ actor RecordingCoordinator {
     }
 
     func getStats() -> Stats {
-        Stats(
+        reconcileActiveRecordingCount()
+        return Stats(
             activeRecordings: activeRecordings,
             queuedRecordings: waitingTasks.count,
             maxConcurrent: maxConcurrent
@@ -244,10 +290,81 @@ actor RecordingCoordinator {
 
 @MainActor
 class ChannelManager: ObservableObject {
+    private static let thumbnailBackfillNoVideoCooldownSeconds: TimeInterval = 10 * 60
+
+    private struct MP4RepairCandidate {
+        let path: String
+        let channelName: String
+        let modifiedAt: Date
+        let sizeBytes: Int64
+    }
+
+    private enum RecordingRepairAuditDecision {
+        case good
+        case optionalRemux
+        case needsRemux
+    }
+
+    private struct RecordingAuditMetrics {
+        /// nil means ffprobe was not available; duration-based checks are skipped.
+        let formatDuration: Double?
+        /// nil means ffprobe was not available or stream duration was unavailable.
+        let videoDuration: Double?
+        let fileSize: Int64
+        let moovInHead: Bool
+        let moofInHead: Bool
+        let malformedBoxes: Bool
+    }
+
+    private struct HeadBoxFlags {
+        let moovInHead: Bool
+        let moofInHead: Bool
+    }
+
+    private struct RepairedRecordingIndexEntry: Codable {
+        let sizeBytes: Int64
+        let modifiedAtUnix: TimeInterval
+    }
+
+    private enum BackgroundWorker: String, CaseIterable {
+        case pausedStatus = "Paused status checks"
+        case thumbnailBackfill = "Offline thumbnail backfill"
+        case ledgerMaintenance = "Recording ledger maintenance"
+
+        var staleThresholdSeconds: TimeInterval {
+            switch self {
+            case .pausedStatus:
+                return 120
+            case .thumbnailBackfill:
+                return 120
+            case .ledgerMaintenance:
+                return 8 * 60
+            }
+        }
+    }
+
+    private enum RecordingAuditCacheDecision: String, Codable {
+        case good
+        case optionalRemux
+        case needsRemux
+    }
+
+    private struct RecordingAuditCacheEntry: Codable {
+        let sizeBytes: Int64
+        let modifiedAtUnix: TimeInterval
+        let decision: RecordingAuditCacheDecision
+    }
+
     @Published var channels: [String: Channel] = [:]
     @Published var appConfig = AppConfig()
     @Published var runtimeDiagnostics: RuntimeDiagnostics = .empty
     @Published var isHydratingChannels: Bool = true
+    @Published var recordingRepairStates: [String: RecordingRepairState] = [:]
+    @Published var recordingRepairSummary: RecordingRepairSummary = .empty
+    @Published var isRepairingFlaggedRecordings: Bool = false
+    @Published var isRecordingRepairScanActive: Bool = false
+    @Published var recordingRepairScanDetail: String?
+    @Published var backgroundWorkerWarnings: [String] = []
     
     var channelCount: Int {
         channels.count
@@ -255,14 +372,31 @@ class ChannelManager: ObservableObject {
     
     private let configURL: URL
     private let appConfigURL: URL
+    private let repairIndexURL: URL
+    private let auditCacheURL: URL
+    private let recordingLedgerBackfillMarkerURL: URL
+    private var repairedRecordingIndex: [String: RepairedRecordingIndexEntry] = [:]
+    private var auditCache: [String: RecordingAuditCacheEntry] = [:]
     private var pausedStatusCheckTask: Task<Void, Never>?
     private var offlineThumbnailBackfillTask: Task<Void, Never>?
     private var bioBackfillTask: Task<Void, Never>?
+    private var recordingLedgerMaintenanceTask: Task<Void, Never>?
+    private var mp4RepairTask: Task<Void, Never>?
+    private var recordingRepairRunTask: Task<Void, Never>?
+    private var backgroundWorkerWatchdogTask: Task<Void, Never>?
+    private var recordingRepairRootPath: String?
+    private var recordingRepairCurrentPath: String?
+    private var recordingRepairStopAfterCurrentItem = false
     private var pausedProbeIndex: Int = 0
+    private var lastPausedProbeDeferralLogAt: Date = .distantPast
     private var thumbnailBackfillIndex: Int = 0
+    private var thumbnailBackfillCooldownUntil: [String: Date] = [:]
     private var bioBackfillIndex: Int = 0
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
+    private let recordingLedger: RecordingLedger
+    private var backgroundWorkerLastHeartbeat: [BackgroundWorker: Date] = [:]
+    private var activeBackgroundWorkerAlerts: Set<BackgroundWorker> = []
     private var webServer: WebServer?
     private var webServerActivePort: Int = 0
     private var isShuttingDown = false
@@ -277,12 +411,22 @@ class ChannelManager: ObservableObject {
         try? FileManager.default.createDirectory(at: appFolder, withIntermediateDirectories: true)
         configURL = appFolder.appendingPathComponent("channels.json")
         appConfigURL = appFolder.appendingPathComponent("appconfig.json")
+        repairIndexURL = appFolder.appendingPathComponent("recording-repair-index.json")
+        auditCacheURL = appFolder.appendingPathComponent("recording-audit-cache.json")
+        recordingLedgerBackfillMarkerURL = appFolder.appendingPathComponent("recording-ledger-backfill.done")
         
         // Initialize with default, will update after loading config
         requestCoordinator = RequestCoordinator(maxConcurrent: 6)
         recordingCoordinator = RecordingCoordinator(maxConcurrent: 0)
+        recordingLedger = RecordingLedger.shared
+
+        Task {
+            await recordingLedger.initialize(appFolder: appFolder)
+        }
         
         loadAppConfig()
+        loadRepairIndex()
+        loadAuditCache()
 
         // Update with actual config value
         Task {
@@ -294,6 +438,8 @@ class ChannelManager: ObservableObject {
         loadConfig()
         startPausedStatusChecks()
         startOfflineThumbnailBackfill()
+        startRecordingLedgerMaintenance()
+        startBackgroundWorkerWatchdog()
         // Bio backfill is manual via on-demand refresh controls in Add Channel and Settings
         // startBioBackfill()
 
@@ -310,6 +456,10 @@ class ChannelManager: ObservableObject {
         pausedStatusCheckTask?.cancel()
         offlineThumbnailBackfillTask?.cancel()
         bioBackfillTask?.cancel()
+        recordingLedgerMaintenanceTask?.cancel()
+        mp4RepairTask?.cancel()
+        recordingRepairRunTask?.cancel()
+        backgroundWorkerWatchdogTask?.cancel()
         webServer?.stop()
     }
 
@@ -325,8 +475,25 @@ class ChannelManager: ObservableObject {
         offlineThumbnailBackfillTask = nil
         bioBackfillTask?.cancel()
         bioBackfillTask = nil
+        recordingLedgerMaintenanceTask?.cancel()
+        recordingLedgerMaintenanceTask = nil
+        backgroundWorkerWatchdogTask?.cancel()
+        backgroundWorkerWatchdogTask = nil
+        recordingRepairStopAfterCurrentItem = true
 
         stopWebServer()
+
+        if let mp4RepairTask {
+            await FileLogger.shared.log("[manager] waiting for recording repair scan to become idle")
+            await mp4RepairTask.value
+            self.mp4RepairTask = nil
+        }
+
+        if let recordingRepairRunTask {
+            await FileLogger.shared.log("[manager] waiting for active recording repair run to become idle")
+            await recordingRepairRunTask.value
+            self.recordingRepairRunTask = nil
+        }
 
         for (_, channel) in channels {
             await channel.shutdownForTermination()
@@ -345,12 +512,699 @@ class ChannelManager: ObservableObject {
             appConfig = config
             Task {
                 await FileLogger.shared.log("[manager] loaded app config")
+                await FileLogger.shared.pruneOldLogs(keepingDays: config.logRetentionDays)
             }
         } else {
             Task {
                 await FileLogger.shared.log("[manager] using default app config (no saved config found)")
+                await FileLogger.shared.pruneOldLogs(keepingDays: AppConfig().logRetentionDays)
             }
         }
+    }
+
+    private func loadRepairIndex() {
+        guard let data = try? Data(contentsOf: repairIndexURL),
+              let decoded = try? JSONDecoder().decode([String: RepairedRecordingIndexEntry].self, from: data) else {
+            repairedRecordingIndex = [:]
+            return
+        }
+        repairedRecordingIndex = decoded
+    }
+
+    private func saveRepairIndex() {
+        let snapshot = repairedRecordingIndex
+        let destination = repairIndexURL
+        DispatchQueue.global(qos: .utility).async {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: destination, options: .atomic)
+            }
+        }
+    }
+
+    private func loadAuditCache() {
+        guard let data = try? Data(contentsOf: auditCacheURL),
+              let decoded = try? JSONDecoder().decode([String: RecordingAuditCacheEntry].self, from: data) else {
+            auditCache = [:]
+            return
+        }
+        auditCache = decoded
+    }
+
+    private func saveAuditCache() {
+        let snapshot = auditCache
+        let destination = auditCacheURL
+        DispatchQueue.global(qos: .utility).async {
+            if let data = try? JSONEncoder().encode(snapshot) {
+                try? data.write(to: destination, options: .atomic)
+            }
+        }
+    }
+
+    /// Returns a cached decision if the file's size and modification date match the stored fingerprint.
+    private func cachedAuditDecision(for candidate: MP4RepairCandidate) -> RecordingRepairAuditDecision? {
+        guard let entry = auditCache[candidate.path] else { return nil }
+        guard entry.sizeBytes == candidate.sizeBytes,
+                            abs(candidate.modifiedAt.timeIntervalSince1970 - entry.modifiedAtUnix) < 2.0 else {
+            return nil
+        }
+        switch entry.decision {
+        case .good: return .good
+        case .optionalRemux: return .optionalRemux
+        case .needsRemux: return .needsRemux
+        }
+    }
+
+    /// Stores an audit decision for a candidate so future scans can skip re-auditing.
+    private func storeAuditDecision(_ decision: RecordingRepairAuditDecision, for candidate: MP4RepairCandidate) {
+        let cacheDecision: RecordingAuditCacheDecision
+        switch decision {
+        case .good: cacheDecision = .good
+        case .optionalRemux: cacheDecision = .optionalRemux
+        case .needsRemux: cacheDecision = .needsRemux
+        }
+        auditCache[candidate.path] = RecordingAuditCacheEntry(
+            sizeBytes: candidate.sizeBytes,
+            modifiedAtUnix: candidate.modifiedAt.timeIntervalSince1970,
+            decision: cacheDecision
+        )
+
+        // Persist incrementally so long-running scans survive relaunches.
+        saveAuditCache()
+    }
+
+    func ensureRecordingRepairMaintenanceRunning() {
+        let rootPath = appConfig.getOutputPath()
+
+        if recordingRepairRootPath == rootPath,
+           mp4RepairTask == nil,
+           !recordingRepairStates.isEmpty {
+            let hasUnresolvedStates = recordingRepairStates.values.contains { state in
+                switch state {
+                case .pendingScan, .scanning:
+                    return true
+                default:
+                    return false
+                }
+            }
+
+            if !hasUnresolvedStates {
+                return
+            }
+        }
+
+        if recordingRepairRootPath == rootPath, mp4RepairTask != nil {
+            return
+        }
+
+        mp4RepairTask?.cancel()
+        recordingRepairRootPath = rootPath
+        recordingRepairCurrentPath = nil
+        recordingRepairStopAfterCurrentItem = false
+        recordingRepairStates.removeAll(keepingCapacity: false)
+        recordingRepairSummary = .empty
+        isRecordingRepairScanActive = true
+        recordingRepairScanDetail = nil
+
+        mp4RepairTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+
+            let candidates = await Self.findAllMP4RepairCandidates(rootPath: rootPath)
+            await self.prepareRecordingRepairState(candidates: candidates)
+
+            guard !Task.isCancelled else {
+                await self.finishRecordingRepairMaintenance()
+                return
+            }
+
+            if candidates.isEmpty {
+                await FileLogger.shared.log("[manager] no mp4 recordings found for repair maintenance")
+                await self.finishRecordingRepairMaintenance()
+                return
+            }
+
+            await FileLogger.shared.log("[manager] starting recording repair maintenance for \(candidates.count) mp4 file(s)")
+
+            var remaining = candidates.count
+            for candidate in candidates {
+                let shouldStop = await self.shouldStopRecordingRepairAfterCurrentItem()
+                if Task.isCancelled || shouldStop {
+                    break
+                }
+
+                let existingState = await self.recordingRepairStateRaw(for: candidate.path)
+                if existingState != .pendingScan {
+                    remaining -= 1
+                    continue
+                }
+
+                await self.setRecordingRepairScanDetail(candidate.path)
+
+                var didAuditOnDisk = false
+
+                if await self.isAlreadyRepaired(path: candidate.path) {
+                    await self.setRecordingRepairState(.good, for: candidate.path)
+                    remaining -= 1
+                    await self.updateRecordingRepairSummary()
+                    continue
+                }
+
+                // Use persistent audit cache to avoid re-probing unchanged files.
+                if let cached = await self.cachedAuditDecision(for: candidate) {
+                    switch cached {
+                    case .good:
+                        await self.setRecordingRepairState(.good, for: candidate.path)
+                    case .optionalRemux, .needsRemux:
+                        await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                    }
+                    remaining -= 1
+                    await self.updateRecordingRepairSummary()
+                    continue
+                }
+
+                await self.setRecordingRepairState(.scanning, for: candidate.path)
+                let auditDecision = await Self.auditRecordingRepairCandidate(path: candidate.path)
+                await self.storeAuditDecision(auditDecision, for: candidate)
+                didAuditOnDisk = true
+
+                switch auditDecision {
+                case .good:
+                    await self.setRecordingRepairState(.good, for: candidate.path)
+                case .optionalRemux:
+                    // Mirror audit-remux-candidates.sh semantics: fragmented head alone
+                    // is optional, so surface it as a candidate but do not auto-remux.
+                    await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                case .needsRemux:
+                    await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                }
+
+                remaining -= 1
+                await self.updateRecordingRepairSummary()
+                if didAuditOnDisk && remaining > 0 {
+                    try? await Task.sleep(nanoseconds: 400_000_000)
+                }
+            }
+
+            await self.finishRecordingRepairMaintenance()
+            await self.saveAuditCache()
+        }
+    }
+
+    func startRepairForFlaggedRecordings() {
+        guard recordingRepairRunTask == nil else { return }
+
+        let flaggedPaths = recordingRepairStates
+            .filter { _, state in
+                switch state {
+                case .needsRemux, .failed:
+                    return true
+                default:
+                    return false
+                }
+            }
+            .map(\.key)
+
+        guard !flaggedPaths.isEmpty else { return }
+
+        let sortedPaths = flaggedPaths.sorted { lhs, rhs in
+            let lhsDate = (try? URL(fileURLWithPath: lhs).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            let rhsDate = (try? URL(fileURLWithPath: rhs).resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? Date.distantPast
+            if lhsDate == rhsDate {
+                return lhs.localizedStandardCompare(rhs) == .orderedAscending
+            }
+            return lhsDate > rhsDate
+        }
+
+        recordingRepairStopAfterCurrentItem = false
+        isRepairingFlaggedRecordings = true
+
+        recordingRepairRunTask = Task.detached(priority: .utility) { [weak self] in
+            guard let self else { return }
+
+            for path in sortedPaths {
+                let shouldStop = await self.shouldStopRecordingRepairAfterCurrentItem()
+                if Task.isCancelled || shouldStop {
+                    break
+                }
+
+                let currentState = await self.recordingRepairStateRaw(for: path)
+                guard currentState == .needsRemux || {
+                    if case .failed = currentState { return true }
+                    return false
+                }() else {
+                    continue
+                }
+
+                await self.setRecordingRepairState(.queued, for: path)
+                await self.setRecordingRepairCurrentPath(path)
+                await self.setRecordingRepairState(.remuxing, for: path)
+
+                let channelName = URL(fileURLWithPath: path)
+                    .deletingLastPathComponent()
+                    .lastPathComponent
+                let repairFailure = await Channel.repairExistingMP4(path: path, channel: channelName)
+
+                await self.setRecordingRepairCurrentPath(nil)
+                if let repairFailure {
+                    await self.setRecordingRepairState(.failed(repairFailure), for: path)
+                } else {
+                    await self.markRecordingAsRepaired(path: path)
+                    await self.setRecordingRepairState(.repaired, for: path)
+                }
+            }
+
+            await self.finishRecordingRepairRun()
+        }
+    }
+
+    private static func findAllMP4RepairCandidates(rootPath: String) async -> [MP4RepairCandidate] {
+        await Task.detached(priority: .utility) {
+            let fm = FileManager.default
+            let normalizedRoot = (rootPath as NSString).expandingTildeInPath
+            let rootURL = URL(fileURLWithPath: normalizedRoot, isDirectory: true)
+
+            var isDirectory: ObjCBool = false
+            guard fm.fileExists(atPath: rootURL.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+                return []
+            }
+
+            let resourceKeys: Set<URLResourceKey> = [.isRegularFileKey, .isDirectoryKey, .contentModificationDateKey, .fileSizeKey]
+            guard let enumerator = fm.enumerator(
+                at: rootURL,
+                includingPropertiesForKeys: Array(resourceKeys),
+                options: [.skipsHiddenFiles, .skipsPackageDescendants]
+            ) else {
+                return []
+            }
+
+            var candidates: [MP4RepairCandidate] = []
+
+            while let fileURL = enumerator.nextObject() as? URL {
+                if let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                   values.isDirectory == true,
+                   fileURL.lastPathComponent.lowercased().hasPrefix("remux-test") {
+                    enumerator.skipDescendants()
+                    continue
+                }
+
+                let lowerName = fileURL.lastPathComponent.lowercased()
+                if lowerName.contains("_finalizing_") || lowerName.contains(".sb-") {
+                    continue
+                }
+
+                guard fileURL.pathExtension.lowercased() == "mp4" else { continue }
+
+                guard let values = try? fileURL.resourceValues(forKeys: resourceKeys),
+                      values.isRegularFile == true else {
+                    continue
+                }
+
+                let modifiedAt = values.contentModificationDate ?? Date.distantPast
+
+                let sizeBytes = Int64(values.fileSize ?? 0)
+                guard sizeBytes > 0 else { continue }
+
+                let channelName = fileURL.deletingLastPathComponent().lastPathComponent
+                candidates.append(MP4RepairCandidate(path: fileURL.path, channelName: channelName, modifiedAt: modifiedAt, sizeBytes: sizeBytes))
+            }
+
+            candidates.sort { lhs, rhs in
+                if lhs.modifiedAt == rhs.modifiedAt {
+                    return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+                }
+                return lhs.modifiedAt > rhs.modifiedAt
+            }
+            return candidates
+        }.value
+    }
+
+    private static func auditRecordingRepairCandidate(path: String) async -> RecordingRepairAuditDecision {
+        await Task.detached(priority: .utility) {
+            let fileURL = URL(fileURLWithPath: path)
+            let fm = FileManager.default
+            guard fm.fileExists(atPath: fileURL.path) else {
+                return .good
+            }
+
+            let fileSize = (try? fm.attributesOfItem(atPath: fileURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+            guard fileSize > 0 else {
+                return .good
+            }
+
+            do {
+                let metrics = try collectRecordingAuditMetrics(fileURL: fileURL, fileSize: fileSize)
+
+                // Duration checks are skipped entirely when ffprobe is unavailable
+                // (nil means we couldn't run ffprobe, not that the file is broken).
+                let durationMetadataMismatch: Bool
+                switch (metrics.formatDuration, metrics.videoDuration) {
+                case let (fd?, vd?):
+                    durationMetadataMismatch =
+                        (fd <= 0.1 && metrics.fileSize > 100 * 1024 * 1024)
+                        || (vd <= 0.1 && metrics.fileSize > 100 * 1024 * 1024)
+                        || (fd > 0 && vd > 0 && abs(fd - vd) > 15)
+                case let (fd?, nil):
+                    durationMetadataMismatch = fd <= 0.1 && metrics.fileSize > 100 * 1024 * 1024
+                case let (nil, vd?):
+                    durationMetadataMismatch = vd <= 0.1 && metrics.fileSize > 100 * 1024 * 1024
+                case (nil, nil):
+                    // ffprobe not available; skip duration checks
+                    durationMetadataMismatch = false
+                }
+
+                let shortForSize: Bool
+                if let fd = metrics.formatDuration {
+                    shortForSize = fd > 0 && fd < 180 && metrics.fileSize > 800 * 1024 * 1024
+                } else {
+                    shortForSize = false
+                }
+
+                if metrics.malformedBoxes || durationMetadataMismatch || shortForSize {
+                    return .needsRemux
+                }
+
+                if metrics.moofInHead {
+                    return .optionalRemux
+                }
+
+                return .good
+            } catch {
+                // Propagate only genuine I/O failures as good (unknown), not needsRemux.
+                // A catch here means collectRecordingAuditMetrics itself threw, which
+                // currently does not happen; leave as good to avoid false positives.
+                return .good
+            }
+        }.value
+    }
+
+    /// Resolves the ffprobe binary from well-known install locations.
+    /// GUI apps do not inherit the shell PATH, so /usr/bin/env cannot find Homebrew tools.
+    private nonisolated static func resolveFFProbePath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffprobe",   // Apple Silicon Homebrew
+            "/usr/local/bin/ffprobe",       // Intel Homebrew / MacPorts
+            "/usr/bin/ffprobe",             // system install
+        ]
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private nonisolated static func collectRecordingAuditMetrics(fileURL: URL, fileSize: Int64) throws -> RecordingAuditMetrics {
+        // Resolve ffprobe once; if unavailable, duration fields remain nil and
+        // duration-based checks are skipped to avoid false positives.
+        let ffprobePath = resolveFFProbePath()
+
+        let formatDuration: Double? = ffprobePath.flatMap { path in
+            runFFProbeDuration(ffprobePath: path, arguments: ["-show_entries", "format=duration"], fileURL: fileURL)
+        }
+        let videoDuration: Double? = ffprobePath.flatMap { path in
+            runFFProbeDuration(ffprobePath: path, arguments: ["-select_streams", "v:0", "-show_entries", "stream=duration"], fileURL: fileURL)
+        }
+
+        let headFlags = parseHeadBoxFlags(fileURL: fileURL, fileSize: fileSize, maxBytes: 12 * 1024 * 1024)
+        let malformedBoxes = hasMalformedTopLevelBoxes(fileURL: fileURL, fileSize: fileSize)
+
+        return RecordingAuditMetrics(
+            formatDuration: formatDuration,
+            videoDuration: videoDuration,
+            fileSize: fileSize,
+            moovInHead: headFlags.moovInHead,
+            moofInHead: headFlags.moofInHead,
+            malformedBoxes: malformedBoxes
+        )
+    }
+
+    private nonisolated static func runFFProbeDuration(ffprobePath: String, arguments: [String], fileURL: URL) -> Double? {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: ffprobePath)
+        process.arguments = ["-v", "error"]
+            + arguments
+            + ["-of", "default=nokey=1:noprint_wrappers=1", fileURL.path]
+
+        let stdout = Pipe()
+        let stderr = Pipe()
+        process.standardOutput = stdout
+        process.standardError = stderr
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+            guard process.terminationStatus == 0 else { return nil }
+            let data = stdout.fileHandleForReading.readDataToEndOfFile()
+            let raw = String(decoding: data, as: UTF8.self)
+                .split(whereSeparator: \ .isNewline)
+                .first
+                .map(String.init)
+            guard let raw else { return nil }
+            return Double(raw)
+        } catch {
+            return nil
+        }
+    }
+
+    private nonisolated static func parseHeadBoxFlags(fileURL: URL, fileSize: Int64, maxBytes: Int) -> HeadBoxFlags {
+        let readLimit = min(UInt64(maxBytes), UInt64(max(fileSize, 0)))
+        guard readLimit >= 8 else {
+            return HeadBoxFlags(moovInHead: false, moofInHead: false)
+        }
+
+        do {
+            let handle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? handle.close() }
+
+            var offset: UInt64 = 0
+            var moov = false
+            var moof = false
+
+            while offset + 8 <= readLimit {
+                try handle.seek(toOffset: offset)
+                guard let header = try handle.read(upToCount: 8), header.count == 8 else { break }
+
+                let size32 = Int(header.prefix(4).reduce(0) { ($0 << 8) | Int($1) })
+                let type = String(decoding: header.suffix(4), as: UTF8.self)
+                var boxSize = UInt64(size32)
+                var headerSize: UInt64 = 8
+
+                if size32 == 0 {
+                    boxSize = UInt64(fileSize) - offset
+                } else if size32 == 1 {
+                    guard let ext = try handle.read(upToCount: 8), ext.count == 8 else { break }
+                    boxSize = UInt64(ext.reduce(0) { ($0 << 8) | UInt64($1) })
+                    headerSize = 16
+                }
+
+                if boxSize < headerSize {
+                    break
+                }
+
+                if type == "moov" { moov = true }
+                if type == "moof" { moof = true }
+                if moov && moof { break }
+
+                if offset + boxSize > readLimit {
+                    break
+                }
+                offset += boxSize
+            }
+
+            return HeadBoxFlags(moovInHead: moov, moofInHead: moof)
+        } catch {
+            return HeadBoxFlags(moovInHead: false, moofInHead: false)
+        }
+    }
+
+    private nonisolated static func hasMalformedTopLevelBoxes(fileURL: URL, fileSize: Int64) -> Bool {
+        do {
+            let handle = try FileHandle(forReadingFrom: fileURL)
+            defer { try? handle.close() }
+
+            var offset: UInt64 = 0
+            while offset + 8 <= UInt64(fileSize) {
+                try handle.seek(toOffset: offset)
+                guard let header = try handle.read(upToCount: 8), header.count == 8 else {
+                    return true
+                }
+
+                let size32 = Int(header.prefix(4).reduce(0) { ($0 << 8) | Int($1) })
+                var boxSize = UInt64(size32)
+                var headerSize: UInt64 = 8
+
+                if size32 == 0 {
+                    boxSize = UInt64(fileSize) - offset
+                } else if size32 == 1 {
+                    guard let extended = try handle.read(upToCount: 8), extended.count == 8 else {
+                        return true
+                    }
+                    boxSize = UInt64(extended.reduce(0) { ($0 << 8) | UInt64($1) })
+                    headerSize = 16
+                }
+
+                if boxSize < headerSize || offset + boxSize > UInt64(fileSize) {
+                    return true
+                }
+
+                offset += boxSize
+            }
+
+            return false
+        } catch {
+            return true
+        }
+    }
+
+    private func prepareRecordingRepairState(candidates: [MP4RepairCandidate]) {
+        var nextStates: [String: RecordingRepairState] = [:]
+        nextStates.reserveCapacity(candidates.count)
+        for candidate in candidates {
+            if isAlreadyRepaired(candidate: candidate) {
+                nextStates[candidate.path] = .good
+            } else if let cachedDecision = cachedAuditDecision(for: candidate) {
+                switch cachedDecision {
+                case .good:
+                    nextStates[candidate.path] = .good
+                case .optionalRemux, .needsRemux:
+                    nextStates[candidate.path] = .needsRemux
+                }
+            } else {
+                nextStates[candidate.path] = .pendingScan
+            }
+        }
+        recordingRepairStates = nextStates
+        updateRecordingRepairSummary()
+    }
+
+    private func isAlreadyRepaired(candidate: MP4RepairCandidate) -> Bool {
+        guard let entry = repairedRecordingIndex[candidate.path] else {
+            return false
+        }
+        return entry.sizeBytes == candidate.sizeBytes
+            && abs(candidate.modifiedAt.timeIntervalSince1970 - entry.modifiedAtUnix) < 2.0
+    }
+
+    private func setRecordingRepairState(_ state: RecordingRepairState, for path: String) {
+        recordingRepairStates[path] = state
+        updateRecordingRepairSummary()
+    }
+
+    private func setRecordingRepairCurrentPath(_ path: String?) {
+        recordingRepairCurrentPath = path
+    }
+
+    private func setRecordingRepairScanDetail(_ path: String?) {
+        recordingRepairScanDetail = path.map { ($0 as NSString).lastPathComponent }
+    }
+
+    private func recordingRepairStateRaw(for path: String) -> RecordingRepairState {
+        recordingRepairStates[path] ?? .pendingScan
+    }
+
+    private func isAlreadyRepaired(path: String) -> Bool {
+        guard let entry = repairedRecordingIndex[path] else {
+            return false
+        }
+
+        let fileURL = URL(fileURLWithPath: path)
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let fileSize = values.fileSize,
+              let modifiedAt = values.contentModificationDate else {
+            return false
+        }
+
+        let modifiedAtUnix = modifiedAt.timeIntervalSince1970
+        return Int64(fileSize) == entry.sizeBytes && abs(modifiedAtUnix - entry.modifiedAtUnix) < 2.0
+    }
+
+    private func markRecordingAsRepaired(path: String) {
+        let fileURL = URL(fileURLWithPath: path)
+        guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
+              let fileSize = values.fileSize,
+              let modifiedAt = values.contentModificationDate else {
+            return
+        }
+
+        repairedRecordingIndex[path] = RepairedRecordingIndexEntry(
+            sizeBytes: Int64(fileSize),
+            modifiedAtUnix: modifiedAt.timeIntervalSince1970
+        )
+        saveRepairIndex()
+    }
+
+    private func shouldStopRecordingRepairAfterCurrentItem() -> Bool {
+        recordingRepairStopAfterCurrentItem
+    }
+
+    private func finishRecordingRepairMaintenance() {
+        mp4RepairTask = nil
+        isRecordingRepairScanActive = false
+        recordingRepairScanDetail = nil
+        updateRecordingRepairSummary()
+    }
+
+    private func finishRecordingRepairRun() {
+        recordingRepairCurrentPath = nil
+        recordingRepairRunTask = nil
+        isRepairingFlaggedRecordings = false
+        updateRecordingRepairSummary()
+    }
+
+    private func updateRecordingRepairSummary() {
+        var pendingScan = 0
+        var scanning = 0
+        var good = 0
+        var needsRemux = 0
+        var queued = 0
+        var remuxing = 0
+        var repaired = 0
+        var failed = 0
+
+        for state in recordingRepairStates.values {
+            switch state {
+            case .pendingScan:
+                pendingScan += 1
+            case .scanning:
+                scanning += 1
+            case .good:
+                good += 1
+            case .needsRemux:
+                needsRemux += 1
+            case .queued:
+                queued += 1
+            case .remuxing:
+                remuxing += 1
+            case .repaired:
+                repaired += 1
+            case .failed:
+                failed += 1
+            case .unsupported:
+                break
+            }
+        }
+
+        recordingRepairSummary = RecordingRepairSummary(
+            pendingScan: pendingScan,
+            scanning: scanning,
+            good: good,
+            needsRemux: needsRemux,
+            queued: queued,
+            remuxing: remuxing,
+            repaired: repaired,
+            failed: failed
+        )
+    }
+
+    func recordingRepairState(for path: String, fileExtension: String) -> RecordingRepairState {
+        if fileExtension.lowercased() != "mp4" {
+            return .unsupported
+        }
+        return recordingRepairStates[path] ?? .pendingScan
+    }
+
+    func terminationBlockReason() -> String? {
+        guard let currentPath = recordingRepairCurrentPath else {
+            if isRepairingFlaggedRecordings {
+                return "Recording remux is active. Please wait for the current remux to finish before quitting."
+            }
+            return nil
+        }
+        return "Recording repair in progress for \((currentPath as NSString).lastPathComponent). Please wait for the current remux to finish before quitting."
     }
     
     func saveAppConfig() {
@@ -417,48 +1271,75 @@ class ChannelManager: ObservableObject {
         saveAppConfig()
     }
     
-    func createChannel(config: ChannelConfig) async throws {
-        await FileLogger.shared.log("[manager] create channel requested", channel: config.username)
-
-        guard channels[config.username] == nil else {
-            await FileLogger.shared.log("[manager] create channel rejected: already exists", channel: config.username, level: "WARN")
-            throw ChaturbateError.networkError("Channel \(config.username) already exists")
+    func createChannel(config: ChannelConfig) async throws -> String {
+        let sanitizedUsername = sanitizeUsername(config.username)
+        guard !sanitizedUsername.isEmpty else {
+            throw ChaturbateError.networkError("Username cannot be empty")
         }
+
+        await FileLogger.shared.log("[manager] create channel requested", channel: sanitizedUsername)
+
+        let duplicateUsername = channels.keys.first(where: { $0.lowercased() == sanitizedUsername.lowercased() })
+        guard duplicateUsername == nil else {
+            await FileLogger.shared.log("[manager] create channel rejected: already exists", channel: sanitizedUsername, level: "WARN")
+            throw ChaturbateError.networkError("Channel \(duplicateUsername ?? sanitizedUsername) already exists")
+        }
+
+        let normalizedConfig = ChannelConfig(
+            isPaused: config.isPaused,
+            username: sanitizedUsername,
+            outputDirectory: config.outputDirectory,
+            framerate: config.framerate,
+            resolution: config.resolution,
+            pattern: config.pattern,
+            maxDuration: config.maxDuration,
+            maxFilesize: config.maxFilesize,
+            maxSessionDuration: config.maxSessionDuration,
+            maxSessionFilesize: config.maxSessionFilesize,
+            createdAt: config.createdAt,
+            lastOnlineAt: config.lastOnlineAt,
+            recordingHistory: config.recordingHistory,
+            isInvalid: config.isInvalid,
+            bioMetadata: config.bioMetadata
+        )
 
         // Validate channel existence (404 means it was deleted/never existed).
         let validator = ChaturbateClient(config: appConfig)
         do {
-            try await validator.validateChannel(username: config.username)
+            try await validator.validateChannel(username: sanitizedUsername)
         } catch ChaturbateError.invalidChannel {
-            await FileLogger.shared.log("[manager] create channel rejected: invalid/404", channel: config.username, level: "WARN")
+            await FileLogger.shared.log("[manager] create channel rejected: invalid/404", channel: sanitizedUsername, level: "WARN")
             throw ChaturbateError.invalidChannel
         } catch {
             // Do not block create on temporary/network/offline/private errors.
-            await FileLogger.shared.log("[manager] channel validation non-fatal error: \(error.localizedDescription)", channel: config.username, level: "WARN")
+            await FileLogger.shared.log("[manager] channel validation non-fatal error: \(error.localizedDescription)", channel: sanitizedUsername, level: "WARN")
         }
         
         let channel = Channel(
-            config: config,
+            config: normalizedConfig,
             appConfig: appConfig,
             requestCoordinator: requestCoordinator,
-            recordingCoordinator: recordingCoordinator
+            recordingCoordinator: recordingCoordinator,
+            recordingLedger: recordingLedger
         )
-        channels[config.username] = channel
+        channels[sanitizedUsername] = channel
         
         // Save immediately
         await saveConfig()
         
-        if !config.isPaused {
+        if !normalizedConfig.isPaused {
             await channel.resume()
         }
 
-        await FileLogger.shared.log("[manager] channel created", channel: config.username)
+        await FileLogger.shared.log("[manager] channel created", channel: sanitizedUsername)
         
         // Fetch bio metadata asynchronously (non-blocking)
-        let username = config.username
+        let username = sanitizedUsername
         Task {
             await self.refreshBioMetadata(username: username)
         }
+
+        return sanitizedUsername
     }
     
     func pauseChannel(username: String) async {
@@ -538,6 +1419,7 @@ class ChannelManager: ObservableObject {
             await channel.renameUsername(to: targetUsername)
             channels.removeValue(forKey: username)
             channels[targetUsername] = channel
+            await recordingLedger.renameChannel(oldUsername: username, newUsername: targetUsername)
             await FileLogger.shared.log("[manager] channel renamed from \(username) to \(targetUsername)", channel: targetUsername)
         }
 
@@ -569,6 +1451,42 @@ class ChannelManager: ObservableObject {
     
     func getChannelInfo(username: String) async -> ChannelInfo? {
         guard let channel = channels[username] else { return nil }
+        return await channel.getInfo()
+    }
+
+    func getRecordingLibraryEntries() async -> [RecordingLedgerEntry] {
+        await recordingLedger.fetchLibraryEntries(includeMissing: false)
+    }
+
+    func markRecordingMovedToTrash(path: String) async {
+        let normalizedPath = (path as NSString).expandingTildeInPath
+        await recordingLedger.markRecordingMovedToTrash(filePath: normalizedPath)
+
+        recordingRepairStates.removeValue(forKey: normalizedPath)
+        repairedRecordingIndex.removeValue(forKey: normalizedPath)
+        auditCache.removeValue(forKey: normalizedPath)
+
+        updateRecordingRepairSummary()
+        saveRepairIndex()
+        saveAuditCache()
+    }
+
+    func getChannelRecordingPaths(username: String) async -> [String] {
+        let entries = await recordingLedger.fetchChannelRecordingEntries(
+            username: username,
+            includeMissing: false
+        )
+        return entries.map(\ .path)
+    }
+
+    func refreshLiveStreamURL(username: String) async -> String? {
+        guard let channel = channels[username] else { return nil }
+        return await channel.refreshLiveStreamURLForPlayback()
+    }
+
+    func refreshChannelStatusForDetail(username: String, refreshPausedThumbnail: Bool = false) async -> ChannelInfo? {
+        guard let channel = channels[username] else { return nil }
+        await channel.refreshStatusForDetailView(refreshPausedThumbnail: refreshPausedThumbnail)
         return await channel.getInfo()
     }
     
@@ -786,7 +1704,8 @@ class ChannelManager: ObservableObject {
                 config: config,
                 appConfig: appConfig,
                 requestCoordinator: requestCoordinator,
-                recordingCoordinator: recordingCoordinator
+                recordingCoordinator: recordingCoordinator,
+                recordingLedger: recordingLedger
             )
             channels[config.username] = channel
             importedChannels.append(channel)
@@ -884,7 +1803,8 @@ class ChannelManager: ObservableObject {
                 config: config,
                 appConfig: appConfig,
                 requestCoordinator: requestCoordinator,
-                recordingCoordinator: recordingCoordinator
+                recordingCoordinator: recordingCoordinator,
+                recordingLedger: recordingLedger
             )
             channels[config.username] = channel
             importedChannels.append(channel)
@@ -949,7 +1869,8 @@ class ChannelManager: ObservableObject {
                     config: config,
                     appConfig: appConfig,
                     requestCoordinator: requestCoordinator,
-                    recordingCoordinator: recordingCoordinator
+                    recordingCoordinator: recordingCoordinator,
+                    recordingLedger: recordingLedger
                 )
                 channels[config.username] = channel
                 
@@ -1071,6 +1992,7 @@ class ChannelManager: ObservableObject {
 
     private func startPausedStatusChecks() {
         pausedStatusCheckTask?.cancel()
+        noteBackgroundWorkerHeartbeat(.pausedStatus)
         Task {
             await FileLogger.shared.log("[manager] started paused status checks")
         }
@@ -1078,16 +2000,25 @@ class ChannelManager: ObservableObject {
             guard let self else { return }
 
             while !Task.isCancelled {
+                self.noteBackgroundWorkerHeartbeat(.pausedStatus)
+                let checksPerCycle = self.appConfig.recordingEnabled ? 2 : 1
+                let sleepNanoseconds: UInt64 = self.appConfig.recordingEnabled
+                    ? 8 * 1_000_000_000
+                    : 30 * 1_000_000_000
                 // Probe multiple paused channels per cycle so large imports
                 // don't take an hour+ to get an initial online flag.
-                await self.checkPausedChannelStatusBatch(maxChecks: 3)
-                try? await Task.sleep(nanoseconds: 6 * 1_000_000_000)
+                // Keep this intentionally conservative to avoid starving
+                // foreground playback/detail probes.
+                await self.checkPausedChannelStatusBatch(maxChecks: checksPerCycle)
+                self.noteBackgroundWorkerHeartbeat(.pausedStatus)
+                try? await Task.sleep(nanoseconds: sleepNanoseconds)
             }
         }
     }
 
     private func startOfflineThumbnailBackfill() {
         offlineThumbnailBackfillTask?.cancel()
+        noteBackgroundWorkerHeartbeat(.thumbnailBackfill)
         Task {
             await FileLogger.shared.log("[manager] started offline thumbnail backfill")
         }
@@ -1098,21 +2029,166 @@ class ChannelManager: ObservableObject {
             try? await Task.sleep(nanoseconds: 20 * 1_000_000_000)
 
             while !Task.isCancelled {
+                self.noteBackgroundWorkerHeartbeat(.thumbnailBackfill)
+
+                // Background thumbnail generation is not essential while
+                // recording is globally paused; keep this worker mostly idle.
+                if !self.appConfig.recordingEnabled {
+                    try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
+                    self.noteBackgroundWorkerHeartbeat(.thumbnailBackfill)
+                    continue
+                }
+
                 await FileLogger.shared.logBackfillCycleStart()
                 await self.backfillOneOfflineThumbnail()
                 await FileLogger.shared.logBackfillCycleEnd()
+                self.noteBackgroundWorkerHeartbeat(.thumbnailBackfill)
                 // One channel at a time keeps disk usage smooth on large libraries.
                 try? await Task.sleep(nanoseconds: 20 * 1_000_000_000)
             }
         }
     }
 
+    private func startRecordingLedgerMaintenance() {
+        recordingLedgerMaintenanceTask?.cancel()
+        noteBackgroundWorkerHeartbeat(.ledgerMaintenance)
+        recordingLedgerMaintenanceTask = Task { [weak self] in
+            guard let self else { return }
+
+            await FileLogger.shared.log("[manager] started recording ledger maintenance")
+            try? await Task.sleep(nanoseconds: 8 * 1_000_000_000)
+
+            if self.hasCompletedInitialLedgerBackfill() {
+                await FileLogger.shared.log("[manager] skipping initial recording ledger backfill (marker present)")
+            } else {
+                let initialConfigs = await self.getAllChannelConfigs()
+                let repairedPaths = Set(self.repairedRecordingIndex.keys)
+                let backfill = await self.recordingLedger.backfillExistingRecordings(
+                    channelConfigs: initialConfigs,
+                    defaultOutputRoot: self.appConfig.getOutputPath(),
+                    repairedPaths: repairedPaths
+                )
+
+                self.markInitialLedgerBackfillComplete(backfill: backfill)
+                await FileLogger.shared.log(
+                    "[manager] recording ledger backfill complete: inserted=\(backfill.inserted), existing=\(backfill.skippedExisting), missing=\(backfill.missingAdded)"
+                )
+            }
+
+            while !Task.isCancelled {
+                self.noteBackgroundWorkerHeartbeat(.ledgerMaintenance)
+                let reconcile = await self.recordingLedger.reconcileFilesystem(rootPath: self.appConfig.getOutputPath())
+                if reconcile.missing > 0 || reconcile.moved > 0 || reconcile.recovered > 0 {
+                    await FileLogger.shared.log(
+                        "[manager] recording ledger reconcile: checked=\(reconcile.checked), moved=\(reconcile.moved), missing=\(reconcile.missing), recovered=\(reconcile.recovered)",
+                        level: "WARN"
+                    )
+                }
+                self.noteBackgroundWorkerHeartbeat(.ledgerMaintenance)
+
+                try? await Task.sleep(nanoseconds: 3 * 60 * 1_000_000_000)
+            }
+        }
+    }
+
+    private func startBackgroundWorkerWatchdog() {
+        backgroundWorkerWatchdogTask?.cancel()
+        for worker in BackgroundWorker.allCases {
+            backgroundWorkerLastHeartbeat[worker] = Date()
+        }
+
+        backgroundWorkerWatchdogTask = Task { [weak self] in
+            guard let self else { return }
+            while !Task.isCancelled {
+                await self.evaluateBackgroundWorkerHealth()
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
+            }
+        }
+    }
+
+    private func noteBackgroundWorkerHeartbeat(_ worker: BackgroundWorker) {
+        backgroundWorkerLastHeartbeat[worker] = Date()
+    }
+
+    private func evaluateBackgroundWorkerHealth() async {
+        let now = Date()
+        var warnings: [String] = []
+
+        for worker in BackgroundWorker.allCases {
+            guard let lastHeartbeat = backgroundWorkerLastHeartbeat[worker] else { continue }
+            let lagSeconds = now.timeIntervalSince(lastHeartbeat)
+            if lagSeconds > worker.staleThresholdSeconds {
+                let warning = "\(worker.rawValue) appears stale (last heartbeat \(Int(lagSeconds))s ago)"
+                warnings.append(warning)
+
+                if !activeBackgroundWorkerAlerts.contains(worker) {
+                    activeBackgroundWorkerAlerts.insert(worker)
+                    await FileLogger.shared.log("[manager] watchdog: \(warning)", level: "WARN")
+                    restartBackgroundWorker(worker)
+                }
+            } else if activeBackgroundWorkerAlerts.contains(worker) {
+                activeBackgroundWorkerAlerts.remove(worker)
+                await FileLogger.shared.log("[manager] watchdog: \(worker.rawValue) heartbeat recovered")
+            }
+        }
+
+        backgroundWorkerWarnings = warnings.sorted()
+    }
+
+    private func restartBackgroundWorker(_ worker: BackgroundWorker) {
+        Task {
+            await FileLogger.shared.log("[manager] watchdog: restarting \(worker.rawValue)", level: "WARN")
+        }
+
+        switch worker {
+        case .pausedStatus:
+            startPausedStatusChecks()
+        case .thumbnailBackfill:
+            startOfflineThumbnailBackfill()
+        case .ledgerMaintenance:
+            startRecordingLedgerMaintenance()
+        }
+    }
+
+    private func hasCompletedInitialLedgerBackfill() -> Bool {
+        FileManager.default.fileExists(atPath: recordingLedgerBackfillMarkerURL.path)
+    }
+
+    private func markInitialLedgerBackfillComplete(backfill: RecordingBackfillSummary) {
+        let formatter = ISO8601DateFormatter()
+        let timestamp = formatter.string(from: Date())
+        let marker = [
+            "completed_at=\(timestamp)",
+            "inserted=\(backfill.inserted)",
+            "existing=\(backfill.skippedExisting)",
+            "missing=\(backfill.missingAdded)"
+        ].joined(separator: "\n")
+
+        do {
+            try marker.write(to: recordingLedgerBackfillMarkerURL, atomically: true, encoding: String.Encoding.utf8)
+        } catch {
+            Task {
+                await FileLogger.shared.log(
+                    "[manager] failed to write recording ledger backfill marker: \(error.localizedDescription)",
+                    level: "WARN"
+                )
+            }
+        }
+    }
+
     private func backfillOneOfflineThumbnail() async {
         var candidates: [(String, Channel)] = []
+        let now = Date()
+
+        // Drop expired cooldown entries before scanning for work.
+        thumbnailBackfillCooldownUntil = thumbnailBackfillCooldownUntil.filter { _, until in
+            until > now
+        }
 
         for (username, channel) in channels {
             let info = await channel.getInfo()
-            if !info.isOnline, info.thumbnailPath == nil {
+            let coolingDown = thumbnailBackfillCooldownUntil[username].map { $0 > now } ?? false
+            if !coolingDown, !info.isOnline, info.thumbnailPath == nil {
                 candidates.append((username, channel))
             }
         }
@@ -1135,7 +2211,9 @@ class ChannelManager: ObservableObject {
         let timeoutNanos: UInt64 = 30 * 1_000_000_000
         
         do {
-            try await withThrowingTaskGroup(of: Void.self) { group in
+            var backfillResult: Channel.OfflineThumbnailBackfillResult?
+
+            try await withThrowingTaskGroup(of: Channel.OfflineThumbnailBackfillResult.self) { group in
                 group.addTask {
                     await channel.backfillOfflineThumbnailIfNeeded()
                 }
@@ -1146,10 +2224,25 @@ class ChannelManager: ObservableObject {
                 }
                 
                 // Wait for first result (either completion or timeout)
-                while let _ = try await group.next() {
+                while let result = try await group.next() {
+                    backfillResult = result
                     group.cancelAll()
                     break
                 }
+            }
+
+            switch backfillResult {
+            case .noVideoCandidate:
+                let until = Date().addingTimeInterval(Self.thumbnailBackfillNoVideoCooldownSeconds)
+                thumbnailBackfillCooldownUntil[username] = until
+                await FileLogger.shared.log(
+                    "Thumbnail backfill: no video candidate cooldown active for \(Int(Self.thumbnailBackfillNoVideoCooldownSeconds))s",
+                    channel: username
+                )
+            case .generated:
+                thumbnailBackfillCooldownUntil.removeValue(forKey: username)
+            default:
+                break
             }
         } catch {
             if error is TimeoutError {
@@ -1211,6 +2304,21 @@ class ChannelManager: ObservableObject {
 
     private func checkPausedChannelStatusBatch(maxChecks: Int) async {
         guard maxChecks > 0 else { return }
+
+        let requestStats = await requestCoordinator.getStats()
+        let queueBusy = requestStats.queuedRequests > 0
+            || requestStats.activeRequests >= max(1, requestStats.maxConcurrent - 1)
+
+        if queueBusy {
+            let now = Date()
+            if now.timeIntervalSince(lastPausedProbeDeferralLogAt) >= 30 {
+                lastPausedProbeDeferralLogAt = now
+                await FileLogger.shared.log(
+                    "[manager] deferring paused status probes (request queue busy: active=\(requestStats.activeRequests)/\(requestStats.maxConcurrent), queued=\(requestStats.queuedRequests))"
+                )
+            }
+            return
+        }
 
         var pausedChannels: [(String, Channel)] = []
 

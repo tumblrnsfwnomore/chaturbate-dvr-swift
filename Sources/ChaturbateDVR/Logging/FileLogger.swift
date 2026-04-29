@@ -90,4 +90,21 @@ actor FileLogger {
     func logLiveThumbnailFailure(channel: String, error: String) {
         log("Live thumbnail: ✗ failed - \(error)", channel: channel, level: "WARN")
     }
+
+    func pruneOldLogs(keepingDays days: Int) {
+        guard days > 0 else { return }
+        let cutoff = Calendar.current.date(byAdding: .day, value: -days, to: Date()) ?? Date()
+        guard let files = try? FileManager.default.contentsOfDirectory(
+            at: logDirectory,
+            includingPropertiesForKeys: [.creationDateKey],
+            options: .skipsHiddenFiles
+        ) else { return }
+
+        for file in files where file.pathExtension == "log" {
+            let attrs = try? file.resourceValues(forKeys: [.creationDateKey])
+            if let created = attrs?.creationDate, created < cutoff {
+                try? FileManager.default.removeItem(at: file)
+            }
+        }
+    }
 }
