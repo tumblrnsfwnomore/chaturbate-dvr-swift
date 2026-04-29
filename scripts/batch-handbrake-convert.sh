@@ -6,16 +6,22 @@ usage() {
 Batch-convert recordings with HandBrakeCLI.
 
 Usage:
-  ./scripts/batch-handbrake-convert.sh --input <dir> [options]
+  ./scripts/batch-handbrake-convert.sh --input <file|dir> [options]
 
 Options:
-  --input <dir>          Root directory to scan recursively (required)
+  --input <file|dir>     File or directory to convert (required; directory is scanned recursively)
   --workers <n>          Concurrent conversions (default: 1)
   --nice <n>             Process niceness for HandBrake (default: 12, lower = more CPU priority)
   --sleep-between <n>    Seconds to pause between file launches (default: 2)
   --preset <name>        HandBrake preset name (default: Fast 1080p30)
+  --encoder <name>       Video encoder override (e.g. vt_h265, vt_h264, x265)
+  --encoder-preset <p>   Encoder preset override (e.g. speed, quality)
+  --quality <pct>        Quality percentage 0-100 (default: preset default; higher = better quality)
+  --no-optimize          Disable MP4 optimize/faststart step for faster completion
   --dry-run              Print planned actions only
   --overwrite            Re-encode even if destination already exists
+  --skip-target-spec     Enable ffprobe-based skip for already-target files
+  --no-skip-target-spec  Disable ffprobe-based skip (compatibility alias)
   --delete-source        Delete source file after verified conversion
   --replace-source       Replace source with converted file after verification
   --extensions <list>    Comma-separated extensions (default: mp4,mkv,mov,ts,m4v)
@@ -23,8 +29,9 @@ Options:
 
 Examples:
   ./scripts/batch-handbrake-convert.sh --input ~/Recordings --dry-run
-  ./scripts/batch-handbrake-convert.sh --input ~/Recordings --delete-source
+  ./scripts/batch-handbrake-convert.sh --input ~/Recordings/video.mp4 --quality 75
   ./scripts/batch-handbrake-convert.sh --input ~/Recordings --workers 2 --nice 10
+  ./scripts/batch-handbrake-convert.sh --input ~/Recordings --workers 2 --sleep-between 0 --encoder vt_h265 --encoder-preset quality --quality 75
 
 Features:
   - Live overall progress bar
@@ -45,8 +52,13 @@ WORKERS=""
 NICE_LEVEL=12
 SLEEP_BETWEEN_JOBS=2
 PRESET="Fast 1080p30"
+VIDEO_ENCODER=""
+VIDEO_ENCODER_PRESET=""
+VIDEO_QUALITY=""
+ENABLE_OPTIMIZE=1
 DRY_RUN=0
 OVERWRITE=0
+SKIP_TARGET_SPEC=0
 DELETE_SOURCE=0
 REPLACE_SOURCE=0
 EXTENSIONS="mp4,mkv,mov,ts,m4v"
@@ -73,12 +85,36 @@ while [[ $# -gt 0 ]]; do
       PRESET="${2:-}"
       shift 2
       ;;
+    --encoder)
+      VIDEO_ENCODER="${2:-}"
+      shift 2
+      ;;
+    --encoder-preset)
+      VIDEO_ENCODER_PRESET="${2:-}"
+      shift 2
+      ;;
+    --quality)
+      VIDEO_QUALITY="${2:-}"
+      shift 2
+      ;;
+    --no-optimize)
+      ENABLE_OPTIMIZE=0
+      shift
+      ;;
     --dry-run)
       DRY_RUN=1
       shift
       ;;
     --overwrite)
       OVERWRITE=1
+      shift
+      ;;
+    --skip-target-spec)
+      SKIP_TARGET_SPEC=1
+      shift
+      ;;
+    --no-skip-target-spec)
+      SKIP_TARGET_SPEC=0
       shift
       ;;
     --delete-source)
@@ -113,9 +149,14 @@ if [[ -z "$INPUT_DIR" ]]; then
 fi
 
 INPUT_DIR="${INPUT_DIR:A}"
-if [[ ! -d "$INPUT_DIR" ]]; then
-  echo "Error: input directory not found: $INPUT_DIR" >&2
+if [[ ! -e "$INPUT_DIR" ]]; then
+  echo "Error: input file or directory not found: $INPUT_DIR" >&2
   exit 1
+fi
+
+INPUT_IS_FILE=0
+if [[ -f "$INPUT_DIR" ]]; then
+  INPUT_IS_FILE=1
 fi
 
 if ! command -v HandBrakeCLI >/dev/null 2>&1; then
@@ -147,9 +188,25 @@ if ! [[ "$SLEEP_BETWEEN_JOBS" =~ '^[0-9]+$' ]]; then
   exit 1
 fi
 
+if [[ -n "$VIDEO_QUALITY" ]]; then
+  if ! [[ "$VIDEO_QUALITY" =~ '^[0-9]+([.][0-9]+)?$' ]]; then
+    echo "Error: --quality must be a number between 0-100" >&2
+    exit 1
+  fi
+  if awk -v q="$VIDEO_QUALITY" 'BEGIN{exit !(q > 100)}'; then
+    echo "Error: --quality must be between 0-100 (got $VIDEO_QUALITY)" >&2
+    exit 1
+  fi
+fi
+
 RUN_TIMESTAMP=$(date '+%Y%m%d-%H%M%S')
-RUN_LOG="$INPUT_DIR/handbrake-convert-$RUN_TIMESTAMP.log"
-STATUS_FILE="$INPUT_DIR/handbrake-convert-$RUN_TIMESTAMP.tsv"
+if (( INPUT_IS_FILE == 1 )); then
+  LOG_DIR="${INPUT_DIR:h}"
+else
+  LOG_DIR="$INPUT_DIR"
+fi
+RUN_LOG="$LOG_DIR/handbrake-convert-$RUN_TIMESTAMP.log"
+STATUS_FILE="$LOG_DIR/handbrake-convert-$RUN_TIMESTAMP.tsv"
 TMP_DIR="$(mktemp -d)"
 JOB_STATE_DIR="$TMP_DIR/job-states"
 mkdir -p "$JOB_STATE_DIR"
@@ -242,6 +299,64 @@ build_find_expr() {
 get_duration_seconds() {
   local file="$1"
   ffprobe -v error -show_entries format=duration -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1
+}
+
+fps_to_decimal() {
+  local ratio="$1"
+  awk -v r="$ratio" 'BEGIN {
+    if (r == "" || r == "0/0") {
+      print ""
+      exit
+    }
+    n = r
+    d = 1
+    if (index(r, "/") > 0) {
+      split(r, p, "/")
+      n = p[1]
+      d = p[2]
+    }
+    if (d == 0 || d == "") {
+      print ""
+      exit
+    }
+    printf "%.6f", n / d
+  }'
+}
+
+is_target_spec_file() {
+  local file="$1"
+
+  (( HAS_FFPROBE == 1 )) || return 1
+
+  local format_name v_codec v_width v_height v_fps_ratio v_rfps_ratio v_fps a_codec
+  format_name="$(ffprobe -v error -show_entries format=format_name -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  v_codec="$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')"
+  v_width="$(ffprobe -v error -select_streams v:0 -show_entries stream=width -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1)"
+  v_height="$(ffprobe -v error -select_streams v:0 -show_entries stream=height -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1)"
+  v_fps_ratio="$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1)"
+  v_rfps_ratio="$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1)"
+  a_codec="$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=nokey=1:noprint_wrappers=1 -- "$file" 2>/dev/null | head -n 1 | tr '[:upper:]' '[:lower:]')"
+
+  [[ -n "$v_codec" && -n "$v_width" && -n "$v_height" ]] || return 1
+
+  # Fast 1080p30 is approximated as MP4 + H.264 + <=1080p + <=30fps (+AAC if audio exists).
+  [[ "$format_name" == *mp4* ]] || return 1
+  [[ "$v_codec" == "h264" ]] || return 1
+  [[ "$v_width" =~ '^[0-9]+$' && "$v_height" =~ '^[0-9]+$' ]] || return 1
+  (( v_width <= 1920 && v_height <= 1080 )) || return 1
+
+  v_fps="$(fps_to_decimal "$v_fps_ratio")"
+  if [[ -z "$v_fps" ]]; then
+    v_fps="$(fps_to_decimal "$v_rfps_ratio")"
+  fi
+  [[ -n "$v_fps" ]] || return 1
+  awk -v fps="$v_fps" 'BEGIN { exit !(fps <= 30.1) }' || return 1
+
+  if [[ -n "$a_codec" && "$a_codec" != "aac" ]]; then
+    return 1
+  fi
+
+  return 0
 }
 
 verify_conversion() {
@@ -445,6 +560,13 @@ convert_one() {
     return
   fi
 
+  if (( OVERWRITE == 0 && SKIP_TARGET_SPEC == 1 )) && is_target_spec_file "$src"; then
+    append_status "SKIP_TARGET	$src	$dest	$src_size	0"
+    log_text "SKIP_TARGET | $(short_name "$src") | source already matches target spec"
+    remove_job_state "$job_id"
+    return
+  fi
+
   if (( DRY_RUN == 1 )); then
     append_status "DRY_RUN	$src	$dest	$src_size	0"
     log_text "DRY_RUN | $(short_name "$src") -> $(short_name "$dest")"
@@ -461,8 +583,23 @@ convert_one() {
     -i "$src"
     -o "$tmp"
     --preset "$PRESET"
-    --optimize
   )
+
+  if [[ -n "$VIDEO_ENCODER" ]]; then
+    hb_cmd+=( --encoder "$VIDEO_ENCODER" )
+  fi
+
+  if [[ -n "$VIDEO_ENCODER_PRESET" ]]; then
+    hb_cmd+=( --encoder-preset "$VIDEO_ENCODER_PRESET" )
+  fi
+
+  if [[ -n "$VIDEO_QUALITY" ]]; then
+    hb_cmd+=( --quality "$VIDEO_QUALITY" )
+  fi
+
+  if (( ENABLE_OPTIMIZE == 1 )); then
+    hb_cmd+=( --optimize )
+  fi
 
   local current_state=""
   local progress_pct="0.0"
@@ -566,6 +703,11 @@ print_scan_summary() {
   echo "Niceness: $NICE_LEVEL"
   echo "Sleep between launches: ${SLEEP_BETWEEN_JOBS}s"
   echo "Preset: $PRESET"
+  echo "Video encoder override: ${VIDEO_ENCODER:-<preset default>}"
+  echo "Encoder preset override: ${VIDEO_ENCODER_PRESET:-<preset default>}"
+  echo "Quality override: ${VIDEO_QUALITY:-<preset default>}"
+  echo "MP4 optimize: $ENABLE_OPTIMIZE"
+  echo "Skip if already target spec: $SKIP_TARGET_SPEC"
   echo "Delete source: $DELETE_SOURCE"
   echo "Replace source: $REPLACE_SOURCE"
   echo "Dry run: $DRY_RUN"
@@ -576,20 +718,30 @@ print_scan_summary() {
   echo "Run status: $STATUS_FILE"
 }
 
-FIND_EXPR="$(build_find_expr "${EXT_ARR[@]}")"
-if [[ -z "$FIND_EXPR" ]]; then
-  echo "Error: no valid extensions after parsing --extensions" >&2
-  exit 1
-fi
-
 typeset -a FILES
-while IFS= read -r -d '' f; do
-  FILES+=("$f")
-done < <(find "$INPUT_DIR" -type f \( ${(z)FIND_EXPR} \) -print0)
+
+if (( INPUT_IS_FILE == 1 )); then
+  FILES+=("$INPUT_DIR")
+else
+  FIND_EXPR="$(build_find_expr "${EXT_ARR[@]}")"
+  if [[ -z "$FIND_EXPR" ]]; then
+    echo "Error: no valid extensions after parsing --extensions" >&2
+    exit 1
+  fi
+  while IFS= read -r -d '' f; do
+    FILES+=("$f")
+  done < <(find "$INPUT_DIR" -type f \( ${(z)FIND_EXPR} \) -print0)
+fi
 
 TOTAL=${#FILES[@]}
 printf 'status\tsource\tdestination\tsource_bytes\toutput_bytes\n' > "$STATUS_FILE"
-log_text "Run started | input=$INPUT_DIR | workers=$WORKERS | nice=$NICE_LEVEL | sleep_between=${SLEEP_BETWEEN_JOBS}s | preset=$PRESET | dry_run=$DRY_RUN | delete_source=$DELETE_SOURCE | replace_source=$REPLACE_SOURCE"
+log_text "Run started | input=$INPUT_DIR | workers=$WORKERS | nice=$NICE_LEVEL | sleep_between=${SLEEP_BETWEEN_JOBS}s | preset=$PRESET | encoder=${VIDEO_ENCODER:-preset-default} | encoder_preset=${VIDEO_ENCODER_PRESET:-preset-default} | quality=${VIDEO_QUALITY:-preset-default} | optimize=$ENABLE_OPTIMIZE | dry_run=$DRY_RUN | delete_source=$DELETE_SOURCE | replace_source=$REPLACE_SOURCE"
+
+if (( SKIP_TARGET_SPEC == 1 )) && [[ -n "$VIDEO_ENCODER" ]] && [[ "$VIDEO_ENCODER" != *h264* ]]; then
+  echo "Warning: --skip-target-spec currently checks for H.264-like output and may skip fewer files with --encoder $VIDEO_ENCODER"
+  log_text "WARN | skip-target-spec is optimized for H.264 checks; encoder override is $VIDEO_ENCODER"
+fi
+
 print_scan_summary "$TOTAL"
 
 if (( TOTAL == 0 )); then
@@ -624,6 +776,7 @@ finish_dashboard "$completed_jobs" "$TOTAL"
 ok_count=$(awk -F '\t' '$1=="OK"{c++} END{print c+0}' "$STATUS_FILE")
 dry_count=$(awk -F '\t' '$1=="DRY_RUN"{c++} END{print c+0}' "$STATUS_FILE")
 skip_count=$(awk -F '\t' '$1=="SKIP_EXISTS"{c++} END{print c+0}' "$STATUS_FILE")
+skip_target_count=$(awk -F '\t' '$1=="SKIP_TARGET"{c++} END{print c+0}' "$STATUS_FILE")
 fail_count=$(awk -F '\t' '$1 ~ /^FAIL_/{c++} END{print c+0}' "$STATUS_FILE")
 
 echo ""
@@ -631,6 +784,7 @@ echo "Summary"
 echo "  OK: $ok_count"
 echo "  Dry run: $dry_count"
 echo "  Skipped (exists): $skip_count"
+echo "  Skipped (target spec): $skip_target_count"
 echo "  Failed: $fail_count"
 echo "  Run log: $RUN_LOG"
 echo "  Run status: $STATUS_FILE"
@@ -656,4 +810,4 @@ if (( fail_count > 0 )); then
   exit 2
 fi
 
-log_text "Run finished successfully | ok=$ok_count | skipped=$skip_count | dry_run=$dry_count"
+log_text "Run finished successfully | ok=$ok_count | skipped_exists=$skip_count | skipped_target=$skip_target_count | dry_run=$dry_count"
