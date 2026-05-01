@@ -6,6 +6,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     var gracefulShutdownHandler: (() async -> Void)?
     var terminationBlockReasonProvider: (() -> String?)?
     private var hasStartedTermination = false
+    private var terminationProgressWindow: NSWindow?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupTemporaryPreviewFiles()
@@ -19,6 +20,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        dismissTerminationProgressWindow()
         cleanupTemporaryPreviewFiles()
     }
 
@@ -27,15 +29,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             return .terminateLater
         }
 
-        if let reason = terminationBlockReasonProvider?() {
-            let alert = NSAlert()
-            alert.alertStyle = .informational
-            alert.messageText = "Please Wait"
-            alert.informativeText = reason
-            alert.addButton(withTitle: "OK")
-            alert.runModal()
-            return .terminateCancel
-        }
+        let pendingReason = terminationBlockReasonProvider?()
 
         guard let gracefulShutdownHandler else {
             return .terminateNow
@@ -43,20 +37,86 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         hasStartedTermination = true
 
-        let reason = "ChaturbateDVR is finishing active recording cleanup. The app will quit automatically when it is safe."
-        let alert = NSAlert()
-        alert.alertStyle = .informational
-        alert.messageText = "Please Wait"
-        alert.informativeText = reason
-        alert.addButton(withTitle: "OK")
-        alert.runModal()
+        if let pendingReason {
+            showTerminationProgressWindow(reason: pendingReason)
+        }
 
         Task { @MainActor in
             await gracefulShutdownHandler()
+            dismissTerminationProgressWindow()
             NSApp.reply(toApplicationShouldTerminate: true)
         }
 
         return .terminateLater
+    }
+
+    private func showTerminationProgressWindow(reason: String) {
+        if let existing = terminationProgressWindow {
+            existing.makeKeyAndOrderFront(nil)
+            return
+        }
+
+        let panelSize = NSSize(width: 470, height: 150)
+        let panel = NSWindow(
+            contentRect: NSRect(origin: .zero, size: panelSize),
+            styleMask: [.titled],
+            backing: .buffered,
+            defer: false
+        )
+        panel.title = "Quitting ChaturbateDVR"
+        panel.isReleasedWhenClosed = false
+        panel.level = .modalPanel
+        panel.standardWindowButton(.closeButton)?.isHidden = true
+        panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
+        panel.standardWindowButton(.zoomButton)?.isHidden = true
+        panel.center()
+
+        let container = NSView(frame: NSRect(origin: .zero, size: panelSize))
+        container.translatesAutoresizingMaskIntoConstraints = false
+
+        let spinner = NSProgressIndicator()
+        spinner.style = .spinning
+        spinner.controlSize = .regular
+        spinner.isIndeterminate = true
+        spinner.translatesAutoresizingMaskIntoConstraints = false
+        spinner.startAnimation(nil)
+
+        let titleLabel = NSTextField(labelWithString: "Finishing pending work before quit...")
+        titleLabel.font = .systemFont(ofSize: 14, weight: .semibold)
+        titleLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        let detailLabel = NSTextField(wrappingLabelWithString: reason)
+        detailLabel.font = .systemFont(ofSize: 12)
+        detailLabel.textColor = .secondaryLabelColor
+        detailLabel.maximumNumberOfLines = 3
+        detailLabel.translatesAutoresizingMaskIntoConstraints = false
+
+        container.addSubview(spinner)
+        container.addSubview(titleLabel)
+        container.addSubview(detailLabel)
+        panel.contentView = container
+
+        NSLayoutConstraint.activate([
+            spinner.leadingAnchor.constraint(equalTo: container.leadingAnchor, constant: 24),
+            spinner.centerYAnchor.constraint(equalTo: container.centerYAnchor),
+
+            titleLabel.leadingAnchor.constraint(equalTo: spinner.trailingAnchor, constant: 16),
+            titleLabel.topAnchor.constraint(equalTo: container.topAnchor, constant: 34),
+            titleLabel.trailingAnchor.constraint(equalTo: container.trailingAnchor, constant: -24),
+
+            detailLabel.leadingAnchor.constraint(equalTo: titleLabel.leadingAnchor),
+            detailLabel.topAnchor.constraint(equalTo: titleLabel.bottomAnchor, constant: 8),
+            detailLabel.trailingAnchor.constraint(equalTo: titleLabel.trailingAnchor)
+        ])
+
+        terminationProgressWindow = panel
+        panel.makeKeyAndOrderFront(nil)
+        NSApp.activate(ignoringOtherApps: true)
+    }
+
+    private func dismissTerminationProgressWindow() {
+        terminationProgressWindow?.close()
+        terminationProgressWindow = nil
     }
 
     private func cleanupTemporaryPreviewFiles() {
@@ -90,10 +150,11 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 @main
 struct ChaturbateDVRApp: App {
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    @StateObject private var manager = ChannelManager()
     
     var body: some Scene {
         WindowGroup {
-            RootView()
+            RootView(manager: manager, appDelegate: appDelegate)
         }
         .commands {
             CommandGroup(replacing: .newItem) {}

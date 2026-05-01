@@ -126,6 +126,7 @@ struct ChannelInfo: Identifiable {
     var isOnline: Bool
     var isPaused: Bool
     var isPausedBySessionLimit: Bool
+    var isActivelyRecording: Bool
     var username: String
     var duration: String
     var filesize: String

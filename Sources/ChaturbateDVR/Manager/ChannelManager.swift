@@ -379,7 +379,6 @@ class ChannelManager: ObservableObject {
     private var auditCache: [String: RecordingAuditCacheEntry] = [:]
     private var pausedStatusCheckTask: Task<Void, Never>?
     private var offlineThumbnailBackfillTask: Task<Void, Never>?
-    private var bioBackfillTask: Task<Void, Never>?
     private var recordingLedgerMaintenanceTask: Task<Void, Never>?
     private var mp4RepairTask: Task<Void, Never>?
     private var recordingRepairRunTask: Task<Void, Never>?
@@ -391,7 +390,6 @@ class ChannelManager: ObservableObject {
     private var lastPausedProbeDeferralLogAt: Date = .distantPast
     private var thumbnailBackfillIndex: Int = 0
     private var thumbnailBackfillCooldownUntil: [String: Date] = [:]
-    private var bioBackfillIndex: Int = 0
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
     private let recordingLedger: RecordingLedger
@@ -419,9 +417,42 @@ class ChannelManager: ObservableObject {
         requestCoordinator = RequestCoordinator(maxConcurrent: 6)
         recordingCoordinator = RecordingCoordinator(maxConcurrent: 0)
         recordingLedger = RecordingLedger.shared
+        let launchUnix = Int64(Date().timeIntervalSince1970)
 
         Task {
             await recordingLedger.initialize(appFolder: appFolder)
+
+            let recovered = await recordingLedger.recoverAbandonedActiveRecordings(activeBefore: launchUnix)
+            if recovered.checked > 0 {
+                await FileLogger.shared.log(
+                    "[manager] recovered stale active recordings on startup: checked=\(recovered.checked), finalized=\(recovered.finalizedWithWarning), missing=\(recovered.markedMissing)",
+                    level: "WARN"
+                )
+            }
+
+            if !recovered.autoRepairCandidates.isEmpty {
+                await FileLogger.shared.log(
+                    "[manager] starting automatic startup repair for \(recovered.autoRepairCandidates.count) recovered stale mp4 recording(s)",
+                    level: "WARN"
+                )
+
+                var repairedCount = 0
+                var failedCount = 0
+                for candidate in recovered.autoRepairCandidates {
+                    let failure = await Channel.repairExistingMP4(path: candidate.path, channel: candidate.channelUsername)
+                    await recordingLedger.markAutoRepairOutcome(filePath: candidate.path, failureReason: failure)
+                    if failure == nil {
+                        repairedCount += 1
+                    } else {
+                        failedCount += 1
+                    }
+                }
+
+                await FileLogger.shared.log(
+                    "[manager] automatic startup repair complete: repaired=\(repairedCount), failed=\(failedCount)",
+                    level: failedCount > 0 ? "WARN" : "INFO"
+                )
+            }
         }
         
         loadAppConfig()
@@ -440,6 +471,8 @@ class ChannelManager: ObservableObject {
         startOfflineThumbnailBackfill()
         startRecordingLedgerMaintenance()
         startBackgroundWorkerWatchdog()
+        ensureRecordingRepairMaintenanceRunning()
+        startRepairForFlaggedRecordings()
         // Bio backfill is manual via on-demand refresh controls in Add Channel and Settings
         // startBioBackfill()
 
@@ -455,7 +488,6 @@ class ChannelManager: ObservableObject {
     deinit {
         pausedStatusCheckTask?.cancel()
         offlineThumbnailBackfillTask?.cancel()
-        bioBackfillTask?.cancel()
         recordingLedgerMaintenanceTask?.cancel()
         mp4RepairTask?.cancel()
         recordingRepairRunTask?.cancel()
@@ -473,8 +505,6 @@ class ChannelManager: ObservableObject {
         pausedStatusCheckTask = nil
         offlineThumbnailBackfillTask?.cancel()
         offlineThumbnailBackfillTask = nil
-        bioBackfillTask?.cancel()
-        bioBackfillTask = nil
         recordingLedgerMaintenanceTask?.cancel()
         recordingLedgerMaintenanceTask = nil
         backgroundWorkerWatchdogTask?.cancel()
@@ -592,10 +622,11 @@ class ChannelManager: ObservableObject {
         saveAuditCache()
     }
 
-    func ensureRecordingRepairMaintenanceRunning() {
+    func ensureRecordingRepairMaintenanceRunning(forceRescan: Bool = false) {
         let rootPath = appConfig.getOutputPath()
 
-        if recordingRepairRootPath == rootPath,
+        if !forceRescan,
+           recordingRepairRootPath == rootPath,
            mp4RepairTask == nil,
            !recordingRepairStates.isEmpty {
             let hasUnresolvedStates = recordingRepairStates.values.contains { state in
@@ -664,7 +695,6 @@ class ChannelManager: ObservableObject {
                 if await self.isAlreadyRepaired(path: candidate.path) {
                     await self.setRecordingRepairState(.good, for: candidate.path)
                     remaining -= 1
-                    await self.updateRecordingRepairSummary()
                     continue
                 }
 
@@ -677,11 +707,9 @@ class ChannelManager: ObservableObject {
                         await self.setRecordingRepairState(.needsRemux, for: candidate.path)
                     }
                     remaining -= 1
-                    await self.updateRecordingRepairSummary()
                     continue
                 }
 
-                await self.setRecordingRepairState(.scanning, for: candidate.path)
                 let auditDecision = await Self.auditRecordingRepairCandidate(path: candidate.path)
                 await self.storeAuditDecision(auditDecision, for: candidate)
                 didAuditOnDisk = true
@@ -698,7 +726,6 @@ class ChannelManager: ObservableObject {
                 }
 
                 remaining -= 1
-                await self.updateRecordingRepairSummary()
                 if didAuditOnDisk && remaining > 0 {
                     try? await Task.sleep(nanoseconds: 400_000_000)
                 }
@@ -707,6 +734,10 @@ class ChannelManager: ObservableObject {
             await self.finishRecordingRepairMaintenance()
             await self.saveAuditCache()
         }
+    }
+
+    func hasExplicitRecordingRepairState(for path: String) -> Bool {
+        recordingRepairStates[path] != nil
     }
 
     func startRepairForFlaggedRecordings() {
@@ -1050,11 +1081,15 @@ class ChannelManager: ObservableObject {
         }
     }
 
-    private func prepareRecordingRepairState(candidates: [MP4RepairCandidate]) {
+    private func prepareRecordingRepairState(candidates: [MP4RepairCandidate]) async {
+        let ledgerStatuses = await recordingLedger.fetchStatusByPath(paths: candidates.map(\ .path))
+
         var nextStates: [String: RecordingRepairState] = [:]
         nextStates.reserveCapacity(candidates.count)
         for candidate in candidates {
-            if isAlreadyRepaired(candidate: candidate) {
+            if let stateFromLedger = recordingRepairState(forLedgerStatus: ledgerStatuses[candidate.path]) {
+                nextStates[candidate.path] = stateFromLedger
+            } else if isAlreadyRepaired(candidate: candidate) {
                 nextStates[candidate.path] = .good
             } else if let cachedDecision = cachedAuditDecision(for: candidate) {
                 switch cachedDecision {
@@ -1090,6 +1125,19 @@ class ChannelManager: ObservableObject {
 
     private func setRecordingRepairScanDetail(_ path: String?) {
         recordingRepairScanDetail = path.map { ($0 as NSString).lastPathComponent }
+    }
+
+    private func recordingRepairState(forLedgerStatus status: String?) -> RecordingRepairState? {
+        guard let status else { return nil }
+
+        switch status {
+        case "completed":
+            return .repaired
+        case "completed_with_remux_warning":
+            return .needsRemux
+        default:
+            return nil
+        }
     }
 
     private func recordingRepairStateRaw(for path: String) -> RecordingRepairState {
@@ -1135,6 +1183,9 @@ class ChannelManager: ObservableObject {
         mp4RepairTask = nil
         isRecordingRepairScanActive = false
         recordingRepairScanDetail = nil
+        if !isRepairingFlaggedRecordings {
+            startRepairForFlaggedRecordings()
+        }
         updateRecordingRepairSummary()
     }
 
@@ -1190,11 +1241,20 @@ class ChannelManager: ObservableObject {
         )
     }
 
-    func recordingRepairState(for path: String, fileExtension: String) -> RecordingRepairState {
+    func recordingRepairState(for path: String, fileExtension: String, recordingStatus: String? = nil) -> RecordingRepairState {
         if fileExtension.lowercased() != "mp4" {
             return .unsupported
         }
-        return recordingRepairStates[path] ?? .pendingScan
+
+        if let state = recordingRepairStates[path] {
+            return state
+        }
+
+        if let stateFromLedger = recordingRepairState(forLedgerStatus: recordingStatus) {
+            return stateFromLedger
+        }
+
+        return .pendingScan
     }
 
     func terminationBlockReason() -> String? {
@@ -1505,7 +1565,7 @@ class ChannelManager: ObservableObject {
             // Requested order:
             // 0: recording, 1: waiting for recording slot, 2: paused but online,
             // 3: offline, 4: paused (offline)
-            if info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot { return 0 }
+            if info.isActivelyRecording { return 0 }
             if info.isWaitingForRecordingSlot { return 1 }
             if info.isOnline && info.isPaused { return 2 }
             if !info.isOnline && !info.isPaused { return 3 }
@@ -2253,53 +2313,6 @@ class ChannelManager: ObservableObject {
                 await FileLogger.shared.log("Thumbnail backfill: unexpected error - \(error.localizedDescription)", channel: username, level: "WARN")
             }
         }
-    }
-
-    private func startBioBackfill() {
-        bioBackfillTask?.cancel()
-        Task {
-            await FileLogger.shared.log("[manager] started bio metadata backfill")
-        }
-        bioBackfillTask = Task { [weak self] in
-            guard let self else { return }
-
-            // Wait a bit before starting bio backfill to avoid startup resource contention
-            try? await Task.sleep(nanoseconds: 60 * 1_000_000_000)
-
-            while !Task.isCancelled {
-                await self.backfillOneBioMetadata()
-                // One channel at a time to avoid overwhelming the network
-                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)
-            }
-        }
-    }
-
-    private func backfillOneBioMetadata() async {
-        var candidates: [(String, Channel)] = []
-
-        for (username, channel) in channels {
-            let config = await channel.config
-            // Only backfill if bio metadata doesn't exist or is too old (>90 days)
-            let shouldBackfill: Bool
-            if let lastRefresh = config.bioMetadata?.lastBioRefresh {
-                let daysSinceRefresh = (Int64(Date().timeIntervalSince1970) - lastRefresh) / (24 * 3600)
-                shouldBackfill = daysSinceRefresh > 90
-            } else {
-                shouldBackfill = true
-            }
-            
-            if shouldBackfill {
-                candidates.append((username, channel))
-            }
-        }
-
-        guard !candidates.isEmpty else { return }
-
-        // Round-robin to give all channels a fair chance
-        let (username, _) = candidates[bioBackfillIndex % candidates.count]
-        bioBackfillIndex = (bioBackfillIndex + 1) % candidates.count
-
-        await refreshBioMetadata(username: username)
     }
 
     private func checkPausedChannelStatusBatch(maxChecks: Int) async {

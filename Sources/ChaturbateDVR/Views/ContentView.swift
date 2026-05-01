@@ -493,7 +493,7 @@ struct AllChannelsGridView: View {
         case .online:
             return info.isOnline && !info.isInvalid
         case .recording:
-            return info.isOnline && !info.isPaused && !info.isWaitingForRecordingSlot && !info.isInvalid && info.globalRecordingEnabled
+            return info.isActivelyRecording && !info.isInvalid
         case .paused:
             return info.isPaused && !info.isPausedBySessionLimit && !info.isInvalid
         case .limitReached:
@@ -809,10 +809,11 @@ private enum RecordingSortOption: String, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
-private struct RecordingLibraryItem: Identifiable, Equatable {
+private struct RecordingLibraryItem: Identifiable {
     let path: String
     let filename: String
     let channelName: String
+    let recordingStatus: String
     let fileExtension: String
     let sizeBytes: Int64
     let modifiedAt: Date
@@ -1116,6 +1117,16 @@ struct RecordingsLibraryView: View {
     private static let pageSize = 60
 
     @State private var allRecordings: [RecordingLibraryItem] = []
+    @State private var sortedRecordings: [RecordingLibraryItem] = []
+    @State private var availableChannelFilters: [String] = []
+    @State private var totalAllRecordingsBytes: Int64 = 0
+    @State private var unsupportedRecordingsCount: Int = 0
+    @State private var cachedVisibleRecordings: [RecordingLibraryItem] = []
+    @State private var cachedPageRecordings: [RecordingLibraryItem] = []
+    @State private var cachedPreviewableVisiblePaths: [String] = []
+    @State private var cachedVisibleBytes: Int64 = 0
+    @State private var cachedTotalPages: Int = 1
+    @State private var pageCacheVersion: Int = 0
     @State private var searchText: String = ""
     @State private var selectedChannelFilter: String = "All Channels"
     @State private var repairFilter: RecordingRepairFilter = .all
@@ -1133,8 +1144,18 @@ struct RecordingsLibraryView: View {
 
     private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
 
+    private static let queryTrimSet = CharacterSet.whitespacesAndNewlines
+
     var body: some View {
         GeometryReader { geometry in
+            let channelOptions = availableChannelFilters
+            let counts = repairFilterCounts
+            let visible = cachedVisibleRecordings
+            let visibleBytes = cachedVisibleBytes
+            let pages = cachedTotalPages
+            let safePage = min(currentPage, pages - 1)
+            let pageItems = cachedPageRecordings
+
             VStack(spacing: 0) {
                 VStack(spacing: 8) {
                     HStack(alignment: .firstTextBaseline, spacing: 10) {
@@ -1152,7 +1173,7 @@ struct RecordingsLibraryView: View {
 
                         Picker("Channel", selection: $selectedChannelFilter) {
                             Text("All Channels").tag("All Channels")
-                            ForEach(channelFilters, id: \.self) { channel in
+                            ForEach(channelOptions, id: \.self) { channel in
                                 Text(channel).tag(channel)
                             }
                         }
@@ -1180,16 +1201,16 @@ struct RecordingsLibraryView: View {
                     }
 
                     HStack(spacing: 8) {
-                        filterChip(.all,         count: repairFilterCounts.count(for: .all))
-                        filterChip(.pendingScan, count: repairFilterCounts.count(for: .pendingScan))
-                        filterChip(.scanning,    count: repairFilterCounts.count(for: .scanning))
-                        filterChip(.good,        count: repairFilterCounts.count(for: .good))
-                        filterChip(.needsRemux,  count: repairFilterCounts.count(for: .needsRemux))
-                        filterChip(.queued,      count: repairFilterCounts.count(for: .queued))
-                        filterChip(.remuxing,    count: repairFilterCounts.count(for: .remuxing))
-                        filterChip(.repaired,    count: repairFilterCounts.count(for: .repaired))
-                        filterChip(.failed,      count: repairFilterCounts.count(for: .failed))
-                        filterChip(.unsupported, count: repairFilterCounts.count(for: .unsupported))
+                        filterChip(.all,         count: counts.count(for: .all))
+                        filterChip(.pendingScan, count: counts.count(for: .pendingScan))
+                        filterChip(.scanning,    count: counts.count(for: .scanning))
+                        filterChip(.good,        count: counts.count(for: .good))
+                        filterChip(.needsRemux,  count: counts.count(for: .needsRemux))
+                        filterChip(.queued,      count: counts.count(for: .queued))
+                        filterChip(.remuxing,    count: counts.count(for: .remuxing))
+                        filterChip(.repaired,    count: counts.count(for: .repaired))
+                        filterChip(.failed,      count: counts.count(for: .failed))
+                        filterChip(.unsupported, count: counts.count(for: .unsupported))
 
                         if manager.isRecordingRepairScanActive {
                             HStack(spacing: 6) {
@@ -1208,7 +1229,7 @@ struct RecordingsLibraryView: View {
                             }
                         }
 
-                        Text("Size: \(formatByteCount(totalVisibleBytes))")
+                        Text("Size: \(formatByteCount(visibleBytes))")
                             .font(.caption)
                             .foregroundColor(.secondary)
                         Spacer(minLength: 0)
@@ -1239,7 +1260,7 @@ struct RecordingsLibraryView: View {
                             .foregroundColor(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if visibleRecordings.isEmpty {
+                } else if visible.isEmpty {
                     VStack(spacing: 8) {
                         Image(systemName: "film.stack")
                             .font(.title2)
@@ -1258,13 +1279,17 @@ struct RecordingsLibraryView: View {
                     VStack(spacing: 0) {
                         ScrollView {
                             LazyVGrid(columns: gridColumns, spacing: Self.thumbnailCardSpacing) {
-                                ForEach(pageRecordings) { item in
+                                ForEach(pageItems) { item in
                                     Button {
                                         openRecordingPreview(for: item)
                                     } label: {
                                         RecordingLibraryCardView(
                                             item: item,
-                                            repairState: manager.recordingRepairState(for: item.path, fileExtension: item.fileExtension)
+                                            repairState: manager.recordingRepairState(
+                                                for: item.path,
+                                                fileExtension: item.fileExtension,
+                                                recordingStatus: item.recordingStatus
+                                            )
                                         )
                                     }
                                     .buttonStyle(.plain)
@@ -1274,7 +1299,7 @@ struct RecordingsLibraryView: View {
                             .padding(16)
                         }
 
-                        if totalPages > 1 {
+                        if pages > 1 {
                             Divider()
                             HStack(spacing: 12) {
                                 Button {
@@ -1286,18 +1311,18 @@ struct RecordingsLibraryView: View {
                                 .controlSize(.small)
                                 .disabled(currentPage == 0)
 
-                                Text("Page \(currentPage + 1) of \(totalPages)  ·  Showing \(pageRecordings.count) of \(visibleRecordings.count)")
+                                Text("Page \(safePage + 1) of \(pages)  ·  Showing \(pageItems.count) of \(visible.count)")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
 
                                 Button {
-                                    currentPage = min(totalPages - 1, currentPage + 1)
+                                    currentPage = min(pages - 1, currentPage + 1)
                                 } label: {
                                     Image(systemName: "chevron.right")
                                 }
                                 .buttonStyle(.bordered)
                                 .controlSize(.small)
-                                .disabled(currentPage >= totalPages - 1)
+                                .disabled(currentPage >= pages - 1)
                             }
                             .padding(.horizontal, 16)
                             .padding(.vertical, 10)
@@ -1332,116 +1357,116 @@ struct RecordingsLibraryView: View {
             thumbnailPrewarmTask = nil
         }
         .onChange(of: showingPreview) { isShowing in
-            if !isShowing {
-                refreshRecordings()
+            if isShowing {
+                thumbnailPrewarmTask?.cancel()
+                thumbnailPrewarmTask = nil
+            } else {
+                scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
             }
         }
         .onChange(of: repairFilter) { _ in
             currentPage = 0
+            recomputeVisibleCaches()
         }
         .onChange(of: selectedChannelFilter) { _ in
             currentPage = 0
+            recomputeVisibleCaches()
         }
         .onChange(of: searchText) { _ in
             currentPage = 0
+            recomputeVisibleCaches()
         }
         .onChange(of: sortOption) { _ in
+            applySortOption()
             currentPage = 0
         }
-        .onChange(of: pageRecordings.map(\.thumbnailCacheKey)) { _ in
+        .onChange(of: currentPage) { _ in
+            recomputeVisibleCaches()
+        }
+        .onChange(of: manager.recordingRepairSummary) { _ in
+            if repairFilter != .all {
+                recomputeVisibleCaches()
+            }
+        }
+        .onChange(of: pageCacheVersion) { _ in
             scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
         }
-    }
-
-    private var channelFilters: [String] {
-        Array(Set(allRecordings.map { $0.channelName }))
-            .sorted { $0.lowercased() < $1.lowercased() }
     }
 
     private var repairFilterCounts: RecordingRepairFilterCounts {
         var counts = RecordingRepairFilterCounts()
         counts.all = allRecordings.count
 
-        for item in allRecordings {
-            let state = manager.recordingRepairState(for: item.path, fileExtension: item.fileExtension)
-            switch state {
-            case .pendingScan:
-                counts.pendingScan += 1
-            case .scanning:
-                counts.scanning += 1
-            case .good:
-                counts.good += 1
-            case .needsRemux:
-                counts.needsRemux += 1
-            case .queued:
-                counts.queued += 1
-            case .remuxing:
-                counts.remuxing += 1
-            case .repaired:
-                counts.repaired += 1
-            case .failed:
-                counts.failed += 1
-            case .unsupported:
-                counts.unsupported += 1
-            }
+        let mp4Count = allRecordings.reduce(0) { partial, item in
+            partial + (item.fileExtension.lowercased() == "mp4" ? 1 : 0)
         }
+        let knownMp4StateCount =
+            manager.recordingRepairSummary.pendingScan
+            + manager.recordingRepairSummary.scanning
+            + manager.recordingRepairSummary.good
+            + manager.recordingRepairSummary.needsRemux
+            + manager.recordingRepairSummary.queued
+            + manager.recordingRepairSummary.remuxing
+            + manager.recordingRepairSummary.repaired
+            + manager.recordingRepairSummary.failed
+        let implicitPendingCount = max(0, mp4Count - knownMp4StateCount)
+
+        // Keep count semantics aligned with `recordingRepairState(for:)` fallback:
+        // MP4 entries without an explicit state are displayed as pending scan.
+        counts.pendingScan = manager.recordingRepairSummary.pendingScan + implicitPendingCount
+        counts.scanning = manager.recordingRepairSummary.scanning
+        counts.good = manager.recordingRepairSummary.good
+        counts.needsRemux = manager.recordingRepairSummary.needsRemux
+        counts.queued = manager.recordingRepairSummary.queued
+        counts.remuxing = manager.recordingRepairSummary.remuxing
+        counts.repaired = manager.recordingRepairSummary.repaired
+        counts.failed = manager.recordingRepairSummary.failed
+        counts.unsupported = unsupportedRecordingsCount
 
         return counts
     }
 
-    private var visibleRecordings: [RecordingLibraryItem] {
-        var filtered = allRecordings.filter { item in
-            if selectedChannelFilter != "All Channels" && item.channelName != selectedChannelFilter {
+    private func buildVisibleRecordings() -> [RecordingLibraryItem] {
+        let query = searchText.trimmingCharacters(in: Self.queryTrimSet)
+        let needsChannelFilter = selectedChannelFilter != "All Channels"
+        let needsRepairFilter = repairFilter != .all
+        let needsQuery = !query.isEmpty
+
+        if !needsChannelFilter && !needsRepairFilter && !needsQuery {
+            return sortedRecordings
+        }
+
+        return sortedRecordings.filter { item in
+            if needsChannelFilter && item.channelName != selectedChannelFilter {
                 return false
             }
 
-            if repairFilter != .all {
-                let state = manager.recordingRepairState(for: item.path, fileExtension: item.fileExtension)
-                if !repairFilter.matches(state) { return false }
+            if needsRepairFilter {
+                let state = manager.recordingRepairState(
+                    for: item.path,
+                    fileExtension: item.fileExtension,
+                    recordingStatus: item.recordingStatus
+                )
+                if !repairFilter.matches(state) {
+                    return false
+                }
             }
 
-            let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
-            if query.isEmpty { return true }
+            if needsQuery {
+                return item.filename.localizedCaseInsensitiveContains(query)
+                    || item.channelName.localizedCaseInsensitiveContains(query)
+            }
 
-            return item.filename.localizedCaseInsensitiveContains(query)
-                || item.channelName.localizedCaseInsensitiveContains(query)
+            return true
         }
-
-        switch sortOption {
-        case .newest:
-            filtered.sort { $0.modifiedAt > $1.modifiedAt }
-        case .oldest:
-            filtered.sort { $0.modifiedAt < $1.modifiedAt }
-        case .largest:
-            filtered.sort { $0.sizeBytes > $1.sizeBytes }
-        case .smallest:
-            filtered.sort { $0.sizeBytes < $1.sizeBytes }
-        case .filename:
-            filtered.sort { $0.filename.lowercased() < $1.filename.lowercased() }
-        }
-
-        return filtered
-    }
-
-    private var totalPages: Int {
-        max(1, Int(ceil(Double(visibleRecordings.count) / Double(Self.pageSize))))
-    }
-
-    private var pageRecordings: [RecordingLibraryItem] {
-        let safePage = min(currentPage, totalPages - 1)
-        let start = safePage * Self.pageSize
-        let end = min(start + Self.pageSize, visibleRecordings.count)
-        guard start < end else { return [] }
-        return Array(visibleRecordings[start..<end])
-    }
-
-    private var totalVisibleBytes: Int64 {
-        visibleRecordings.reduce(0) { $0 + $1.sizeBytes }
     }
 
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { _ in
+            if showingPreview {
+                return
+            }
             refreshRecordings()
         }
     }
@@ -1451,26 +1476,88 @@ struct RecordingsLibraryView: View {
         scanError = nil
         manager.ensureRecordingRepairMaintenanceRunning()
 
-        Task { @MainActor in
-            let recordings = await loadRecordings()
-            allRecordings = recordings
+        Task {
+            let entries = await manager.getRecordingLibraryEntries()
+            let activeChannelThumbnails = await loadActiveChannelThumbnails(entries: entries)
 
-            if selectedChannelFilter != "All Channels",
-               !channelFilters.contains(selectedChannelFilter) {
-                selectedChannelFilter = "All Channels"
+            let recordings = await Task.detached(priority: .utility) {
+                Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails)
+            }.value
+
+            await MainActor.run {
+                allRecordings = recordings
+                totalAllRecordingsBytes = recordings.reduce(0) { $0 + $1.sizeBytes }
+                unsupportedRecordingsCount = recordings.reduce(0) { partial, item in
+                    partial + (item.fileExtension.lowercased() == "mp4" ? 0 : 1)
+                }
+                availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
+                    .sorted { $0.lowercased() < $1.lowercased() }
+                     applySortOption()
+
+                let hasImplicitPendingMP4 = recordings.contains { item in
+                    item.fileExtension.lowercased() == "mp4"
+                        && !manager.hasExplicitRecordingRepairState(for: item.path)
+                }
+                if hasImplicitPendingMP4 {
+                    manager.ensureRecordingRepairMaintenanceRunning(forceRescan: true)
+                }
+
+                if selectedChannelFilter != "All Channels",
+                   !availableChannelFilters.contains(selectedChannelFilter) {
+                    selectedChannelFilter = "All Channels"
+                }
+                isScanning = false
+                scheduleThumbnailPrewarm(debounceNanoseconds: 0)
             }
-            isScanning = false
-            scheduleThumbnailPrewarm(debounceNanoseconds: 0)
         }
+    }
+
+    private func applySortOption() {
+        var sorted = allRecordings
+
+        switch sortOption {
+        case .newest:
+            sorted.sort { $0.modifiedAt > $1.modifiedAt }
+        case .oldest:
+            sorted.sort { $0.modifiedAt < $1.modifiedAt }
+        case .largest:
+            sorted.sort { $0.sizeBytes > $1.sizeBytes }
+        case .smallest:
+            sorted.sort { $0.sizeBytes < $1.sizeBytes }
+        case .filename:
+            sorted.sort { $0.filename.lowercased() < $1.filename.lowercased() }
+        }
+
+        sortedRecordings = sorted
+        recomputeVisibleCaches()
+    }
+
+    private func loadActiveChannelThumbnails(entries: [RecordingLedgerEntry]) async -> [String: String] {
+        let activeUsernames = Set(entries.filter(\.isActive).map(\.channelUsername))
+        var activeChannelThumbnails: [String: String] = [:]
+        activeChannelThumbnails.reserveCapacity(activeUsernames.count)
+
+        for username in activeUsernames {
+            if let thumbnailPath = await manager.getChannelThumbnailPath(username: username) {
+                activeChannelThumbnails[username] = thumbnailPath
+            }
+        }
+
+        return activeChannelThumbnails
     }
 
     private func scheduleThumbnailPrewarm(debounceNanoseconds: UInt64) {
         thumbnailPrewarmTask?.cancel()
 
+        guard !showingPreview else {
+            thumbnailPrewarmTask = nil
+            return
+        }
+
         // Only prewarm thumbnails for the current page to stay lean.
         let prioritizedCount = prioritizedThumbnailCount(for: thumbnailViewportSize)
-        let prioritizedItems = Array(pageRecordings.prefix(prioritizedCount))
-        let backgroundItems = Array(pageRecordings.dropFirst(prioritizedCount))
+        let prioritizedItems = Array(cachedPageRecordings.prefix(prioritizedCount))
+        let backgroundItems = Array(cachedPageRecordings.dropFirst(prioritizedCount))
 
         guard !prioritizedItems.isEmpty || !backgroundItems.isEmpty else {
             thumbnailPrewarmTask = nil
@@ -1510,17 +1597,11 @@ struct RecordingsLibraryView: View {
         scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
     }
 
-    private func loadRecordings() async -> [RecordingLibraryItem] {
-        let entries = await manager.getRecordingLibraryEntries()
+    private nonisolated static func mapRecordingEntries(
+        _ entries: [RecordingLedgerEntry],
+        activeChannelThumbnails: [String: String]
+    ) -> [RecordingLibraryItem] {
         let fileManager = FileManager.default
-
-        let activeUsernames = Set(entries.filter(\.isActive).map(\.channelUsername))
-        var activeChannelThumbnails: [String: String] = [:]
-        for username in activeUsernames {
-            if let thumbnailPath = await manager.getChannelThumbnailPath(username: username) {
-                activeChannelThumbnails[username] = thumbnailPath
-            }
-        }
 
         return entries.map { entry in
             let finalPath = (entry.path as NSString).expandingTildeInPath
@@ -1541,6 +1622,7 @@ struct RecordingsLibraryView: View {
                 path: finalPath,
                 filename: fileURL.lastPathComponent,
                 channelName: entry.channelUsername,
+                recordingStatus: entry.status,
                 fileExtension: entry.fileExtension,
                 sizeBytes: entry.fileSizeBytes,
                 modifiedAt: entry.modifiedAt,
@@ -1552,25 +1634,58 @@ struct RecordingsLibraryView: View {
         }
     }
 
+    private func recomputeVisibleCaches() {
+        let visible = buildVisibleRecordings()
+        cachedVisibleRecordings = visible
+        cachedPreviewableVisiblePaths = visible.filter(\ .isPreviewable).map(\ .path)
+
+        if selectedChannelFilter == "All Channels" && repairFilter == .all && searchText.trimmingCharacters(in: Self.queryTrimSet).isEmpty {
+            cachedVisibleBytes = totalAllRecordingsBytes
+        } else {
+            cachedVisibleBytes = visible.reduce(0) { $0 + $1.sizeBytes }
+        }
+
+        let totalPages = max(1, Int(ceil(Double(visible.count) / Double(Self.pageSize))))
+        cachedTotalPages = totalPages
+
+        if currentPage >= totalPages {
+            currentPage = max(totalPages - 1, 0)
+        }
+
+        let safePage = min(currentPage, totalPages - 1)
+        let start = safePage * Self.pageSize
+        let end = min(start + Self.pageSize, visible.count)
+        if start < end {
+            cachedPageRecordings = Array(visible[start..<end])
+        } else {
+            cachedPageRecordings = []
+        }
+        pageCacheVersion &+= 1
+    }
+
     private func openRecordingPreview(for item: RecordingLibraryItem) {
         guard item.isPreviewable else { return }
 
-        // Use all visible recordings for sequential playback nav across pages.
-        let orderedPaths = visibleRecordings
-            .filter(\ .isPreviewable)
-            .map(\ .path)
-        guard let index = orderedPaths.firstIndex(of: item.path) else { return }
+        // Use cached visible ordering to keep modal-open work O(1).
+        guard let index = cachedPreviewableVisiblePaths.firstIndex(of: item.path) else { return }
 
-        previewPaths = orderedPaths
+        previewPaths = cachedPreviewableVisiblePaths
         previewIndex = index
         showingPreview = true
     }
 
     private func handleRecordingMovedToTrash(_ path: String) {
         allRecordings.removeAll { $0.path == path }
+        totalAllRecordingsBytes = allRecordings.reduce(0) { $0 + $1.sizeBytes }
+        unsupportedRecordingsCount = allRecordings.reduce(0) { partial, item in
+            partial + (item.fileExtension.lowercased() == "mp4" ? 0 : 1)
+        }
+        availableChannelFilters = Array(Set(allRecordings.map { $0.channelName }))
+            .sorted { $0.lowercased() < $1.lowercased() }
+        applySortOption()
 
         // Keep pagination stable after removals.
-        currentPage = min(currentPage, max(totalPages - 1, 0))
+        currentPage = min(currentPage, max(cachedTotalPages - 1, 0))
         scheduleThumbnailPrewarm(debounceNanoseconds: 0)
 
         Task { @MainActor in
@@ -1615,6 +1730,19 @@ struct RecordingsLibraryView: View {
 private struct RecordingLibraryCardView: View {
     let item: RecordingLibraryItem
     let repairState: RecordingRepairState
+
+    private static let modifiedDateFormatter: DateFormatter = {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .short
+        formatter.timeStyle = .short
+        return formatter
+    }()
+
+    private static let sizeFormatter: ByteCountFormatter = {
+        let formatter = ByteCountFormatter()
+        formatter.countStyle = .file
+        return formatter
+    }()
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -1673,16 +1801,11 @@ private struct RecordingLibraryCardView: View {
     }
 
     private func formatModifiedDate(_ date: Date) -> String {
-        let formatter = DateFormatter()
-        formatter.dateStyle = .short
-        formatter.timeStyle = .short
-        return formatter.string(from: date)
+        Self.modifiedDateFormatter.string(from: date)
     }
 
     private func formatSize(_ bytes: Int64) -> String {
-        let formatter = ByteCountFormatter()
-        formatter.countStyle = .file
-        return formatter.string(fromByteCount: bytes)
+        Self.sizeFormatter.string(fromByteCount: bytes)
     }
 
     @ViewBuilder
@@ -1817,7 +1940,7 @@ struct ChannelPreviewCard: View {
     private var isWaitingForRecordingSlot: Bool { info.isWaitingForRecordingSlot }
     private var isWaitingOnline: Bool { isWaitingForRecordingSlot && info.isOnline }
     private var isLive: Bool { info.isOnline && !info.isPaused && !isWaitingForRecordingSlot }
-    private var isRecording: Bool { isLive && info.globalRecordingEnabled }
+    private var isRecording: Bool { info.isActivelyRecording }
     private var isPausedOnline: Bool { info.isOnline && info.isPaused }
     private var isOffline: Bool { !info.isOnline }
     private var isInvalid: Bool { info.isInvalid }
@@ -2454,11 +2577,8 @@ struct ActivitySidebarView: View {
     private var recordingChannels: [ChannelInfo] {
         channelInfos
             .filter {
-                $0.isOnline &&
-                !$0.isPaused &&
-                !$0.isWaitingForRecordingSlot &&
-                !$0.isInvalid &&
-                $0.globalRecordingEnabled
+                $0.isActivelyRecording &&
+                !$0.isInvalid
             }
             .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
     }
@@ -2682,140 +2802,6 @@ struct ActivitySidebarView: View {
         withAnimation(.easeInOut(duration: 0.18)) {
             slotColumnCount = nextCount
         }
-    }
-}
-
-struct ChannelRowView: View {
-    let info: ChannelInfo
-
-    private var isPausedOnline: Bool {
-        info.isPaused && info.isOnline
-    }
-
-    private var isInvalid: Bool {
-        info.isInvalid
-    }
-
-    private var isDegraded: Bool {
-        info.consecutiveSegmentFailures > 0
-    }
-
-    private var showNoPersonBadge: Bool {
-        info.isOnline && info.isNoPersonDetected && !info.isInvalid
-    }
-
-    private var hasCloudflarePressure: Bool {
-        info.cloudflareBlockCount > 0
-    }
-
-    private var isWaitingForRecordingSlot: Bool {
-        info.isWaitingForRecordingSlot
-    }
-    
-    var body: some View {
-        HStack(spacing: 12) {
-            ZStack {
-                Circle()
-                    .fill(isInvalid ? Color.red : (info.isPaused ? Color.orange : (info.isOnline ? Color.green : Color.gray)))
-                    .frame(width: 10, height: 10)
-                
-                if info.isChecking {
-                    ProgressView()
-                        .scaleEffect(0.5)
-                        .frame(width: 10, height: 10)
-                }
-            }
-            .frame(width: 10, height: 10)
-            
-            VStack(alignment: .leading, spacing: 4) {
-                Text(info.username)
-                    .font(.headline)
-                    .foregroundColor(.primary)
-                
-                HStack(spacing: 8) {
-                    if isInvalid {
-                        Text("Invalid (404)")
-                    } else if info.isPaused {
-                        Text(info.isOnline ? "Paused (Online)" : "Paused")
-                    } else if isWaitingForRecordingSlot {
-                        HStack(spacing: 4) {
-                            ProgressView()
-                                .controlSize(.mini)
-                            Text(info.isOnline ? "Waiting For Slot (Online)" : "Waiting For Slot (Rechecking)")
-                        }
-                        .font(.caption2)
-                        .foregroundColor(.blue)
-                    } else if info.isOnline {
-                        Label(info.duration, systemImage: "clock")
-                        Label(info.filesize, systemImage: "doc")
-                        if isDegraded {
-                            Text("Degraded")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.14))
-                                .cornerRadius(6)
-                        }
-                        if showNoPersonBadge {
-                            Text("No Person \(formatNoPersonDuration(info.noPersonDurationSeconds))")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.14))
-                                .cornerRadius(6)
-                                .lineLimit(1)
-                        }
-                        if hasCloudflarePressure {
-                            Text("CF x\(info.cloudflareBlockCount)")
-                                .font(.caption2)
-                                .fontWeight(.semibold)
-                                .foregroundColor(.orange)
-                                .padding(.horizontal, 6)
-                                .padding(.vertical, 2)
-                                .background(Color.orange.opacity(0.14))
-                                .cornerRadius(6)
-                        }
-                    } else {
-                        Text("Offline")
-                    }
-                }
-                .font(.caption)
-                .foregroundColor(isInvalid ? .red : .secondary)
-
-                if let lastOnlineAt = info.lastOnlineAt {
-                    Text("Last online: \(lastOnlineAt)")
-                        .font(.caption2)
-                        .foregroundColor(.secondary)
-                        .lineLimit(1)
-                }
-
-                if info.isChecking {
-                    HStack(spacing: 4) {
-                        ProgressView()
-                            .controlSize(.mini)
-                        Text("Checking...")
-                    }
-                    .font(.caption2)
-                    .foregroundColor(.accentColor)
-                }
-            }
-            
-            Spacer()
-        }
-        .padding(.vertical, 4)
-        .padding(.horizontal, 6)
-        .background(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .fill(isInvalid ? Color.red.opacity(0.10) : (isPausedOnline ? Color.orange.opacity(0.10) : Color.clear))
-        )
-        .overlay(
-            RoundedRectangle(cornerRadius: 8, style: .continuous)
-                .stroke(isInvalid ? Color.red.opacity(0.24) : (isPausedOnline ? Color.orange.opacity(0.22) : Color.clear), lineWidth: 1)
-        )
     }
 }
 
@@ -3163,8 +3149,11 @@ struct ChannelDetailView: View {
         if info.isPaused {
             return info.isOnline ? "Paused (Online)" : "Paused"
         }
+        if info.isActivelyRecording {
+            return "Recording"
+        }
         if info.isOnline {
-            return info.globalRecordingEnabled ? "Recording" : "Online"
+            return "Online"
         }
         return "Offline"
     }
@@ -3179,8 +3168,11 @@ struct ChannelDetailView: View {
         if info.isPaused {
             return .orange
         }
+        if info.isActivelyRecording {
+            return .green
+        }
         if info.isOnline {
-            return info.globalRecordingEnabled ? .green : .mint
+            return .mint
         }
         return .gray
     }
@@ -3352,34 +3344,6 @@ struct ChannelDetailView: View {
     private func responsiveDetailWidth(totalWidth: CGFloat) -> CGFloat {
         let target = totalWidth * 0.29
         return min(max(target, 300), 380)
-    }
-
-    private func colorForDetailLog(_ log: String, info: ChannelInfo) -> Color {
-        let lower = log.lowercased()
-
-        if lower.contains("error") || lower.contains("blocked") {
-            return .red
-        }
-        if lower.contains("check") || lower.contains("probing") {
-            return .accentColor
-        }
-        if lower.contains("online") {
-            return .green
-        }
-        if lower.contains("offline") {
-            return .gray
-        }
-
-        if info.isChecking {
-            return .accentColor
-        }
-        if info.isPaused {
-            return .orange
-        }
-        if info.isOnline {
-            return .green
-        }
-        return .secondary
     }
 
     private func copyActivityLogs(_ logs: [String]) {

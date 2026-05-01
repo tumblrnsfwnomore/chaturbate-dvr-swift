@@ -17,11 +17,18 @@ private actor MP4Finalizer {
         let sizeBytes: Int64
     }
 
+    private struct ProcessResult {
+        let status: Int32
+        let stdout: String
+        let stderr: String
+    }
+
     private var inFlightPaths: Set<String> = []
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
 
     func enqueue(
         sourcePath: String,
+        audioSourcePath: String? = nil,
         destinationPath: String,
         channel: String,
         onCompletion: (@Sendable (RepairOutcome) -> Void)? = nil
@@ -30,7 +37,12 @@ private actor MP4Finalizer {
 
         Task.detached(priority: .utility) { [weak self] in
             guard let self else { return }
-            let outcome = await self.finalize(sourcePath: sourcePath, destinationPath: destinationPath, channel: channel)
+            let outcome = await self.finalize(
+                sourcePath: sourcePath,
+                audioSourcePath: audioSourcePath,
+                destinationPath: destinationPath,
+                channel: channel
+            )
             onCompletion?(outcome)
         }
     }
@@ -43,7 +55,7 @@ private actor MP4Finalizer {
         return await finalize(sourcePath: path, destinationPath: path, channel: channel)
     }
 
-    private func finalize(sourcePath: String, destinationPath: String, channel: String) async -> RepairOutcome {
+    private func finalize(sourcePath: String, audioSourcePath: String? = nil, destinationPath: String, channel: String) async -> RepairOutcome {
         defer {
             inFlightPaths.remove(sourcePath)
             if inFlightPaths.isEmpty, !idleWaiters.isEmpty {
@@ -56,10 +68,16 @@ private actor MP4Finalizer {
         }
 
         let sourceURL = URL(fileURLWithPath: sourcePath)
+        let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: $0) }
         let destinationURL = URL(fileURLWithPath: destinationPath)
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             return .skipped("source file missing")
         }
+
+        let hasAudioSidecar = {
+            guard let audioSourceURL else { return false }
+            return FileManager.default.fileExists(atPath: audioSourceURL.path)
+        }()
 
         let tempURL = sourceURL
             .deletingLastPathComponent()
@@ -68,7 +86,11 @@ private actor MP4Finalizer {
         do {
             let sourceAttributes = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
             let sourceMetrics = try await loadMediaMetrics(for: sourceURL)
-            try await exportPassthrough(sourceURL: sourceURL, destinationURL: tempURL)
+            try await exportPassthrough(
+                sourceURL: sourceURL,
+                audioSourceURL: hasAudioSidecar ? audioSourceURL : nil,
+                destinationURL: tempURL
+            )
             let exportedMetrics = try await loadMediaMetrics(for: tempURL)
             try validateExport(source: sourceMetrics, exported: exportedMetrics)
 
@@ -91,6 +113,10 @@ private actor MP4Finalizer {
                 try? FileManager.default.setAttributes(preservedAttributes, ofItemAtPath: destinationURL.path)
             }
 
+            if hasAudioSidecar, let audioSourceURL {
+                try? FileManager.default.removeItem(at: audioSourceURL)
+            }
+
             await FileLogger.shared.log("[recording] finalized mp4 for fast open/seek (duration \(formatSeconds(exportedMetrics.durationSeconds)) size \(exportedMetrics.sizeBytes) bytes)", channel: channel)
             return .succeeded
         } catch {
@@ -100,7 +126,21 @@ private actor MP4Finalizer {
         }
     }
 
-    private func exportPassthrough(sourceURL: URL, destinationURL: URL) async throws {
+    private func exportPassthrough(sourceURL: URL, audioSourceURL: URL? = nil, destinationURL: URL) async throws {
+        if let ffmpegPath = resolveFFMPEGPath() {
+            try remuxWithFFMPEG(
+                ffmpegPath: ffmpegPath,
+                sourceURL: sourceURL,
+                audioSourceURL: audioSourceURL,
+                destinationURL: destinationURL
+            )
+            return
+        }
+
+        if audioSourceURL != nil {
+            throw ChaturbateError.fileError("ffmpeg is required to mux split audio for fragmented MP4 recordings")
+        }
+
         let asset = AVURLAsset(url: sourceURL)
         guard let export = AVAssetExportSession(asset: asset, presetName: AVAssetExportPresetPassthrough) else {
             throw ChaturbateError.fileError("Could not create export session")
@@ -108,6 +148,46 @@ private actor MP4Finalizer {
 
         export.shouldOptimizeForNetworkUse = true
         try await export.export(to: destinationURL, as: .mp4)
+    }
+
+    private func remuxWithFFMPEG(ffmpegPath: String, sourceURL: URL, audioSourceURL: URL? = nil, destinationURL: URL) throws {
+        var arguments: [String] = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", sourceURL.path,
+        ]
+
+        if let audioSourceURL {
+            arguments += [
+                "-i", audioSourceURL.path,
+                "-map", "0:v:0",
+                "-map", "1:a:0?",
+                "-c", "copy",
+                "-shortest",
+                "-movflags", "+faststart",
+                destinationURL.path,
+            ]
+        } else {
+            arguments += [
+                "-map", "0",
+                "-c", "copy",
+                "-movflags", "+faststart",
+                destinationURL.path,
+            ]
+        }
+
+        let result = runProcess(executablePath: ffmpegPath, arguments: arguments)
+
+        guard result.status == 0 else {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            let trimmed = details.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                throw ChaturbateError.fileError("ffmpeg remux failed with status \(result.status)")
+            }
+            throw ChaturbateError.fileError("ffmpeg remux failed: \(trimmed)")
+        }
     }
 
     private func loadMediaMetrics(for fileURL: URL) async throws -> MediaMetrics {
@@ -166,6 +246,43 @@ private actor MP4Finalizer {
         String(format: "%.1f%%", ratio * 100)
     }
 
+    private func resolveFFMPEGPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+        ]
+
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+
+    private func runProcess(executablePath: String, arguments: [String]) -> ProcessResult {
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: executablePath)
+        process.arguments = arguments
+
+        let stdoutPipe = Pipe()
+        let stderrPipe = Pipe()
+        process.standardOutput = stdoutPipe
+        process.standardError = stderrPipe
+
+        do {
+            try process.run()
+            process.waitUntilExit()
+
+            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+            return ProcessResult(
+                status: process.terminationStatus,
+                stdout: String(decoding: stdoutData, as: UTF8.self),
+                stderr: String(decoding: stderrData, as: UTF8.self)
+            )
+        } catch {
+            return ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+        }
+    }
+
     func waitUntilIdle() async {
         if inFlightPaths.isEmpty {
             return
@@ -178,6 +295,12 @@ private actor MP4Finalizer {
 }
 
 actor Channel {
+    private enum IngestContainerMode {
+        case unknown
+        case transportStream
+        case fragmentedMP4
+    }
+
     enum OfflineThumbnailBackfillResult: Sendable {
         case skipped
         case noVideoCandidate
@@ -206,6 +329,7 @@ actor Channel {
     private static let segmentTimelineMismatchMinClaimedSeconds: Double = 120
     private static let segmentTimelineMismatchMaxRatio: Double = 2.0
     private static let segmentTimelineMismatchRequiredEvents: Int = 3
+    private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 20
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -255,8 +379,15 @@ actor Channel {
     private var recordingPreviewTempPath: String?
     private var activeInitSegmentURI: String?
     private var activeInitSegmentData: Data?
+    private var activeAudioPlaylistURL: String?
+    private var activeAudioInitSegmentURI: String?
+    private var activeAudioInitSegmentData: Data?
     private var activeFragmentTimescale: UInt32?
+    private var ingestContainerMode: IngestContainerMode = .unknown
     private var currentFileDecodeTimeOffset: UInt64?
+    private var currentAudioFile: FileHandle?
+    private var currentAudioWorkingFilename: String?
+    private var currentAudioFilesize: Int = 0
     private var previousRawSegmentDecodeStartTime: UInt64?
     private var previousSegmentDecodeStartTime: UInt64?
     private var cumulativeClaimedSegmentDuration: Double = 0
@@ -479,6 +610,7 @@ actor Channel {
             isOnline: isOnline,
             isPaused: config.isPaused,
             isPausedBySessionLimit: isPausedBySessionLimit,
+            isActivelyRecording: currentFile != nil || activeRecordingID != nil,
             username: config.username,
             duration: formatDuration(duration),
             filesize: formatFilesize(filesize),
@@ -962,7 +1094,19 @@ actor Channel {
         isChecking = false
         let jitter = Double.random(in: 0.9...1.1)
         let adjustedWait = UInt64(Double(waitTimeSeconds) * jitter * 1_000_000_000)
-        try? await Task.sleep(nanoseconds: adjustedWait)
+
+        // While globally paused, we still poll slowly, but wake quickly when
+        // recording is re-enabled so channels can resume without multi-minute lag.
+        let sleepChunk: UInt64 = 5_000_000_000
+        var elapsed: UInt64 = 0
+        while elapsed < adjustedWait && !Task.isCancelled {
+            if appConfig.recordingEnabled {
+                break
+            }
+            let duration = min(sleepChunk, adjustedWait - elapsed)
+            try? await Task.sleep(nanoseconds: duration)
+            elapsed += duration
+        }
     }
     
     private func recordStream() async throws {
@@ -1010,6 +1154,7 @@ actor Channel {
                             framerate: config.framerate
                         )
                     }
+                    activeAudioPlaylistURL = playlist.audioPlaylistURL
 
                     endWaitingForSlotMonitoring()
 
@@ -1037,7 +1182,15 @@ actor Channel {
                     isOnline = true
                     markLastOnlineNow()
                     addLog("Recording slot acquired")
-                    addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps)")
+                    let codecsSummary = playlist.codecs ?? "unknown"
+                    let audioSummary = playlist.audioLikelyPresent ? "audio signaled" : "audio not signaled"
+                    addLog("Stream quality - resolution \(playlist.resolution)p (target: \(config.resolution)p), framerate \(playlist.framerate)fps (target: \(config.framerate)fps), codecs \(codecsSummary), \(audioSummary)")
+                    if playlist.audioPlaylistURL != nil {
+                        addLog("Split audio playlist detected; recording audio sidecar for final MP4 mux")
+                    }
+                    if !playlist.audioLikelyPresent {
+                        addLog("Selected variant appears video-only; recording may have no audio track")
+                    }
 
                     try await watchSegments(playlist: playlist)
                 }
@@ -1325,8 +1478,12 @@ actor Channel {
     }
     
     private func watchSegments(playlist: Playlist) async throws {
-        var lastSeq = -1
+        var lastVideoSeq = -1
+        var lastAudioSeq = -1
         let httpClient = HTTPClient(config: appConfig)
+        let recordingStartedAt = Date()
+        let noSegmentTimeoutSeconds = 45.0 // Alert if no segments after 45 seconds
+        var emptySegmentCount = 0
         
         while !Task.isCancelled && !config.isPaused && appConfig.recordingEnabled {
             let content = try await httpClient.get(playlist.playlistURL)
@@ -1337,12 +1494,13 @@ actor Channel {
             )
             let segments = try M3U8Parser.parseMediaPlaylist(content)
 
-            if lastSeq == -1, let latestSequence = segments.last?.sequenceNumber {
+            if lastVideoSeq == -1, let latestSequence = segments.last?.sequenceNumber {
                 // On startup, begin from the latest published segment to avoid
                 // failing on older entries that may already be expired.
-                lastSeq = max(-1, latestSequence - 1)
+                lastVideoSeq = max(-1, latestSequence - 1)
             }
             
+            var processedAnySegment = false
             for segment in segments {
                 if Task.isCancelled || config.isPaused {
                     throw ChaturbateError.paused
@@ -1352,10 +1510,11 @@ actor Channel {
                 }
                 
                 let seq = segment.sequenceNumber
-                if seq == -1 || seq <= lastSeq {
+                if seq == -1 || seq <= lastVideoSeq {
                     continue
                 }
-                lastSeq = seq
+                lastVideoSeq = seq
+                processedAnySegment = true
 
                 let segmentURL = resolveSegmentURL(segment.uri, playlistURL: playlist.playlistURL)
                 
@@ -1367,6 +1526,58 @@ actor Channel {
                 )
 
                 try await handleSegment(data: segmentData, duration: segment.duration)
+            }
+
+            if let audioPlaylistURL = activeAudioPlaylistURL {
+                let audioContent = try await httpClient.get(audioPlaylistURL)
+                try await refreshActiveAudioInitSegment(
+                    mediaPlaylistContent: audioContent,
+                    playlistURL: audioPlaylistURL,
+                    httpClient: httpClient
+                )
+                let audioSegments = try M3U8Parser.parseMediaPlaylist(audioContent)
+
+                if lastAudioSeq == -1, let latestAudioSequence = audioSegments.last?.sequenceNumber {
+                    // Align startup behavior with video to avoid immediate stale-segment fetches.
+                    lastAudioSeq = max(-1, latestAudioSequence - 1)
+                }
+
+                for segment in audioSegments {
+                    if Task.isCancelled || config.isPaused {
+                        throw ChaturbateError.paused
+                    }
+                    if !appConfig.recordingEnabled {
+                        break
+                    }
+
+                    let seq = segment.sequenceNumber
+                    if seq == -1 || seq <= lastAudioSeq {
+                        continue
+                    }
+                    lastAudioSeq = seq
+
+                    let segmentURL = resolveSegmentURL(segment.uri, playlistURL: audioPlaylistURL)
+                    let audioData = try await downloadSegmentWithRetry(
+                        httpClient: httpClient,
+                        url: segmentURL,
+                        maxRetries: 2,
+                        updateStreamHealth: false
+                    )
+
+                    try await handleAudioSegment(data: audioData)
+                }
+            }
+            
+            // Detect if we're stuck with no segments (indicates potential stream issue)
+            if !processedAnySegment {
+                emptySegmentCount += 1
+                let timeSinceStart = Date().timeIntervalSince(recordingStartedAt)
+                
+                if timeSinceStart > noSegmentTimeoutSeconds && emptySegmentCount > 5 {
+                    addLog("⚠️ No segments downloaded after \(Int(timeSinceStart))s (\(emptySegmentCount) empty cycles); stream may have stalled")
+                }
+            } else {
+                emptySegmentCount = 0
             }
             
             try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
@@ -1610,8 +1821,10 @@ actor Channel {
         try validateSegmentTimeline(claimedDuration: duration, observedDuration: observedSegmentDuration)
 
         if pendingTimestampDiscontinuity && filesize > 0 {
-            addLog("Timestamp discontinuity detected, rolling to a new recording file")
+            addLog("Timestamp discontinuity detected; dropping current segment and rolling to a new recording file")
             try await nextFile()
+            pendingTimestampDiscontinuity = false
+            return
         }
         pendingTimestampDiscontinuity = false
 
@@ -1673,6 +1886,26 @@ actor Channel {
             try await nextFile()
             addLog("Max filesize or duration exceeded, next file queued")
         }
+    }
+
+    private func handleAudioSegment(data: Data) async throws {
+        guard activeAudioPlaylistURL != nil else {
+            return
+        }
+
+        try await ensureCurrentFileOpenForWrite()
+
+        guard let audioFile = currentAudioFile else {
+            return
+        }
+
+        if currentAudioFilesize == 0, let initData = activeAudioInitSegmentData {
+            try audioFile.write(contentsOf: initData)
+            currentAudioFilesize += initData.count
+        }
+
+        try audioFile.write(contentsOf: data)
+        currentAudioFilesize += data.count
     }
     
     private func nextFile() async throws {
@@ -1758,6 +1991,8 @@ actor Channel {
     private func createNewFile(filename: String, fileExtension: String) async throws {
         let fileURL = URL(fileURLWithPath: (filename as NSString).expandingTildeInPath + ".\(fileExtension)")
         let workingURL = workingFileURL(for: fileURL)
+        let shouldRecordAudioSidecar = (fileExtension.lowercased() == "mp4" && activeAudioPlaylistURL != nil)
+        let audioWorkingURL = shouldRecordAudioSidecar ? workingAudioFileURL(for: fileURL) : nil
 
         let directory = fileURL.deletingLastPathComponent()
         try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
@@ -1771,13 +2006,35 @@ actor Channel {
             throw ChaturbateError.fileError("Could not create file: \(workingURL.path)")
         }
 
+        if let audioWorkingURL {
+            if FileManager.default.fileExists(atPath: audioWorkingURL.path) {
+                try FileManager.default.removeItem(at: audioWorkingURL)
+            }
+
+            let audioCreated = FileManager.default.createFile(atPath: audioWorkingURL.path, contents: nil)
+            guard audioCreated else {
+                throw ChaturbateError.fileError("Could not create audio sidecar file: \(audioWorkingURL.path)")
+            }
+        }
+
         guard let fileHandle = FileHandle(forWritingAtPath: workingURL.path) else {
             throw ChaturbateError.fileError("Could not open file: \(workingURL.path)")
+        }
+
+        var audioHandle: FileHandle?
+        if let audioWorkingURL {
+            guard let opened = FileHandle(forWritingAtPath: audioWorkingURL.path) else {
+                throw ChaturbateError.fileError("Could not open audio sidecar file: \(audioWorkingURL.path)")
+            }
+            audioHandle = opened
         }
 
         currentFile = fileHandle
         currentFilename = fileURL.path
         currentWorkingFilename = workingURL.path
+        currentAudioFile = audioHandle
+        currentAudioWorkingFilename = audioWorkingURL?.path
+        currentAudioFilesize = 0
 
         config.recordingHistory.append(fileURL.path)
         if config.recordingHistory.count > 200 {
@@ -1802,12 +2059,14 @@ actor Channel {
                 eventType: "recording_started",
                 message: "Recording file opened"
             )
+            addLog("Recording file created: \(fileExtension.uppercased()) (0 KB, awaiting segments)")
         }
     }
 
     private func closeCurrentFile(resetStats: Bool) {
         let finalPath = currentFilename
         let workingPath = currentWorkingFilename
+        let audioWorkingPath = currentAudioWorkingFilename
         let shouldFinalizeMP4 = (finalPath as NSString?)?.pathExtension.lowercased() == "mp4"
         let recordingID = activeRecordingID
         let durationSnapshot = duration
@@ -1825,12 +2084,32 @@ actor Channel {
             currentFile = nil
         }
 
+        if let audioFile = currentAudioFile {
+            do {
+                try audioFile.synchronize()
+                try audioFile.close()
+            } catch {
+                addLog("Could not close recording audio sidecar cleanly: \(error.localizedDescription)")
+            }
+
+            currentAudioFile = nil
+        }
+
+        let usableAudioWorkingPath: String? = {
+            guard let audioWorkingPath,
+                  FileManager.default.fileExists(atPath: audioWorkingPath) else {
+                return nil
+            }
+            return audioWorkingPath
+        }()
+
         if shouldFinalizeMP4, let workingPath, let finalPath {
             let channelName = config.username
             let recordingLedger = self.recordingLedger
             Task {
                 await Self.mp4Finalizer.enqueue(
                     sourcePath: workingPath,
+                    audioSourcePath: usableAudioWorkingPath,
                     destinationPath: finalPath,
                     channel: channelName
                 ) { outcome in
@@ -1877,6 +2156,10 @@ actor Channel {
                 addLog("Could not publish recording file cleanly: \(error.localizedDescription)")
             }
 
+            if let usableAudioWorkingPath {
+                try? FileManager.default.removeItem(atPath: usableAudioWorkingPath)
+            }
+
             if let recordingID {
                 let recordingLedger = self.recordingLedger
                 let resolvedFinalPath = FileManager.default.fileExists(atPath: finalPath) ? finalPath : workingPath
@@ -1916,6 +2199,8 @@ actor Channel {
             lastRecordingProgressPersistAt = .distantPast
             currentFilename = nil
             currentWorkingFilename = nil
+            currentAudioWorkingFilename = nil
+            currentAudioFilesize = 0
             pendingFilenameBase = nil
             currentFileDecodeTimeOffset = nil
             resetSegmentTimelineTracking()
@@ -1924,6 +2209,12 @@ actor Channel {
 
     private func workingFileURL(for visibleFileURL: URL) -> URL {
         let hiddenName = ".\(visibleFileURL.lastPathComponent)"
+        return visibleFileURL.deletingLastPathComponent().appendingPathComponent(hiddenName)
+    }
+
+    private func workingAudioFileURL(for visibleFileURL: URL) -> URL {
+        let baseName = visibleFileURL.deletingPathExtension().lastPathComponent
+        let hiddenName = ".\(baseName)_audio.m4a"
         return visibleFileURL.deletingLastPathComponent().appendingPathComponent(hiddenName)
     }
 
@@ -1941,31 +2232,69 @@ actor Channel {
         // still forcing file rollover on discontinuities.
         if let previousRaw = previousRawSegmentDecodeStartTime,
            rawDecodeStartTime < previousRaw {
-            currentFileDecodeTimeOffset = rawDecodeStartTime
             pendingTimestampDiscontinuity = true
             previousSegmentDecodeStartTime = nil
             addLog("fMP4 decode timeline rewind detected (raw tfdt \(rawDecodeStartTime) < \(previousRaw)); rolling to a new recording file")
-        } else if currentFileDecodeTimeOffset == nil {
-            currentFileDecodeTimeOffset = rawDecodeStartTime
+        } else if let previousRaw = previousRawSegmentDecodeStartTime,
+                  isForwardDecodeTimeJump(rawDecodeStartTime, previousRawDecodeStartTime: previousRaw) {
+            pendingTimestampDiscontinuity = true
+            previousSegmentDecodeStartTime = nil
+
+            if let timescale = activeFragmentTimescale, timescale > 0 {
+                let deltaSeconds = Double(rawDecodeStartTime - previousRaw) / Double(timescale)
+                addLog(
+                    "fMP4 decode timeline jump detected (+\(String(format: "%.2f", deltaSeconds))s raw tfdt \(previousRaw) -> \(rawDecodeStartTime)); rolling to a new recording file"
+                )
+            } else {
+                addLog(
+                    "fMP4 decode timeline jump detected (raw tfdt \(previousRaw) -> \(rawDecodeStartTime)); rolling to a new recording file"
+                )
+            }
         }
 
         previousRawSegmentDecodeStartTime = rawDecodeStartTime
 
-        let baseline = currentFileDecodeTimeOffset ?? rawDecodeStartTime
-        let normalizedDecodeStartTime = rawDecodeStartTime >= baseline
-            ? (rawDecodeStartTime - baseline)
-            : rawDecodeStartTime
+        // Preserve original fragment timestamps; mutating tfdt in-place can
+        // corrupt long-session playback timing.
+        return (data, rawDecodeStartTime)
+    }
 
-        return (data, normalizedDecodeStartTime)
+    private func isForwardDecodeTimeJump(_ rawDecodeStartTime: UInt64, previousRawDecodeStartTime: UInt64) -> Bool {
+        guard rawDecodeStartTime > previousRawDecodeStartTime,
+              let timescale = activeFragmentTimescale,
+              timescale > 0 else {
+            return false
+        }
+
+        let deltaSeconds = Double(rawDecodeStartTime - previousRawDecodeStartTime) / Double(timescale)
+        guard deltaSeconds.isFinite else {
+            return false
+        }
+
+        return deltaSeconds > Self.fmp4ForwardDecodeJumpThresholdSeconds
     }
 
     private func extractFirstTFDTDecodeTime(from data: Data) -> UInt64? {
         let bytes = [UInt8](data)
         guard !bytes.isEmpty else { return nil }
-        return findFirstTFDTDecodeTime(in: bytes, range: 0..<bytes.count)
+        guard let location = findFirstTFDTLocation(in: bytes, range: 0..<bytes.count) else {
+            return nil
+        }
+
+        if location.version == 1 {
+            guard location.valueOffset + 8 <= location.payloadEnd else {
+                return nil
+            }
+            return readUInt64(bytes, at: location.valueOffset)
+        }
+
+        guard location.valueOffset + 4 <= location.payloadEnd else {
+            return nil
+        }
+        return UInt64(readUInt32(bytes, at: location.valueOffset))
     }
 
-    private func findFirstTFDTDecodeTime(in bytes: [UInt8], range: Range<Int>) -> UInt64? {
+    private func findFirstTFDTLocation(in bytes: [UInt8], range: Range<Int>) -> (version: UInt8, valueOffset: Int, payloadEnd: Int)? {
         var cursor = range.lowerBound
 
         while cursor + 8 <= range.upperBound {
@@ -2000,30 +2329,45 @@ actor Channel {
                 let version = bytes[payloadStart]
                 let valueOffset = payloadStart + 4
 
-                if version == 1 {
-                    guard valueOffset + 8 <= payloadEnd else {
-                        cursor += boxSize
-                        continue
-                    }
-                    return readUInt64(bytes, at: valueOffset)
-                }
-
-                guard valueOffset + 4 <= payloadEnd else {
+                guard version == 0 || version == 1 else {
                     cursor += boxSize
                     continue
                 }
-                return UInt64(readUInt32(bytes, at: valueOffset))
+
+                return (version, valueOffset, payloadEnd)
             }
 
             if isContainerBox(type), payloadStart < payloadEnd,
-               let nestedDecodeTime = findFirstTFDTDecodeTime(in: bytes, range: payloadStart..<payloadEnd) {
-                return nestedDecodeTime
+               let nestedLocation = findFirstTFDTLocation(in: bytes, range: payloadStart..<payloadEnd) {
+                return nestedLocation
             }
 
             cursor += boxSize
         }
 
         return nil
+    }
+
+    private func rewriteFirstTFDTDecodeTime(in data: Data, to decodeTime: UInt64) -> Data? {
+        var bytes = [UInt8](data)
+        guard let location = findFirstTFDTLocation(in: bytes, range: 0..<bytes.count) else {
+            return nil
+        }
+
+        if location.version == 1 {
+            guard location.valueOffset + 8 <= location.payloadEnd else {
+                return nil
+            }
+            writeUInt64(decodeTime, to: &bytes, at: location.valueOffset)
+            return Data(bytes)
+        }
+
+        guard decodeTime <= UInt64(UInt32.max),
+              location.valueOffset + 4 <= location.payloadEnd else {
+            return nil
+        }
+        writeUInt32(UInt32(decodeTime), to: &bytes, at: location.valueOffset)
+        return Data(bytes)
     }
 
     private func isContainerBox(_ type: String) -> Bool {
@@ -2167,6 +2511,9 @@ actor Channel {
         recentPreviewBytes = 0
         activeInitSegmentURI = nil
         activeInitSegmentData = nil
+        activeAudioPlaylistURL = nil
+        activeAudioInitSegmentURI = nil
+        activeAudioInitSegmentData = nil
         activeFragmentTimescale = nil
         resetSegmentTimelineTracking()
 
@@ -2178,11 +2525,22 @@ actor Channel {
 
     private func refreshActiveInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws {
         guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
+            if ingestContainerMode != .transportStream {
+                ingestContainerMode = .transportStream
+                addLog("Stream ingest mode: MPEG-TS segments (no #EXT-X-MAP)")
+            }
             activeInitSegmentURI = nil
             activeInitSegmentData = nil
+            activeAudioInitSegmentURI = nil
+            activeAudioInitSegmentData = nil
             activeFragmentTimescale = nil
             resetSegmentTimelineTracking()
             return
+        }
+
+        if ingestContainerMode != .fragmentedMP4 {
+            ingestContainerMode = .fragmentedMP4
+            addLog("Stream ingest mode: fragmented MP4 via #EXT-X-MAP")
         }
 
         if activeInitSegmentURI == initURI, activeInitSegmentData != nil {
@@ -2206,6 +2564,23 @@ actor Channel {
         if activeFragmentTimescale == nil {
             addLog("Could not read fMP4 timescale from init segment; duration guard disabled for this stream")
         }
+    }
+
+    private func refreshActiveAudioInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws {
+        guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
+            activeAudioInitSegmentURI = nil
+            activeAudioInitSegmentData = nil
+            return
+        }
+
+        if activeAudioInitSegmentURI == initURI, activeAudioInitSegmentData != nil {
+            return
+        }
+
+        let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
+        let initData = try await httpClient.getData(resolvedInitURL)
+        activeAudioInitSegmentURI = initURI
+        activeAudioInitSegmentData = initData
     }
 
     private func resetSegmentTimelineTracking() {

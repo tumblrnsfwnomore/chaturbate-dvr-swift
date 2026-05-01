@@ -2,7 +2,8 @@ import SwiftUI
 import AppKit
 
 struct RootView: View {
-    @StateObject private var manager = ChannelManager()
+    @ObservedObject var manager: ChannelManager
+    let appDelegate: AppDelegate
     @State private var showingLoginSheet = false
 
     private var shouldShowOnboarding: Bool {
@@ -18,13 +19,11 @@ struct RootView: View {
             }
         }
         .onAppear {
-            if let appDelegate = NSApp.delegate as? AppDelegate {
-                appDelegate.gracefulShutdownHandler = { [manager] in
-                    await manager.shutdownForTermination()
-                }
-                appDelegate.terminationBlockReasonProvider = { [manager] in
-                    manager.terminationBlockReason()
-                }
+            appDelegate.gracefulShutdownHandler = { [manager] in
+                await manager.shutdownForTermination()
+            }
+            appDelegate.terminationBlockReasonProvider = { [manager] in
+                manager.terminationBlockReason()
             }
         }
         .sheet(isPresented: $showingLoginSheet) {

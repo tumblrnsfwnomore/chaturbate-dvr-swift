@@ -100,6 +100,65 @@ The app uses modern Swift concurrency features:
 - Ensure you have sufficient disk space
 - Check file permissions in the output directory
 - Verify the filename pattern is valid
+- Fragmented MP4 streams now record split audio renditions and mux audio+video on finalize when an audio group is advertised in the HLS master playlist
+
+### Audit MP4 Timeline And Audio Health
+
+To scan a recordings directory for likely timestamp-corrupted files (retime candidates)
+and files missing an audio stream:
+
+```bash
+./scripts/audit-retime-candidates.sh --input "/path/to/recordings"
+```
+
+Useful options:
+
+```bash
+./scripts/audit-retime-candidates.sh \
+  --input "/path/to/recordings" \
+  --output-dir /tmp \
+  --large-gap-sec 5 \
+  --huge-gap-sec 30
+```
+
+The script writes a TSV report plus list files for:
+
+- `retime_required`
+- `retime_review`
+- `likely_ok`
+- `no_audio`
+
+### Batch Repair Timeline-Corrupted Files
+
+After running the retime audit, batch-repair all required candidates:
+
+```bash
+./scripts/batch-retime-repair.sh \
+  --report audits/retime-audit-YYYYMMDD-HHMMSS.tsv \
+  --class retime_required
+```
+
+Run a preview first:
+
+```bash
+./scripts/batch-retime-repair.sh \
+  --report audits/retime-audit-YYYYMMDD-HHMMSS.tsv \
+  --class retime_required \
+  --dry-run
+```
+
+Review a small batch in a separate folder:
+
+```bash
+./scripts/batch-retime-repair.sh \
+  --report audits/retime-audit-YYYYMMDD-HHMMSS.tsv \
+  --class retime_required \
+  --output-dir /tmp/retime-review \
+  --limit 5
+```
+
+By default, repaired files are written as sibling files with `_retimed.mp4` suffix.
+Use `--replace-source` only when you want verified outputs to replace originals.
 
 ### Batch Convert Recordings to Smaller MP4 Files
 

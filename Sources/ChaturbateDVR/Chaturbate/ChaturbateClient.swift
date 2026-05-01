@@ -1105,25 +1105,4 @@ actor ChaturbateClient {
 
         return known[code] ?? rawLanguage
     }
-
-    private func extractBioField(html: String, dataTestid: String) -> String? {
-        // Pattern to extract content from <td> with specific data-testid
-        // We need to be flexible with attribute ordering and formatting
-        let escapedTestid = NSRegularExpression.escapedPattern(for: dataTestid)
-        let pattern = "<td[^>]*data-testid=\"\(escapedTestid)\"[^>]*>([^<]*)</td>"
-        
-        guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
-            return nil
-        }
-        
-        let nsString = html as NSString
-        let matches = regex.matches(in: html, options: [], range: NSRange(location: 0, length: nsString.length))
-        
-        if let firstMatch = matches.first, let range = Range(firstMatch.range(at: 1), in: html) {
-            return String(html[range])
-        }
-        
-        // Field not found - this is normal, not all sections exist for all users/profiles
-        return nil
-    }
 }

@@ -17,6 +17,18 @@ struct RecordingReconcileSummary {
     var recovered: Int
 }
 
+struct ActiveRecordingRecoverySummary {
+    var checked: Int
+    var finalizedWithWarning: Int
+    var markedMissing: Int
+    var autoRepairCandidates: [ActiveRecordingAutoRepairCandidate]
+}
+
+struct ActiveRecordingAutoRepairCandidate: Sendable {
+    let path: String
+    let channelUsername: String
+}
+
 struct RecordingLedgerEntry: Sendable {
     let path: String
     let workingFilePath: String?
@@ -47,6 +59,16 @@ actor RecordingLedger {
         let status: String
         let sizeBytes: Int64
         let modifiedAt: Int64
+    }
+
+    private struct ActiveRecordingRow {
+        let id: Int64
+        let channelUsername: String
+        let path: String
+        let workingPath: String?
+        let startedAt: Int64
+        let durationSeconds: Double
+        let sizeBytes: Int64
     }
 
     private var database: OpaquePointer?
@@ -237,6 +259,7 @@ actor RecordingLedger {
         let observedSize = (finalAttributes?[.size] as? NSNumber)?.int64Value ?? fileSizeBytes
         let modified = ((finalAttributes?[.modificationDate] as? Date)?.timeIntervalSince1970).map(Int64.init)
         let exists = FileManager.default.fileExists(atPath: normalizedPath)
+        let audioPresent = exists ? await audioPresenceFromMediaFile(path: normalizedPath) : -1
         let now = nowUnix()
 
         let sql = """
@@ -249,6 +272,7 @@ actor RecordingLedger {
             status = ?,
             is_remuxed = ?,
             remuxed_at = CASE WHEN ? = 1 THEN ? ELSE remuxed_at END,
+            audio_present = ?,
             file_exists = ?,
             missing_since = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(missing_since, ?) END,
             file_last_seen_at = CASE WHEN ? = 1 THEN ? ELSE file_last_seen_at END,
@@ -268,18 +292,19 @@ actor RecordingLedger {
         sqlite3_bind_int(statement, 6, wasRemuxed ? 1 : 0)
         sqlite3_bind_int(statement, 7, wasRemuxed ? 1 : 0)
         sqlite3_bind_int64(statement, 8, now)
-        sqlite3_bind_int(statement, 9, exists ? 1 : 0)
+        sqlite3_bind_int(statement, 9, Int32(audioPresent))
         sqlite3_bind_int(statement, 10, exists ? 1 : 0)
-        sqlite3_bind_int64(statement, 11, now)
-        sqlite3_bind_int(statement, 12, exists ? 1 : 0)
-        sqlite3_bind_int64(statement, 13, now)
+        sqlite3_bind_int(statement, 11, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 12, now)
+        sqlite3_bind_int(statement, 13, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 14, now)
         if let modified {
-            sqlite3_bind_int64(statement, 14, modified)
+            sqlite3_bind_int64(statement, 15, modified)
         } else {
-            sqlite3_bind_null(statement, 14)
+            sqlite3_bind_null(statement, 15)
         }
-        sqlite3_bind_int64(statement, 15, now)
-        sqlite3_bind_int64(statement, 16, recordingID)
+        sqlite3_bind_int64(statement, 16, now)
+        sqlite3_bind_int64(statement, 17, recordingID)
 
         _ = sqlite3_step(statement)
     }
@@ -426,6 +451,152 @@ actor RecordingLedger {
         return summary
     }
 
+    func recoverAbandonedActiveRecordings(activeBefore cutoffUnix: Int64) async -> ActiveRecordingRecoverySummary {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return ActiveRecordingRecoverySummary(checked: 0, finalizedWithWarning: 0, markedMissing: 0, autoRepairCandidates: [])
+        }
+
+        let rows = loadActiveRecordingRows(activeBefore: cutoffUnix, database: database)
+        guard !rows.isEmpty else {
+            return ActiveRecordingRecoverySummary(checked: 0, finalizedWithWarning: 0, markedMissing: 0, autoRepairCandidates: [])
+        }
+
+        var summary = ActiveRecordingRecoverySummary(
+            checked: rows.count,
+            finalizedWithWarning: 0,
+            markedMissing: 0,
+            autoRepairCandidates: []
+        )
+        let now = nowUnix()
+        var queuedRepairPaths = Set<String>()
+
+        for row in rows {
+            let fileManager = FileManager.default
+
+            let finalPath = normalizePath(row.path)
+            let finalExists = fileManager.fileExists(atPath: finalPath)
+
+            let normalizedWorkingPath = normalizeOptionalPath(row.workingPath)
+            let workingExists = normalizedWorkingPath.map { fileManager.fileExists(atPath: $0) } ?? false
+
+            var resolvedPath: String?
+            if finalExists {
+                resolvedPath = finalPath
+            } else if workingExists {
+                if let normalizedWorkingPath {
+                    do {
+                        if fileManager.fileExists(atPath: finalPath) {
+                            try fileManager.removeItem(atPath: finalPath)
+                        }
+                        try fileManager.moveItem(atPath: normalizedWorkingPath, toPath: finalPath)
+                        resolvedPath = finalPath
+                    } catch {
+                        resolvedPath = normalizedWorkingPath
+                    }
+                }
+            } else {
+                resolvedPath = nil
+            }
+
+            let resolvedAttributes = resolvedPath.flatMap { try? fileManager.attributesOfItem(atPath: $0) }
+            let observedSize = (resolvedAttributes?[.size] as? NSNumber)?.int64Value ?? (row.sizeBytes > 0 ? row.sizeBytes : nil)
+            let modifiedAtUnix = ((resolvedAttributes?[.modificationDate] as? Date)?.timeIntervalSince1970).map(Int64.init)
+            let endedUnix = modifiedAtUnix ?? now
+
+            let wallClockDuration = row.startedAt > 0 ? max(0, endedUnix - row.startedAt) : 0
+            let stabilizedDuration = max(row.durationSeconds, Double(wallClockDuration))
+
+            let status: String
+            if resolvedPath != nil {
+                status = "completed_with_warning"
+                summary.finalizedWithWarning += 1
+            } else {
+                status = "interrupted_missing"
+                summary.markedMissing += 1
+            }
+
+            let sql = """
+            UPDATE recordings
+            SET ended_at = COALESCE(ended_at, ?),
+                duration_seconds = CASE
+                    WHEN COALESCE(duration_seconds, 0) > ? THEN duration_seconds
+                    ELSE ?
+                END,
+                file_size_bytes = CASE
+                    WHEN ? IS NOT NULL THEN ?
+                    ELSE file_size_bytes
+                END,
+                file_path = COALESCE(?, file_path),
+                working_file_path = NULL,
+                status = ?,
+                file_exists = ?,
+                missing_since = CASE
+                    WHEN ? = 1 THEN NULL
+                    ELSE COALESCE(missing_since, ?)
+                END,
+                file_last_seen_at = CASE
+                    WHEN ? = 1 THEN ?
+                    ELSE file_last_seen_at
+                END,
+                file_last_modified_at = COALESCE(?, file_last_modified_at),
+                updated_at = ?
+            WHERE id = ?
+            """
+
+            guard let statement = prepare(database: database, sql: sql) else { continue }
+            defer { sqlite3_finalize(statement) }
+
+            sqlite3_bind_int64(statement, 1, endedUnix)
+            sqlite3_bind_double(statement, 2, stabilizedDuration)
+            sqlite3_bind_double(statement, 3, stabilizedDuration)
+            if let observedSize {
+                sqlite3_bind_int64(statement, 4, observedSize)
+                sqlite3_bind_int64(statement, 5, observedSize)
+            } else {
+                sqlite3_bind_null(statement, 4)
+                sqlite3_bind_null(statement, 5)
+            }
+            bindText(statement: statement, index: 6, value: resolvedPath)
+            bindText(statement: statement, index: 7, value: status)
+            sqlite3_bind_int(statement, 8, resolvedPath == nil ? 0 : 1)
+            sqlite3_bind_int(statement, 9, resolvedPath == nil ? 0 : 1)
+            sqlite3_bind_int64(statement, 10, now)
+            sqlite3_bind_int(statement, 11, resolvedPath == nil ? 0 : 1)
+            sqlite3_bind_int64(statement, 12, now)
+            if let modifiedAtUnix {
+                sqlite3_bind_int64(statement, 13, modifiedAtUnix)
+            } else {
+                sqlite3_bind_null(statement, 13)
+            }
+            sqlite3_bind_int64(statement, 14, now)
+            sqlite3_bind_int64(statement, 15, row.id)
+
+            _ = sqlite3_step(statement)
+
+            appendSystemEvent(
+                recordingID: row.id,
+                level: "WARN",
+                eventType: "abandoned_active_recovered",
+                message: "Recovered stale active recording after app restart",
+                database: database
+            )
+
+            if let resolvedPath,
+               URL(fileURLWithPath: resolvedPath).pathExtension.lowercased() == "mp4",
+               fileManager.fileExists(atPath: resolvedPath),
+               queuedRepairPaths.insert(resolvedPath).inserted {
+                summary.autoRepairCandidates.append(
+                    ActiveRecordingAutoRepairCandidate(
+                        path: resolvedPath,
+                        channelUsername: row.channelUsername
+                    )
+                )
+            }
+        }
+
+        return summary
+    }
+
     func fetchLibraryEntries(limit: Int? = nil, includeMissing: Bool = false) async -> [RecordingLedgerEntry] {
         guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
             return []
@@ -557,6 +728,48 @@ actor RecordingLedger {
         return entries
     }
 
+    func fetchStatusByPath(paths: [String]) async -> [String: String] {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return [:]
+        }
+
+        let normalizedPaths = Array(Set(paths.map(normalizePath))).filter { !$0.isEmpty }
+        guard !normalizedPaths.isEmpty else { return [:] }
+
+        var statuses: [String: String] = [:]
+        let chunkSize = 400
+        var start = 0
+
+        while start < normalizedPaths.count {
+            let end = min(start + chunkSize, normalizedPaths.count)
+            let chunk = Array(normalizedPaths[start..<end])
+            let placeholders = Array(repeating: "?", count: chunk.count).joined(separator: ",")
+            let sql = "SELECT file_path, status FROM recordings WHERE file_path IN (\(placeholders))"
+
+            guard let statement = prepare(database: database, sql: sql) else {
+                start = end
+                continue
+            }
+
+            for (offset, path) in chunk.enumerated() {
+                bindText(statement: statement, index: Int32(offset + 1), value: path)
+            }
+
+            while sqlite3_step(statement) == SQLITE_ROW {
+                guard let path = columnText(statement: statement, index: 0),
+                      let status = columnText(statement: statement, index: 1) else {
+                    continue
+                }
+                statuses[path] = status
+            }
+
+            sqlite3_finalize(statement)
+            start = end
+        }
+
+        return statuses
+    }
+
     func markRecordingMovedToTrash(filePath: String) async {
         guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
             return
@@ -580,6 +793,62 @@ actor RecordingLedger {
         sqlite3_bind_int64(statement, 2, now)
         bindText(statement: statement, index: 3, value: normalizedPath)
         _ = sqlite3_step(statement)
+    }
+
+    func markAutoRepairOutcome(filePath: String, failureReason: String?) async {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return
+        }
+
+        let normalizedPath = normalizePath(filePath)
+        let now = nowUnix()
+
+        if let failureReason {
+            if let recordingID = recordingID(forPath: normalizedPath, database: database) {
+                appendSystemEvent(
+                    recordingID: recordingID,
+                    level: "WARN",
+                    eventType: "abandoned_active_auto_repair_failed",
+                    message: failureReason,
+                    database: database
+                )
+            }
+            return
+        }
+
+        let sql = """
+        UPDATE recordings
+        SET status = 'completed',
+            is_remuxed = 1,
+            remuxed_at = CASE WHEN remuxed_at IS NULL THEN ? ELSE remuxed_at END,
+            file_exists = 1,
+            missing_since = NULL,
+            file_last_seen_at = CASE
+                WHEN file_last_seen_at IS NULL THEN ?
+                ELSE file_last_seen_at
+            END,
+            updated_at = ?
+        WHERE file_path = ?
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, now)
+        sqlite3_bind_int64(statement, 2, now)
+        sqlite3_bind_int64(statement, 3, now)
+        bindText(statement: statement, index: 4, value: normalizedPath)
+        _ = sqlite3_step(statement)
+
+        if let recordingID = recordingID(forPath: normalizedPath, database: database) {
+            appendSystemEvent(
+                recordingID: recordingID,
+                level: "INFO",
+                eventType: "abandoned_active_auto_repair_succeeded",
+                message: "Automatic startup repair finalized recovered recording",
+                database: database
+            )
+        }
     }
 
     // MARK: - Internal helpers
@@ -649,6 +918,7 @@ actor RecordingLedger {
             consecutive_segment_failures INTEGER NOT NULL DEFAULT 0,
             cloudflare_block_count INTEGER NOT NULL DEFAULT 0,
             timeline_mismatch_count INTEGER NOT NULL DEFAULT 0,
+            audio_present INTEGER NOT NULL DEFAULT -1,
             missing_since INTEGER,
             file_last_seen_at INTEGER,
             file_last_modified_at INTEGER,
@@ -681,6 +951,29 @@ actor RecordingLedger {
         """
 
         _ = sqlite3_exec(database, schema, nil, nil, nil)
+        ensureRecordingColumns(database: database)
+    }
+
+    private func ensureRecordingColumns(database: OpaquePointer) {
+        if !columnExists(table: "recordings", column: "audio_present", database: database) {
+            _ = sqlite3_exec(database, "ALTER TABLE recordings ADD COLUMN audio_present INTEGER NOT NULL DEFAULT -1;", nil, nil, nil)
+        }
+    }
+
+    private func columnExists(table: String, column: String, database: OpaquePointer) -> Bool {
+        let sql = "PRAGMA table_info(\(table));"
+        guard let statement = prepare(database: database, sql: sql) else {
+            return false
+        }
+        defer { sqlite3_finalize(statement) }
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            if let name = columnText(statement: statement, index: 1), name == column {
+                return true
+            }
+        }
+
+        return false
     }
 
     private func ensureChannelID(username: String, database: OpaquePointer) -> Int64 {
@@ -738,6 +1031,7 @@ actor RecordingLedger {
         let createdAt = (attributes[.creationDate] as? Date)
         let modifiedAt = (attributes[.modificationDate] as? Date) ?? Date()
         let durationSeconds = await durationFromMediaFile(path: normalizedPath)
+        let audioPresent = await audioPresenceFromMediaFile(path: normalizedPath)
 
         let endUnix = Int64(modifiedAt.timeIntervalSince1970)
         let startUnix: Int64
@@ -758,10 +1052,11 @@ actor RecordingLedger {
             channel_id, started_at, ended_at, duration_seconds, file_size_bytes,
             file_path, working_file_path, container, status, is_remuxed, remuxed_at,
             first_person_detected_at, last_person_detected_at,
+            audio_present,
             missing_since, file_last_seen_at, file_last_modified_at,
             file_exists, is_backfilled, created_at, updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'backfilled', ?, ?, NULL, NULL, NULL, ?, ?, 1, 1, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, NULL, ?, 'backfilled', ?, ?, NULL, NULL, ?, NULL, ?, ?, 1, 1, ?, ?)
         """
 
         guard let statement = prepare(database: database, sql: sql) else { return false }
@@ -784,10 +1079,11 @@ actor RecordingLedger {
         } else {
             sqlite3_bind_null(statement, 9)
         }
-        sqlite3_bind_int64(statement, 10, now)
-        sqlite3_bind_int64(statement, 11, endUnix)
-        sqlite3_bind_int64(statement, 12, now)
+        sqlite3_bind_int(statement, 10, Int32(audioPresent))
+        sqlite3_bind_int64(statement, 11, now)
+        sqlite3_bind_int64(statement, 12, endUnix)
         sqlite3_bind_int64(statement, 13, now)
+        sqlite3_bind_int64(statement, 14, now)
 
         guard sqlite3_step(statement) == SQLITE_DONE else { return false }
 
@@ -856,6 +1152,52 @@ actor RecordingLedger {
             let sizeBytes = sqlite3_column_int64(statement, 3)
             let modified = sqlite3_column_int64(statement, 4)
             rows.append(RecordingRow(id: id, path: path, status: status, sizeBytes: sizeBytes, modifiedAt: modified))
+        }
+        return rows
+    }
+
+    private func loadActiveRecordingRows(activeBefore cutoffUnix: Int64, database: OpaquePointer) -> [ActiveRecordingRow] {
+        let sql = """
+        SELECT
+                        r.id,
+                        c.username,
+                        r.file_path,
+                        r.working_file_path,
+                        COALESCE(r.started_at, r.created_at, r.updated_at, 0),
+                        COALESCE(r.duration_seconds, 0),
+                        COALESCE(r.file_size_bytes, 0)
+                FROM recordings r
+                JOIN channels c ON c.id = r.channel_id
+        WHERE status = 'active'
+                    AND COALESCE(r.updated_at, 0) <= ?
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return [] }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, cutoffUnix)
+
+        var rows: [ActiveRecordingRow] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            let channelUsername = columnText(statement: statement, index: 1) ?? "unknown"
+            let path = columnText(statement: statement, index: 2) ?? ""
+            let workingPath = columnText(statement: statement, index: 3)
+            let startedAt = sqlite3_column_int64(statement, 4)
+            let duration = sqlite3_column_double(statement, 5)
+            let sizeBytes = sqlite3_column_int64(statement, 6)
+
+            rows.append(
+                ActiveRecordingRow(
+                    id: id,
+                    channelUsername: channelUsername,
+                    path: path,
+                    workingPath: workingPath,
+                    startedAt: startedAt,
+                    durationSeconds: duration,
+                    sizeBytes: sizeBytes
+                )
+            )
         }
         return rows
     }
@@ -1098,6 +1440,20 @@ actor RecordingLedger {
             return seconds
         }
         return nil
+    }
+
+    private func audioPresenceFromMediaFile(path: String) async -> Int {
+        let asset = AVURLAsset(url: URL(fileURLWithPath: path))
+        if let audioTracks = try? await asset.loadTracks(withMediaType: .audio) {
+            return audioTracks.isEmpty ? 0 : 1
+        }
+
+        if let tracks = try? await asset.load(.tracks) {
+            let hasAudio = tracks.contains { $0.mediaType == .audio }
+            return hasAudio ? 1 : 0
+        }
+
+        return -1
     }
 
     private func prepare(database: OpaquePointer, sql: String) -> OpaquePointer? {
