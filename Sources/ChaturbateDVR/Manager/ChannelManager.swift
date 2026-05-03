@@ -290,7 +290,7 @@ actor RecordingCoordinator {
 
 @MainActor
 class ChannelManager: ObservableObject {
-    private static let visibleWorkingFilePrefix = "cbdvr_inprogress_"
+    nonisolated private static let visibleWorkingFilePrefix = "cbdvr_inprogress_"
 
     private static let thumbnailBackfillNoVideoCooldownSeconds: TimeInterval = 10 * 60
 
@@ -382,6 +382,7 @@ class ChannelManager: ObservableObject {
     private var pausedStatusCheckTask: Task<Void, Never>?
     private var offlineThumbnailBackfillTask: Task<Void, Never>?
     private var recordingLedgerMaintenanceTask: Task<Void, Never>?
+    private var scheduledFollowedImportTask: Task<Void, Never>?
     private var mp4RepairTask: Task<Void, Never>?
     private var recordingRepairRunTask: Task<Void, Never>?
     private var backgroundWorkerWatchdogTask: Task<Void, Never>?
@@ -392,6 +393,7 @@ class ChannelManager: ObservableObject {
     private var lastPausedProbeDeferralLogAt: Date = .distantPast
     private var thumbnailBackfillIndex: Int = 0
     private var thumbnailBackfillCooldownUntil: [String: Date] = [:]
+    private var newlyImportedChannels: Set<String> = []
     private let requestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
     private let recordingLedger: RecordingLedger
@@ -466,6 +468,7 @@ class ChannelManager: ObservableObject {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
             await recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
             await recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
+            await Channel.updateMaxConcurrentFinalizations(appConfig.maxConcurrentFinalizations)
         }
         
         loadConfig()
@@ -473,6 +476,7 @@ class ChannelManager: ObservableObject {
         startOfflineThumbnailBackfill()
         startRecordingLedgerMaintenance()
         startBackgroundWorkerWatchdog()
+        startScheduledFollowedImport()
         ensureRecordingRepairMaintenanceRunning()
         startRepairForFlaggedRecordings()
         // Bio backfill is manual via on-demand refresh controls in Add Channel and Settings
@@ -491,6 +495,7 @@ class ChannelManager: ObservableObject {
         pausedStatusCheckTask?.cancel()
         offlineThumbnailBackfillTask?.cancel()
         recordingLedgerMaintenanceTask?.cancel()
+        scheduledFollowedImportTask?.cancel()
         mp4RepairTask?.cancel()
         recordingRepairRunTask?.cancel()
         backgroundWorkerWatchdogTask?.cancel()
@@ -509,6 +514,8 @@ class ChannelManager: ObservableObject {
         offlineThumbnailBackfillTask = nil
         recordingLedgerMaintenanceTask?.cancel()
         recordingLedgerMaintenanceTask = nil
+        scheduledFollowedImportTask?.cancel()
+        scheduledFollowedImportTask = nil
         backgroundWorkerWatchdogTask?.cancel()
         backgroundWorkerWatchdogTask = nil
         recordingRepairStopAfterCurrentItem = true
@@ -720,6 +727,7 @@ class ChannelManager: ObservableObject {
                     continue
                 }
 
+                await self.setRecordingRepairState(.scanning, for: candidate.path)
                 let auditDecision = await Self.auditRecordingRepairCandidate(path: candidate.path)
                 await self.storeAuditDecision(auditDecision, for: candidate)
                 didAuditOnDisk = true
@@ -1317,9 +1325,11 @@ class ChannelManager: ObservableObject {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
             await self.recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
             await self.recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
+            await Channel.updateMaxConcurrentFinalizations(appConfig.maxConcurrentFinalizations)
 
             let recordingsCap = appConfig.maxConcurrentRecordings == 0 ? "unlimited" : String(appConfig.maxConcurrentRecordings)
             await FileLogger.shared.log("[manager] updated max concurrent recordings to \(recordingsCap)")
+            await FileLogger.shared.log("[manager] updated max concurrent finalizations to \(appConfig.maxConcurrentFinalizations)")
             await FileLogger.shared.log("[manager] recording \(appConfig.recordingEnabled ? "enabled" : "disabled")")
             
             for (_, channel) in channels {
@@ -1545,6 +1555,11 @@ class ChannelManager: ObservableObject {
         await recordingLedger.fetchLibraryEntries(includeMissing: false)
     }
 
+    func getRecordingDetail(path: String) async -> RecordingLedgerDetail? {
+        let normalizedPath = (path as NSString).expandingTildeInPath
+        return await recordingLedger.fetchRecordingDetail(filePath: normalizedPath)
+    }
+
     func getActivelyFinalizingPaths() async -> Set<String> {
         await Channel.activelyFinalizingPaths()
     }
@@ -1568,6 +1583,13 @@ class ChannelManager: ObservableObject {
             includeMissing: false
         )
         return entries.map(\ .path)
+    }
+
+    func getChannelRecordingEntries(username: String, includeMissing: Bool = true) async -> [RecordingLedgerEntry] {
+        await recordingLedger.fetchChannelRecordingEntries(
+            username: username,
+            includeMissing: includeMissing
+        )
     }
 
     func refreshLiveStreamURL(username: String) async -> String? {
@@ -1594,13 +1616,14 @@ class ChannelManager: ObservableObject {
 
         func sortPriority(for info: ChannelInfo) -> Int {
             // Requested order:
-            // 0: recording, 1: waiting for recording slot, 2: paused but online,
-            // 3: offline, 4: paused (offline)
+            // 0: recording, 1: waiting for recording slot, 2: online (unpaused),
+            // 3: paused but online, 4: offline, 5: paused (offline)
             if info.isActivelyRecording { return 0 }
             if info.isWaitingForRecordingSlot { return 1 }
-            if info.isOnline && info.isPaused { return 2 }
-            if !info.isOnline && !info.isPaused { return 3 }
-            return 4
+            if info.isOnline && !info.isPaused { return 2 }
+            if info.isOnline && info.isPaused { return 3 }
+            if !info.isOnline && !info.isPaused { return 4 }
+            return 5
         }
 
         let sortedInfos = infos.sorted { lhs, rhs in
@@ -1828,6 +1851,20 @@ class ChannelManager: ObservableObject {
                 }
 
                 await FileLogger.shared.log("[manager] import followed cams post-check complete")
+                
+                // Mark newly imported channels for priority thumbnail generation.
+                // Collect usernames while still on the detached task, then apply
+                // the mutation on the MainActor to satisfy strict concurrency.
+                var collectedUsernames: [String] = []
+                for channel in channelsToProbe {
+                    collectedUsernames.append(await channel.config.username)
+                }
+                let importedUsernames = collectedUsernames
+                await MainActor.run {
+                    for username in importedUsernames {
+                        self.newlyImportedChannels.insert(username)
+                    }
+                }
             }
         }
 
@@ -2113,7 +2150,7 @@ class ChannelManager: ObservableObject {
         Task {
             await FileLogger.shared.log("[manager] started offline thumbnail backfill")
         }
-        offlineThumbnailBackfillTask = Task { [weak self] in
+        offlineThumbnailBackfillTask = Task { @MainActor [weak self] in
             guard let self else { return }
 
             // Avoid startup I/O spikes: wait a bit before first backfill pass.
@@ -2179,6 +2216,46 @@ class ChannelManager: ObservableObject {
 
                 try? await Task.sleep(nanoseconds: 3 * 60 * 1_000_000_000)
             }
+        }
+    }
+
+    private func startScheduledFollowedImport() {
+        scheduledFollowedImportTask?.cancel()
+        scheduledFollowedImportTask = Task { [weak self] in
+            guard let self else { return }
+
+            await FileLogger.shared.log("[manager] started scheduled followed channel import")
+
+            // Run import on startup with a small delay to avoid competing with initial loads
+            try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
+            
+            while !Task.isCancelled {
+                await self.performScheduledFollowedImport()
+
+                // Import every 2 hours to discover new followed channels
+                let importIntervalSeconds: UInt64 = 2 * 60 * 60 * 1_000_000_000
+                try? await Task.sleep(nanoseconds: importIntervalSeconds)
+            }
+        }
+    }
+
+    private func performScheduledFollowedImport() async {
+        guard isAuthenticated else {
+            await FileLogger.shared.log("[manager] skipping scheduled followed import (not authenticated)", level: "DEBUG")
+            return
+        }
+
+        do {
+            let preview = try await prepareFollowedImport()
+            let result = await importFollowedChannelsFromPreview(preview)
+            
+            if result.imported > 0 {
+                await FileLogger.shared.log("[manager] scheduled followed import completed: imported=\(result.imported), skipped=\(result.skipped)")
+            } else {
+                await FileLogger.shared.log("[manager] scheduled followed import completed: no new channels found", level: "DEBUG")
+            }
+        } catch {
+            await FileLogger.shared.log("[manager] scheduled followed import failed: \(error.localizedDescription)", level: "WARN")
         }
     }
 
@@ -2268,6 +2345,34 @@ class ChannelManager: ObservableObject {
     }
 
     private func backfillOneOfflineThumbnail() async {
+        // First, prioritize generating thumbnails for newly imported online channels
+        let newlyImported = Array(self.newlyImportedChannels)
+        
+        for username in newlyImported {
+            guard let channel = channels[username] else {
+                // Channel was removed, clean up tracking
+                self.newlyImportedChannels.remove(username)
+                continue
+            }
+            
+            let info = await channel.getInfo()
+            
+            if info.isOnline && info.thumbnailPath == nil {
+                // Channel is online and needs a thumbnail; refresh it to trigger live preview generation
+                await FileLogger.shared.log("Thumbnail backfill: prioritizing newly imported online channel", channel: username)
+                await channel.refreshPausedOnlineStatus(bypassRateLimit: true)
+                
+                // Remove from newly imported set after processing
+                self.newlyImportedChannels.remove(username)
+                return
+            } else if info.isOnline {
+                // Channel is online and already has a thumbnail, remove from tracking
+                self.newlyImportedChannels.remove(username)
+            }
+            // If channel is offline, leave it in newly imported set for now; we'll try to generate offline thumbnail later
+        }
+        
+        // Standard offline thumbnail backfill
         var candidates: [(String, Channel)] = []
         let now = Date()
 
@@ -2335,6 +2440,9 @@ class ChannelManager: ObservableObject {
             default:
                 break
             }
+            
+            // Clean up newly imported tracking after processing
+            self.newlyImportedChannels.remove(username)
         } catch {
             if error is TimeoutError {
                 await channel.addLogFromManager("Thumbnail generation timed out after 30 seconds, moving to next channel")
@@ -2343,6 +2451,9 @@ class ChannelManager: ObservableObject {
                 await channel.addLogFromManager("Thumbnail generation failed during background backfill: \(error.localizedDescription)")
                 await FileLogger.shared.log("Thumbnail backfill: unexpected error - \(error.localizedDescription)", channel: username, level: "WARN")
             }
+            
+            // Clean up newly imported tracking after error
+            self.newlyImportedChannels.remove(username)
         }
     }
 

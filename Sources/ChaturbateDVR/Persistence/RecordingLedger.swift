@@ -35,9 +35,58 @@ struct RecordingLedgerEntry: Sendable {
     let channelUsername: String
     let fileExtension: String
     let fileSizeBytes: Int64
+    let durationSeconds: Double
+    let startedAt: Date?
+    let endedAt: Date?
     let modifiedAt: Date
     let fileExists: Bool
     let status: String
+
+    var isActive: Bool {
+        status == "active"
+    }
+
+    var isFinalizing: Bool {
+        status == "finalizing"
+    }
+}
+
+struct RecordingEventEntry: Sendable, Identifiable {
+    let id: Int64
+    let createdAt: Date
+    let level: String
+    let eventType: String
+    let message: String
+    let metadataJSON: String?
+}
+
+struct RecordingLedgerDetail: Sendable {
+    let id: Int64
+    let path: String
+    let workingFilePath: String?
+    let channelUsername: String
+    let fileExtension: String
+    let status: String
+    let durationSeconds: Double
+    let fileSizeBytes: Int64
+    let fileExists: Bool
+    let startedAt: Date?
+    let endedAt: Date?
+    let remuxedAt: Date?
+    let firstPersonDetectedAt: Date?
+    let lastPersonDetectedAt: Date?
+    let noPersonDurationSeconds: Int
+    let segmentRetryCount: Int
+    let consecutiveSegmentFailures: Int
+    let cloudflareBlockCount: Int
+    let timelineMismatchCount: Int
+    let audioPresent: Int
+    let missingSince: Date?
+    let fileLastSeenAt: Date?
+    let fileLastModifiedAt: Date?
+    let isRemuxed: Bool
+    let isBackfilled: Bool
+    let events: [RecordingEventEntry]
 
     var isActive: Bool {
         status == "active"
@@ -698,6 +747,9 @@ actor RecordingLedger {
             c.username,
             COALESCE(r.container, ''),
             COALESCE(r.file_size_bytes, 0),
+            COALESCE(r.duration_seconds, 0),
+            r.started_at,
+            r.ended_at,
             COALESCE(r.file_last_modified_at, r.ended_at, r.updated_at, r.created_at, 0),
             COALESCE(r.file_exists, 0),
             r.status
@@ -707,6 +759,9 @@ actor RecordingLedger {
 
         if !includeMissing {
             sql += " WHERE (COALESCE(r.file_exists, 0) = 1 OR r.status IN ('active', 'finalizing'))"
+            sql += " AND r.status != 'deleted'"
+        } else {
+            sql += " WHERE r.status != 'deleted'"
         }
         sql += " ORDER BY COALESCE(r.file_last_modified_at, r.ended_at, r.updated_at, r.created_at, 0) DESC"
 
@@ -724,9 +779,12 @@ actor RecordingLedger {
             let channel = columnText(statement: statement, index: 2) ?? "unknown"
             let container = columnText(statement: statement, index: 3) ?? ""
             let sizeBytes = sqlite3_column_int64(statement, 4)
-            let modifiedUnix = sqlite3_column_int64(statement, 5)
-            let fileExists = sqlite3_column_int(statement, 6) != 0
-            let status = columnText(statement: statement, index: 7) ?? "unknown"
+            let durationSeconds = sqlite3_column_double(statement, 5)
+            let startedAt = optionalDate(statement: statement, index: 6)
+            let endedAt = optionalDate(statement: statement, index: 7)
+            let modifiedUnix = sqlite3_column_int64(statement, 8)
+            let fileExists = sqlite3_column_int(statement, 9) != 0
+            let status = columnText(statement: statement, index: 10) ?? "unknown"
 
             let ext = container.isEmpty ? URL(fileURLWithPath: path).pathExtension.lowercased() : container.lowercased()
             let modifiedAt = Date(timeIntervalSince1970: TimeInterval(modifiedUnix))
@@ -738,6 +796,9 @@ actor RecordingLedger {
                     channelUsername: channel,
                     fileExtension: ext,
                     fileSizeBytes: sizeBytes,
+                    durationSeconds: durationSeconds,
+                    startedAt: startedAt,
+                    endedAt: endedAt,
                     modifiedAt: modifiedAt,
                     fileExists: fileExists,
                     status: status
@@ -764,6 +825,9 @@ actor RecordingLedger {
             c.username,
             COALESCE(r.container, ''),
             COALESCE(r.file_size_bytes, 0),
+            COALESCE(r.duration_seconds, 0),
+            r.started_at,
+            r.ended_at,
             COALESCE(r.file_last_modified_at, r.ended_at, r.updated_at, r.created_at, 0),
             COALESCE(r.file_exists, 0),
             r.status
@@ -775,6 +839,7 @@ actor RecordingLedger {
         if !includeMissing {
             sql += " AND (COALESCE(r.file_exists, 0) = 1 OR r.status = 'active')"
         }
+        sql += " AND r.status != 'deleted'"
         sql += " ORDER BY COALESCE(r.file_last_modified_at, r.ended_at, r.updated_at, r.created_at, 0) DESC"
 
         if let limit, limit > 0 {
@@ -793,9 +858,12 @@ actor RecordingLedger {
             let channel = columnText(statement: statement, index: 2) ?? username
             let container = columnText(statement: statement, index: 3) ?? ""
             let sizeBytes = sqlite3_column_int64(statement, 4)
-            let modifiedUnix = sqlite3_column_int64(statement, 5)
-            let fileExists = sqlite3_column_int(statement, 6) != 0
-            let status = columnText(statement: statement, index: 7) ?? "unknown"
+            let durationSeconds = sqlite3_column_double(statement, 5)
+            let startedAt = optionalDate(statement: statement, index: 6)
+            let endedAt = optionalDate(statement: statement, index: 7)
+            let modifiedUnix = sqlite3_column_int64(statement, 8)
+            let fileExists = sqlite3_column_int(statement, 9) != 0
+            let status = columnText(statement: statement, index: 10) ?? "unknown"
 
             let ext = container.isEmpty ? URL(fileURLWithPath: path).pathExtension.lowercased() : container.lowercased()
             let modifiedAt = Date(timeIntervalSince1970: TimeInterval(modifiedUnix))
@@ -807,6 +875,9 @@ actor RecordingLedger {
                     channelUsername: channel,
                     fileExtension: ext,
                     fileSizeBytes: sizeBytes,
+                    durationSeconds: durationSeconds,
+                    startedAt: startedAt,
+                    endedAt: endedAt,
                     modifiedAt: modifiedAt,
                     fileExists: fileExists,
                     status: status
@@ -815,6 +886,98 @@ actor RecordingLedger {
         }
 
         return entries
+    }
+
+    func fetchRecordingDetail(filePath: String) async -> RecordingLedgerDetail? {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return nil
+        }
+
+        let normalizedPath = normalizePath(filePath)
+        let sql = """
+        SELECT
+            r.id,
+            r.file_path,
+            r.working_file_path,
+            c.username,
+            COALESCE(r.container, ''),
+            r.status,
+            COALESCE(r.duration_seconds, 0),
+            COALESCE(r.file_size_bytes, 0),
+            COALESCE(r.file_exists, 0),
+            r.started_at,
+            r.ended_at,
+            r.remuxed_at,
+            r.first_person_detected_at,
+            r.last_person_detected_at,
+            COALESCE(r.no_person_duration_seconds, 0),
+            COALESCE(r.segment_retry_count, 0),
+            COALESCE(r.consecutive_segment_failures, 0),
+            COALESCE(r.cloudflare_block_count, 0),
+            COALESCE(r.timeline_mismatch_count, 0),
+            COALESCE(r.audio_present, -1),
+            r.missing_since,
+            r.file_last_seen_at,
+            r.file_last_modified_at,
+            COALESCE(r.is_remuxed, 0),
+            COALESCE(r.is_backfilled, 0)
+        FROM recordings r
+        JOIN channels c ON c.id = r.channel_id
+        WHERE r.file_path = ?
+        LIMIT 1
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return nil }
+        defer { sqlite3_finalize(statement) }
+
+        bindText(statement: statement, index: 1, value: normalizedPath)
+
+        guard sqlite3_step(statement) == SQLITE_ROW else {
+            return nil
+        }
+
+        let recordingID = sqlite3_column_int64(statement, 0)
+        guard let path = columnText(statement: statement, index: 1) else {
+            return nil
+        }
+
+        let workingFilePath = normalizeOptionalPath(columnText(statement: statement, index: 2))
+        let channelUsername = columnText(statement: statement, index: 3) ?? "unknown"
+        let container = columnText(statement: statement, index: 4) ?? ""
+        let status = columnText(statement: statement, index: 5) ?? "unknown"
+        let durationSeconds = sqlite3_column_double(statement, 6)
+        let fileSizeBytes = sqlite3_column_int64(statement, 7)
+        let fileExists = sqlite3_column_int(statement, 8) != 0
+        let fileExtension = container.isEmpty ? URL(fileURLWithPath: path).pathExtension.lowercased() : container.lowercased()
+
+        return RecordingLedgerDetail(
+            id: recordingID,
+            path: normalizePath(path),
+            workingFilePath: workingFilePath,
+            channelUsername: channelUsername,
+            fileExtension: fileExtension,
+            status: status,
+            durationSeconds: durationSeconds,
+            fileSizeBytes: fileSizeBytes,
+            fileExists: fileExists,
+            startedAt: optionalDate(statement: statement, index: 9),
+            endedAt: optionalDate(statement: statement, index: 10),
+            remuxedAt: optionalDate(statement: statement, index: 11),
+            firstPersonDetectedAt: optionalDate(statement: statement, index: 12),
+            lastPersonDetectedAt: optionalDate(statement: statement, index: 13),
+            noPersonDurationSeconds: Int(sqlite3_column_int64(statement, 14)),
+            segmentRetryCount: Int(sqlite3_column_int64(statement, 15)),
+            consecutiveSegmentFailures: Int(sqlite3_column_int64(statement, 16)),
+            cloudflareBlockCount: Int(sqlite3_column_int64(statement, 17)),
+            timelineMismatchCount: Int(sqlite3_column_int64(statement, 18)),
+            audioPresent: Int(sqlite3_column_int64(statement, 19)),
+            missingSince: optionalDate(statement: statement, index: 20),
+            fileLastSeenAt: optionalDate(statement: statement, index: 21),
+            fileLastModifiedAt: optionalDate(statement: statement, index: 22),
+            isRemuxed: sqlite3_column_int(statement, 23) != 0,
+            isBackfilled: sqlite3_column_int(statement, 24) != 0,
+            events: fetchRecordingEvents(recordingID: recordingID, database: database)
+        )
     }
 
     func fetchStatusByPath(paths: [String]) async -> [String: String] {
@@ -868,9 +1031,9 @@ actor RecordingLedger {
         let now = nowUnix()
         let sql = """
         UPDATE recordings
-        SET status = 'missing',
+        SET status = 'deleted',
             file_exists = 0,
-            missing_since = CASE WHEN missing_since IS NULL THEN ? ELSE missing_since END,
+            missing_since = NULL,
             updated_at = ?
         WHERE file_path = ?
         """
@@ -882,6 +1045,16 @@ actor RecordingLedger {
         sqlite3_bind_int64(statement, 2, now)
         bindText(statement: statement, index: 3, value: normalizedPath)
         _ = sqlite3_step(statement)
+
+        if let recordingID = recordingID(forPath: normalizedPath, database: database) {
+            appendSystemEvent(
+                recordingID: recordingID,
+                level: "INFO",
+                eventType: "moved_to_trash",
+                message: "Recording was explicitly moved to Trash",
+                database: database
+            )
+        }
     }
 
     func markAutoRepairOutcome(filePath: String, failureReason: String?) async {
@@ -1041,12 +1214,81 @@ actor RecordingLedger {
 
         _ = sqlite3_exec(database, schema, nil, nil, nil)
         ensureRecordingColumns(database: database)
+        applyMigrations(database: database)
     }
 
     private func ensureRecordingColumns(database: OpaquePointer) {
         if !columnExists(table: "recordings", column: "audio_present", database: database) {
             _ = sqlite3_exec(database, "ALTER TABLE recordings ADD COLUMN audio_present INTEGER NOT NULL DEFAULT -1;", nil, nil, nil)
         }
+    }
+
+    private func applyMigrations(database: OpaquePointer) {
+        let currentVersion = databaseUserVersion(database: database)
+
+        if currentVersion < 1 {
+            // Legacy releases used 'missing' for explicit trash actions.
+            _ = sqlite3_exec(database, "UPDATE recordings SET status = 'deleted' WHERE status = 'missing';", nil, nil, nil)
+            setDatabaseUserVersion(database: database, version: 1)
+        }
+    }
+
+    private func databaseUserVersion(database: OpaquePointer) -> Int {
+        let sql = "PRAGMA user_version;"
+        guard let statement = prepare(database: database, sql: sql) else { return 0 }
+        defer { sqlite3_finalize(statement) }
+
+        guard sqlite3_step(statement) == SQLITE_ROW else { return 0 }
+        return Int(sqlite3_column_int(statement, 0))
+    }
+
+    private func setDatabaseUserVersion(database: OpaquePointer, version: Int) {
+        _ = sqlite3_exec(database, "PRAGMA user_version = \(max(version, 0));", nil, nil, nil)
+    }
+
+    private func fetchRecordingEvents(recordingID: Int64, database: OpaquePointer) -> [RecordingEventEntry] {
+        let sql = """
+        SELECT id, created_at, level, event_type, message, metadata_json
+        FROM recording_events
+        WHERE recording_id = ?
+        ORDER BY created_at DESC, id DESC
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, recordingID)
+
+        var events: [RecordingEventEntry] = []
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let id = sqlite3_column_int64(statement, 0)
+            let createdAt = Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, 1)))
+            let level = columnText(statement: statement, index: 2) ?? "INFO"
+            let eventType = columnText(statement: statement, index: 3) ?? "unknown"
+            let message = columnText(statement: statement, index: 4) ?? ""
+            let metadataJSON = columnText(statement: statement, index: 5)
+            events.append(
+                RecordingEventEntry(
+                    id: id,
+                    createdAt: createdAt,
+                    level: level,
+                    eventType: eventType,
+                    message: message,
+                    metadataJSON: metadataJSON
+                )
+            )
+        }
+
+        return events
+    }
+
+    private func optionalDate(statement: OpaquePointer?, index: Int32) -> Date? {
+        guard let statement, sqlite3_column_type(statement, index) != SQLITE_NULL else {
+            return nil
+        }
+        return Date(timeIntervalSince1970: TimeInterval(sqlite3_column_int64(statement, index)))
     }
 
     private func columnExists(table: String, column: String, database: OpaquePointer) -> Bool {
@@ -1227,7 +1469,7 @@ actor RecordingLedger {
         let sql = """
         SELECT id, file_path, status, COALESCE(file_size_bytes, 0), COALESCE(file_last_modified_at, 0)
         FROM recordings
-        WHERE status NOT IN ('active', 'finalizing')
+        WHERE status NOT IN ('active', 'finalizing', 'deleted')
         """
 
         guard let statement = prepare(database: database, sql: sql) else { return [] }

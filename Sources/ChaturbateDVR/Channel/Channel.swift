@@ -4,6 +4,14 @@ import AppKit
 import Vision
 
 private actor MP4Finalizer {
+    private struct PendingJob {
+        let sourcePath: String
+        let audioSourcePath: String?
+        let destinationPath: String
+        let channel: String
+        let onCompletion: (@Sendable (RepairOutcome) -> Void)?
+    }
+
     private static let minDurationRetentionRatio: Double = 0.90
     private static let minFileSizeRetentionRatio: Double = 0.70
 
@@ -25,7 +33,9 @@ private actor MP4Finalizer {
 
     private var inFlightPaths: Set<String> = []
     private var activelyProcessingPaths: Set<String> = []
+    private var pendingJobs: [PendingJob] = []
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+    private var maxConcurrentFinalizations: Int = 1
 
     func activelyFinalizingPaths() -> Set<String> {
         activelyProcessingPaths
@@ -40,16 +50,19 @@ private actor MP4Finalizer {
     ) {
         guard inFlightPaths.insert(sourcePath).inserted else { return }
 
-        Task.detached(priority: .utility) { [weak self] in
-            guard let self else { return }
-            let outcome = await self.finalize(
-                sourcePath: sourcePath,
-                audioSourcePath: audioSourcePath,
-                destinationPath: destinationPath,
-                channel: channel
-            )
-            onCompletion?(outcome)
-        }
+        pendingJobs.append(PendingJob(
+            sourcePath: sourcePath,
+            audioSourcePath: audioSourcePath,
+            destinationPath: destinationPath,
+            channel: channel,
+            onCompletion: onCompletion
+        ))
+        startNextJobsIfPossible()
+    }
+
+    func updateMaxConcurrentFinalizations(_ maxConcurrentFinalizations: Int) {
+        self.maxConcurrentFinalizations = max(1, maxConcurrentFinalizations)
+        startNextJobsIfPossible()
     }
 
     func repair(path: String, channel: String) async -> RepairOutcome {
@@ -61,19 +74,6 @@ private actor MP4Finalizer {
     }
 
     private func finalize(sourcePath: String, audioSourcePath: String? = nil, destinationPath: String, channel: String) async -> RepairOutcome {
-        activelyProcessingPaths.insert(sourcePath)
-        defer {
-            activelyProcessingPaths.remove(sourcePath)
-            inFlightPaths.remove(sourcePath)
-            if inFlightPaths.isEmpty, !idleWaiters.isEmpty {
-                let waiters = idleWaiters
-                idleWaiters.removeAll(keepingCapacity: false)
-                for waiter in waiters {
-                    waiter.resume(returning: ())
-                }
-            }
-        }
-
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: $0) }
         let destinationURL = URL(fileURLWithPath: destinationPath)
@@ -297,6 +297,39 @@ private actor MP4Finalizer {
 
         await withCheckedContinuation { continuation in
             idleWaiters.append(continuation)
+        }
+    }
+
+    private func startNextJobsIfPossible() {
+        while activelyProcessingPaths.count < maxConcurrentFinalizations,
+              !pendingJobs.isEmpty {
+            let job = pendingJobs.removeFirst()
+            activelyProcessingPaths.insert(job.sourcePath)
+
+            Task(priority: .utility) { [self] in
+                let outcome = await finalize(
+                    sourcePath: job.sourcePath,
+                    audioSourcePath: job.audioSourcePath,
+                    destinationPath: job.destinationPath,
+                    channel: job.channel
+                )
+                finishJob(sourcePath: job.sourcePath)
+                job.onCompletion?(outcome)
+            }
+        }
+    }
+
+    private func finishJob(sourcePath: String) {
+        activelyProcessingPaths.remove(sourcePath)
+        inFlightPaths.remove(sourcePath)
+        startNextJobsIfPossible()
+
+        if inFlightPaths.isEmpty, !idleWaiters.isEmpty {
+            let waiters = idleWaiters
+            idleWaiters.removeAll(keepingCapacity: false)
+            for waiter in waiters {
+                waiter.resume(returning: ())
+            }
         }
     }
 }
@@ -556,6 +589,10 @@ actor Channel {
         await mp4Finalizer.activelyFinalizingPaths()
     }
 
+    static func updateMaxConcurrentFinalizations(_ maxConcurrentFinalizations: Int) async {
+        await mp4Finalizer.updateMaxConcurrentFinalizations(maxConcurrentFinalizations)
+    }
+
     static func enqueueExistingMP4Repair(path: String, channel: String) async {
         await mp4Finalizer.enqueue(sourcePath: path, destinationPath: path, channel: channel)
     }
@@ -618,7 +655,11 @@ actor Channel {
     func getInfo() -> ChannelInfo {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd hh:mm a"
-        let effectiveWaitingForSlot = isWaitingForRecordingSlot && !config.isPaused
+        let waitingBecauseGlobalPause = isInGlobalRecordingPauseMode
+            && !appConfig.recordingEnabled
+            && isOnline
+            && !config.isPaused
+        let effectiveWaitingForSlot = (isWaitingForRecordingSlot || waitingBecauseGlobalPause) && !config.isPaused
         
         return ChannelInfo(
             isOnline: isOnline,

@@ -212,6 +212,7 @@ struct AppConfig: Codable {
     var domain: String = "https://chaturbate.com/"
     var maxConcurrentRequests: Int = 6 // max concurrent API requests across all channels
     var maxConcurrentRecordings: Int = 0 // 0 means unlimited concurrent recordings
+    var maxConcurrentFinalizations: Int = 1
     var breakStaticThresholdMinutes: Int = 10
     var breakNoPersonNoMotionThresholdMinutes: Int = 3
     var breakAnalysisIntervalSeconds: Int = 10
@@ -240,6 +241,7 @@ struct AppConfig: Codable {
         domain = try container.decodeIfPresent(String.self, forKey: .domain) ?? "https://chaturbate.com/"
         maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 6
         maxConcurrentRecordings = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecordings) ?? 0
+        maxConcurrentFinalizations = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentFinalizations) ?? 1
         breakStaticThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakStaticThresholdMinutes) ?? 10
         breakNoPersonNoMotionThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakNoPersonNoMotionThresholdMinutes) ?? 3
         breakAnalysisIntervalSeconds = try container.decodeIfPresent(Int.self, forKey: .breakAnalysisIntervalSeconds) ?? 10
@@ -260,6 +262,7 @@ struct AppConfig: Codable {
         case inAppCookies, inAppUserAgent, loggedInUsername, hasCompletedOnboarding
         case domain, maxConcurrentRequests
         case maxConcurrentRecordings
+        case maxConcurrentFinalizations
         case breakStaticThresholdMinutes
         case breakNoPersonNoMotionThresholdMinutes
         case breakAnalysisIntervalSeconds

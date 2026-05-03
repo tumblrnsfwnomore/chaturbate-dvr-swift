@@ -173,6 +173,30 @@ struct SettingsView: View {
 
                             VStack(alignment: .leading, spacing: 6) {
                                 HStack {
+                                    Text("Max Concurrent Finalizations")
+                                        .font(.subheadline)
+                                        .fontWeight(.medium)
+                                    Spacer()
+                                    Stepper(value: Binding(
+                                        get: { manager.appConfig.maxConcurrentFinalizations },
+                                        set: {
+                                            manager.appConfig.maxConcurrentFinalizations = max(1, min(8, $0))
+                                            manager.saveAppConfig()
+                                        }
+                                    ), in: 1...8) {
+                                        Text("\(manager.appConfig.maxConcurrentFinalizations)")
+                                            .foregroundColor(.secondary)
+                                    }
+                                }
+                                Text("Limit how many recordings can be remuxed/finalized at once. Lower values reduce storage pressure.")
+                                    .font(.caption)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
                                     Text("Break: Static Scene Threshold")
                                         .font(.subheadline)
                                         .fontWeight(.medium)
