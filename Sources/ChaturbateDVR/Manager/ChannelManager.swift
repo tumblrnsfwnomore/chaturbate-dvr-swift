@@ -290,6 +290,8 @@ actor RecordingCoordinator {
 
 @MainActor
 class ChannelManager: ObservableObject {
+    private static let visibleWorkingFilePrefix = "cbdvr_inprogress_"
+
     private static let thumbnailBackfillNoVideoCooldownSeconds: TimeInterval = 10 * 60
 
     private struct MP4RepairCandidate {
@@ -425,7 +427,7 @@ class ChannelManager: ObservableObject {
             let recovered = await recordingLedger.recoverAbandonedActiveRecordings(activeBefore: launchUnix)
             if recovered.checked > 0 {
                 await FileLogger.shared.log(
-                    "[manager] recovered stale active recordings on startup: checked=\(recovered.checked), finalized=\(recovered.finalizedWithWarning), missing=\(recovered.markedMissing)",
+                    "[manager] recovered stale active/finalizing recordings on startup: checked=\(recovered.checked), finalized=\(recovered.finalizedWithWarning), missing=\(recovered.markedMissing)",
                     level: "WARN"
                 )
             }
@@ -513,16 +515,24 @@ class ChannelManager: ObservableObject {
 
         stopWebServer()
 
-        if let mp4RepairTask {
-            await FileLogger.shared.log("[manager] waiting for recording repair scan to become idle")
-            await mp4RepairTask.value
-            self.mp4RepairTask = nil
-        }
-
-        if let recordingRepairRunTask {
-            await FileLogger.shared.log("[manager] waiting for active recording repair run to become idle")
-            await recordingRepairRunTask.value
-            self.recordingRepairRunTask = nil
+        // Loop because finishRecordingRepairMaintenance can spawn recordingRepairRunTask
+        // just as we read it (race between the finishing detached task and this shutdown path).
+        // isShuttingDown guards against further restarts inside finishRecordingRepairMaintenance.
+        var drainedRepair = false
+        while !drainedRepair {
+            drainedRepair = true
+            if let task = mp4RepairTask {
+                await FileLogger.shared.log("[manager] waiting for recording repair scan to become idle")
+                await task.value
+                self.mp4RepairTask = nil
+                drainedRepair = false
+            }
+            if let task = recordingRepairRunTask {
+                await FileLogger.shared.log("[manager] waiting for active recording repair run to become idle")
+                await task.value
+                self.recordingRepairRunTask = nil
+                drainedRepair = false
+            }
         }
 
         for (_, channel) in channels {
@@ -737,11 +747,14 @@ class ChannelManager: ObservableObject {
     }
 
     func hasExplicitRecordingRepairState(for path: String) -> Bool {
-        recordingRepairStates[path] != nil
+        if recordingRepairStates[path] != nil { return true }
+        // Also check the real filesystem path for case-insensitive volume mismatches.
+        let resolvedPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        return resolvedPath != path && recordingRepairStates[resolvedPath] != nil
     }
 
     func startRepairForFlaggedRecordings() {
-        guard recordingRepairRunTask == nil else { return }
+        guard !isShuttingDown, recordingRepairRunTask == nil else { return }
 
         let flaggedPaths = recordingRepairStates
             .filter { _, state in
@@ -838,7 +851,9 @@ class ChannelManager: ObservableObject {
                 }
 
                 let lowerName = fileURL.lastPathComponent.lowercased()
-                if lowerName.contains("_finalizing_") || lowerName.contains(".sb-") {
+                if lowerName.hasPrefix(Self.visibleWorkingFilePrefix)
+                    || lowerName.contains("_finalizing_")
+                    || lowerName.contains(".sb-") {
                     continue
                 }
 
@@ -1183,7 +1198,7 @@ class ChannelManager: ObservableObject {
         mp4RepairTask = nil
         isRecordingRepairScanActive = false
         recordingRepairScanDetail = nil
-        if !isRepairingFlaggedRecordings {
+        if !isRepairingFlaggedRecordings, !isShuttingDown {
             startRepairForFlaggedRecordings()
         }
         updateRecordingRepairSummary()
@@ -1246,7 +1261,19 @@ class ChannelManager: ObservableObject {
             return .unsupported
         }
 
+        // In-progress recordings are not repair candidates.
+        if recordingStatus == "active" || recordingStatus == "finalizing" {
+            return .unsupported
+        }
+
         if let state = recordingRepairStates[path] {
+            return state
+        }
+
+        // Fall back to the real filesystem path in case the ledger stored a
+        // different case variant on a case-insensitive volume.
+        let resolvedPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
+        if resolvedPath != path, let state = recordingRepairStates[resolvedPath] {
             return state
         }
 
@@ -1516,6 +1543,10 @@ class ChannelManager: ObservableObject {
 
     func getRecordingLibraryEntries() async -> [RecordingLedgerEntry] {
         await recordingLedger.fetchLibraryEntries(includeMissing: false)
+    }
+
+    func getActivelyFinalizingPaths() async -> Set<String> {
+        await Channel.activelyFinalizingPaths()
     }
 
     func markRecordingMovedToTrash(path: String) async {

@@ -820,6 +820,7 @@ private struct RecordingLibraryItem: Identifiable {
     let thumbnailSourcePath: String?
     let channelThumbnailPath: String?
     let isInProgress: Bool
+    let isActivelyFinalizing: Bool
     let isPreviewable: Bool
 
     var id: String { path }
@@ -1394,35 +1395,28 @@ struct RecordingsLibraryView: View {
     }
 
     private var repairFilterCounts: RecordingRepairFilterCounts {
+        // Derive counts using the same per-item logic as buildVisibleRecordings so
+        // the badge numbers always match the number of items shown by each filter.
         var counts = RecordingRepairFilterCounts()
         counts.all = allRecordings.count
-
-        let mp4Count = allRecordings.reduce(0) { partial, item in
-            partial + (item.fileExtension.lowercased() == "mp4" ? 1 : 0)
+        for item in allRecordings {
+            let state = manager.recordingRepairState(
+                for: item.path,
+                fileExtension: item.fileExtension,
+                recordingStatus: item.recordingStatus
+            )
+            switch state {
+            case .pendingScan:  counts.pendingScan += 1
+            case .scanning:     counts.scanning += 1
+            case .good:         counts.good += 1
+            case .needsRemux:   counts.needsRemux += 1
+            case .queued:       counts.queued += 1
+            case .remuxing:     counts.remuxing += 1
+            case .repaired:     counts.repaired += 1
+            case .failed:       counts.failed += 1
+            case .unsupported:  counts.unsupported += 1
+            }
         }
-        let knownMp4StateCount =
-            manager.recordingRepairSummary.pendingScan
-            + manager.recordingRepairSummary.scanning
-            + manager.recordingRepairSummary.good
-            + manager.recordingRepairSummary.needsRemux
-            + manager.recordingRepairSummary.queued
-            + manager.recordingRepairSummary.remuxing
-            + manager.recordingRepairSummary.repaired
-            + manager.recordingRepairSummary.failed
-        let implicitPendingCount = max(0, mp4Count - knownMp4StateCount)
-
-        // Keep count semantics aligned with `recordingRepairState(for:)` fallback:
-        // MP4 entries without an explicit state are displayed as pending scan.
-        counts.pendingScan = manager.recordingRepairSummary.pendingScan + implicitPendingCount
-        counts.scanning = manager.recordingRepairSummary.scanning
-        counts.good = manager.recordingRepairSummary.good
-        counts.needsRemux = manager.recordingRepairSummary.needsRemux
-        counts.queued = manager.recordingRepairSummary.queued
-        counts.remuxing = manager.recordingRepairSummary.remuxing
-        counts.repaired = manager.recordingRepairSummary.repaired
-        counts.failed = manager.recordingRepairSummary.failed
-        counts.unsupported = unsupportedRecordingsCount
-
         return counts
     }
 
@@ -1478,10 +1472,11 @@ struct RecordingsLibraryView: View {
 
         Task {
             let entries = await manager.getRecordingLibraryEntries()
+            let activelyFinalizingPaths = await manager.getActivelyFinalizingPaths()
             let activeChannelThumbnails = await loadActiveChannelThumbnails(entries: entries)
 
             let recordings = await Task.detached(priority: .utility) {
-                Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails)
+                Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
             }.value
 
             await MainActor.run {
@@ -1599,7 +1594,8 @@ struct RecordingsLibraryView: View {
 
     private nonisolated static func mapRecordingEntries(
         _ entries: [RecordingLedgerEntry],
-        activeChannelThumbnails: [String: String]
+        activeChannelThumbnails: [String: String],
+        activelyFinalizingPaths: Set<String>
     ) -> [RecordingLibraryItem] {
         let fileManager = FileManager.default
 
@@ -1610,9 +1606,10 @@ struct RecordingsLibraryView: View {
 
             let workingPath = entry.workingFilePath.map { ($0 as NSString).expandingTildeInPath }
             let workingExists = workingPath.map { fileManager.fileExists(atPath: $0) } ?? false
-            // Active recordings often point at non-finalized transport streams; use channel thumbnails instead.
+            let isActivelyFinalizing = entry.isFinalizing && activelyFinalizingPaths.contains(finalPath)
+            // Active/finalizing recordings use channel thumbnails; don't generate from incomplete files.
             let thumbnailSourcePath: String?
-            if entry.isActive {
+            if entry.isActive || entry.isFinalizing {
                 thumbnailSourcePath = nil
             } else {
                 thumbnailSourcePath = finalExists ? finalPath : (workingExists ? workingPath : nil)
@@ -1627,8 +1624,9 @@ struct RecordingsLibraryView: View {
                 sizeBytes: entry.fileSizeBytes,
                 modifiedAt: entry.modifiedAt,
                 thumbnailSourcePath: thumbnailSourcePath,
-                channelThumbnailPath: entry.isActive ? activeChannelThumbnails[entry.channelUsername] : nil,
-                isInProgress: entry.isActive,
+                channelThumbnailPath: (entry.isActive || entry.isFinalizing) ? activeChannelThumbnails[entry.channelUsername] : nil,
+                isInProgress: entry.isActive || entry.isFinalizing,
+                isActivelyFinalizing: isActivelyFinalizing,
                 isPreviewable: finalExists
             )
         }
@@ -1810,7 +1808,25 @@ private struct RecordingLibraryCardView: View {
 
     @ViewBuilder
     private var repairBadge: some View {
-        if item.isInProgress {
+        if item.recordingStatus == "finalizing" {
+            if item.isActivelyFinalizing {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.55)
+                        .frame(width: 10, height: 10)
+                    Text("Finalizing")
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(Color.blue.opacity(0.14))
+                .foregroundColor(.blue)
+                .clipShape(Capsule())
+            } else {
+                badge(label: "Queued", tint: .secondary)
+            }
+        } else if item.isInProgress {
             badge(label: "Recording", tint: .orange)
         } else {
             switch repairState {

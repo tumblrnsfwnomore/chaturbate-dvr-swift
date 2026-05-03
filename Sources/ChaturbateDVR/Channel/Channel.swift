@@ -24,7 +24,12 @@ private actor MP4Finalizer {
     }
 
     private var inFlightPaths: Set<String> = []
+    private var activelyProcessingPaths: Set<String> = []
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
+
+    func activelyFinalizingPaths() -> Set<String> {
+        activelyProcessingPaths
+    }
 
     func enqueue(
         sourcePath: String,
@@ -56,7 +61,9 @@ private actor MP4Finalizer {
     }
 
     private func finalize(sourcePath: String, audioSourcePath: String? = nil, destinationPath: String, channel: String) async -> RepairOutcome {
+        activelyProcessingPaths.insert(sourcePath)
         defer {
+            activelyProcessingPaths.remove(sourcePath)
             inFlightPaths.remove(sourcePath)
             if inFlightPaths.isEmpty, !idleWaiters.isEmpty {
                 let waiters = idleWaiters
@@ -295,6 +302,8 @@ private actor MP4Finalizer {
 }
 
 actor Channel {
+    private static let workingFilePrefix = "cbdvr_inprogress_"
+
     private enum IngestContainerMode {
         case unknown
         case transportStream
@@ -330,6 +339,7 @@ actor Channel {
     private static let segmentTimelineMismatchMaxRatio: Double = 2.0
     private static let segmentTimelineMismatchRequiredEvents: Int = 3
     private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 20
+    private static let maxAudioLeadSeconds: Double = 0.75
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -388,6 +398,7 @@ actor Channel {
     private var currentAudioFile: FileHandle?
     private var currentAudioWorkingFilename: String?
     private var currentAudioFilesize: Int = 0
+    private var currentAudioDuration: Double = 0
     private var previousRawSegmentDecodeStartTime: UInt64?
     private var previousSegmentDecodeStartTime: UInt64?
     private var cumulativeClaimedSegmentDuration: Double = 0
@@ -526,7 +537,6 @@ actor Channel {
     }
 
     func shutdownForTermination() {
-        config.isPaused = true
         pausedOnlineStickyUntil = nil
         resetBreakDetectionState()
         monitoringTask?.cancel()
@@ -540,6 +550,10 @@ actor Channel {
     static func waitForMP4FinalizationToComplete() async {
         await Task.yield()
         await mp4Finalizer.waitUntilIdle()
+    }
+
+    static func activelyFinalizingPaths() async -> Set<String> {
+        await mp4Finalizer.activelyFinalizingPaths()
     }
 
     static func enqueueExistingMP4Repair(path: String, channel: String) async {
@@ -604,7 +618,7 @@ actor Channel {
     func getInfo() -> ChannelInfo {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd hh:mm a"
-        let effectiveWaitingForSlot = isWaitingForRecordingSlot && appConfig.recordingEnabled && !config.isPaused
+        let effectiveWaitingForSlot = isWaitingForRecordingSlot && !config.isPaused
         
         return ChannelInfo(
             isOnline: isOnline,
@@ -1554,7 +1568,6 @@ actor Channel {
                     if seq == -1 || seq <= lastAudioSeq {
                         continue
                     }
-                    lastAudioSeq = seq
 
                     let segmentURL = resolveSegmentURL(segment.uri, playlistURL: audioPlaylistURL)
                     let audioData = try await downloadSegmentWithRetry(
@@ -1564,7 +1577,13 @@ actor Channel {
                         updateStreamHealth: false
                     )
 
-                    try await handleAudioSegment(data: audioData)
+                    let appended = try await handleAudioSegment(data: audioData, duration: segment.duration)
+                    if appended {
+                        lastAudioSeq = seq
+                    } else {
+                        // Keep this segment for the next polling cycle so audio stays aligned with video.
+                        break
+                    }
                 }
             }
             
@@ -1888,15 +1907,21 @@ actor Channel {
         }
     }
 
-    private func handleAudioSegment(data: Data) async throws {
+    private func handleAudioSegment(data: Data, duration: Double) async throws -> Bool {
         guard activeAudioPlaylistURL != nil else {
-            return
+            return false
         }
 
         try await ensureCurrentFileOpenForWrite()
 
         guard let audioFile = currentAudioFile else {
-            return
+            return false
+        }
+
+        // Avoid muxing audio that runs ahead of the currently written video.
+        // If audio is too far ahead, defer this segment and retry next cycle.
+        if (currentAudioDuration + duration) > (self.duration + Self.maxAudioLeadSeconds) {
+            return false
         }
 
         if currentAudioFilesize == 0, let initData = activeAudioInitSegmentData {
@@ -1906,6 +1931,8 @@ actor Channel {
 
         try audioFile.write(contentsOf: data)
         currentAudioFilesize += data.count
+        currentAudioDuration += duration
+        return true
     }
     
     private func nextFile() async throws {
@@ -2107,6 +2134,9 @@ actor Channel {
             let channelName = config.username
             let recordingLedger = self.recordingLedger
             Task {
+                if let recordingID {
+                    await recordingLedger.markFinalizing(recordingID: recordingID)
+                }
                 await Self.mp4Finalizer.enqueue(
                     sourcePath: workingPath,
                     audioSourcePath: usableAudioWorkingPath,
@@ -2201,6 +2231,7 @@ actor Channel {
             currentWorkingFilename = nil
             currentAudioWorkingFilename = nil
             currentAudioFilesize = 0
+            currentAudioDuration = 0
             pendingFilenameBase = nil
             currentFileDecodeTimeOffset = nil
             resetSegmentTimelineTracking()
@@ -2208,13 +2239,13 @@ actor Channel {
     }
 
     private func workingFileURL(for visibleFileURL: URL) -> URL {
-        let hiddenName = ".\(visibleFileURL.lastPathComponent)"
+        let hiddenName = "\(Self.workingFilePrefix)\(visibleFileURL.lastPathComponent)"
         return visibleFileURL.deletingLastPathComponent().appendingPathComponent(hiddenName)
     }
 
     private func workingAudioFileURL(for visibleFileURL: URL) -> URL {
         let baseName = visibleFileURL.deletingPathExtension().lastPathComponent
-        let hiddenName = ".\(baseName)_audio.m4a"
+        let hiddenName = "\(Self.workingFilePrefix)\(baseName)_audio.m4a"
         return visibleFileURL.deletingLastPathComponent().appendingPathComponent(hiddenName)
     }
 

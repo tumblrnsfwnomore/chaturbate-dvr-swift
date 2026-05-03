@@ -265,6 +265,8 @@ fi
 STATUS_FILE="$RUN_DIR/retime-repair-$RUN_TIMESTAMP.tsv"
 printf 'status\tsource\toutput\tfps\tin_duration\tout_duration\tout_max_gap\tnote\n' > "$STATUS_FILE"
 
+RUN_START_EPOCH=$(date +%s)
+
 echo "Starting batch retime repair"
 echo "  Files selected: $TOTAL"
 if [[ -n "$LIMIT" ]]; then
@@ -273,6 +275,60 @@ fi
 echo "  Workers: $WORKERS"
 echo "  Mode: $([[ $REPLACE_SOURCE -eq 1 ]] && echo replace-source || echo write-new-files)"
 echo "  Status TSV: $STATUS_FILE"
+
+format_seconds() {
+  local total="${1:-0}"
+  if (( total < 0 )); then
+    total=0
+  fi
+  local hours=$(( total / 3600 ))
+  local minutes=$(( (total % 3600) / 60 ))
+  local seconds=$(( total % 60 ))
+  if (( hours > 0 )); then
+    printf '%d:%02d:%02d' "$hours" "$minutes" "$seconds"
+  else
+    printf '%02d:%02d' "$minutes" "$seconds"
+  fi
+}
+
+count_completed() {
+  local lines
+  lines=$(wc -l < "$STATUS_FILE" | tr -d ' ')
+  if (( lines > 0 )); then
+    echo $(( lines - 1 ))
+  else
+    echo 0
+  fi
+}
+
+print_runtime_progress() {
+  local launched="$1"
+  local running="$2"
+  local now elapsed completed percent eta
+  now=$(date +%s)
+  elapsed=$(( now - RUN_START_EPOCH ))
+  completed=$(count_completed)
+
+  if (( TOTAL > 0 )); then
+    percent=$(( completed * 100 / TOTAL ))
+  else
+    percent=100
+  fi
+
+  if (( completed > 0 && completed < TOTAL )); then
+    eta=$(( elapsed * (TOTAL - completed) / completed ))
+  else
+    eta=0
+  fi
+
+  if [[ -t 1 ]]; then
+    printf '\rProgress %d/%d (%d%%) | launched=%d running=%d | elapsed=%s | eta=%s\033[K' \
+      "$completed" "$TOTAL" "$percent" "$launched" "$running" "$(format_seconds "$elapsed")" "$(format_seconds "$eta")"
+  else
+    printf 'Progress %d/%d (%d%%) | launched=%d running=%d | elapsed=%s | eta=%s\n' \
+      "$completed" "$TOTAL" "$percent" "$launched" "$running" "$(format_seconds "$elapsed")" "$(format_seconds "$eta")"
+  fi
+}
 
 fraction_to_decimal_fps() {
   local ratio="$1"
@@ -300,9 +356,34 @@ get_max_gap() {
 
 detect_source_fps() {
   local f="$1"
-  local ratio
-  ratio=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nokey=1:noprint_wrappers=1 -- "$f" 2>/dev/null | head -n 1)
-  fraction_to_decimal_fps "$ratio"
+  local avg_ratio r_ratio avg_fps r_fps
+  avg_ratio=$(ffprobe -v error -select_streams v:0 -show_entries stream=avg_frame_rate -of default=nokey=1:noprint_wrappers=1 -- "$f" 2>/dev/null | head -n 1)
+  r_ratio=$(ffprobe -v error -select_streams v:0 -show_entries stream=r_frame_rate -of default=nokey=1:noprint_wrappers=1 -- "$f" 2>/dev/null | head -n 1)
+
+  avg_fps=$(fraction_to_decimal_fps "$avg_ratio")
+  r_fps=$(fraction_to_decimal_fps "$r_ratio")
+
+  awk -v a="$avg_fps" -v r="$r_fps" 'BEGIN {
+    # Common webcam targets are 30/60. Corrupted files often report very low
+    # avg_frame_rate due timeline inflation; prefer nominal r_frame_rate there.
+    if (a >= 15 && a <= 120 && r >= 15 && r <= 120) {
+      if ((a / r) >= 0.75 && (a / r) <= 1.25) {
+        printf "%.6f", a
+        exit
+      }
+      printf "%.6f", r
+      exit
+    }
+    if (r >= 15 && r <= 120) {
+      printf "%.6f", r
+      exit
+    }
+    if (a >= 15 && a <= 120) {
+      printf "%.6f", a
+      exit
+    }
+    print "30"
+  }'
 }
 
 build_output_path() {
@@ -409,20 +490,34 @@ STARTED=0
 while IFS= read -r source; do
   [[ -n "$source" ]] || continue
 
+  if [[ -t 1 ]]; then
+    printf '\nLaunching %d/%d: %s\n' $(( STARTED + 1 )) "$TOTAL" "${source:t}"
+  else
+    echo "Launching $(( STARTED + 1 ))/$TOTAL: $source"
+  fi
+
   run_repair "$source" &
   pids+=("$!")
   STARTED=$(( STARTED + 1 ))
+  print_runtime_progress "$STARTED" "${#pids[@]}"
 
   while (( ${#pids[@]} >= WORKERS )); do
     wait "${pids[1]}" || true
     pids=("${pids[@]:1}")
+    print_runtime_progress "$STARTED" "${#pids[@]}"
   done
 done < "$FILE_LIST"
 
 for pid in "${pids[@]:-}"; do
   [[ -n "$pid" ]] || continue
   wait "$pid" || true
+  pids=("${pids[@]:1}")
+  print_runtime_progress "$STARTED" "${#pids[@]}"
 done
+
+if [[ -t 1 ]]; then
+  printf '\n'
+fi
 
 echo "Batch retime complete"
 echo "  Status TSV: $STATUS_FILE"

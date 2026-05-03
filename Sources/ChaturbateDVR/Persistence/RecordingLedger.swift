@@ -42,10 +42,24 @@ struct RecordingLedgerEntry: Sendable {
     var isActive: Bool {
         status == "active"
     }
+
+    var isFinalizing: Bool {
+        status == "finalizing"
+    }
 }
 
 actor RecordingLedger {
     static let shared = RecordingLedger()
+    private static let legacyWorkingFilePrefix = "."
+    private static let workingFilePrefix = ".cbdvr_work_"
+    private static let visibleWorkingFilePrefix = "cbdvr_inprogress_"
+
+    private static func isIgnoredInProgressFilename(_ fileName: String) -> Bool {
+        let lowerName = fileName.lowercased()
+        return lowerName.hasPrefix(workingFilePrefix)
+            || lowerName.hasPrefix(visibleWorkingFilePrefix)
+            || lowerName.contains("_finalizing_")
+    }
 
     private struct CatalogEntry {
         let path: String
@@ -69,6 +83,7 @@ actor RecordingLedger {
         let startedAt: Int64
         let durationSeconds: Double
         let sizeBytes: Int64
+        let originalStatus: String
     }
 
     private var database: OpaquePointer?
@@ -212,6 +227,26 @@ actor RecordingLedger {
         bindText(statement: statement, index: 4, value: eventType)
         bindText(statement: statement, index: 5, value: message)
         bindText(statement: statement, index: 6, value: metadataJSON)
+
+        _ = sqlite3_step(statement)
+    }
+
+    func markFinalizing(recordingID: Int64) async {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return
+        }
+
+        let sql = """
+        UPDATE recordings
+        SET status = 'finalizing', updated_at = ?
+        WHERE id = ? AND status = 'active'
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, nowUnix())
+        sqlite3_bind_int64(statement, 2, recordingID)
 
         _ = sqlite3_step(statement)
     }
@@ -470,6 +505,46 @@ actor RecordingLedger {
         let now = nowUnix()
         var queuedRepairPaths = Set<String>()
 
+        func orphanedFinalizingTempPath(for finalPath: String, fileManager: FileManager) -> String? {
+            let finalURL = URL(fileURLWithPath: finalPath)
+            let directoryURL = finalURL.deletingLastPathComponent()
+            let fileStem = finalURL.deletingPathExtension().lastPathComponent.lowercased()
+            let expectedPrefixes = [
+                "\(fileStem)_finalizing_",
+                "\(Self.legacyWorkingFilePrefix)\(fileStem)_finalizing_",
+                "\(Self.workingFilePrefix)\(fileStem)_finalizing_",
+                "\(Self.visibleWorkingFilePrefix)\(fileStem)_finalizing_",
+            ]
+
+            guard let candidates = try? fileManager.contentsOfDirectory(
+                at: directoryURL,
+                includingPropertiesForKeys: [.contentModificationDateKey, .isRegularFileKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                return nil
+            }
+
+            let tempCandidates = candidates.filter { url in
+                guard url.pathExtension.lowercased() == "mp4",
+                      expectedPrefixes.contains(where: { prefix in
+                          url.lastPathComponent.lowercased().hasPrefix(prefix)
+                      }) else {
+                    return false
+                }
+                let values = try? url.resourceValues(forKeys: [.isRegularFileKey])
+                return values?.isRegularFile == true
+            }
+
+            return tempCandidates.max { lhs, rhs in
+                let lhsDate = (try? lhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                let rhsDate = (try? rhs.resourceValues(forKeys: [.contentModificationDateKey]).contentModificationDate) ?? .distantPast
+                if lhsDate == rhsDate {
+                    return lhs.path.localizedStandardCompare(rhs.path) == .orderedAscending
+                }
+                return lhsDate < rhsDate
+            }?.path
+        }
+
         for row in rows {
             let fileManager = FileManager.default
 
@@ -495,7 +570,19 @@ actor RecordingLedger {
                     }
                 }
             } else {
-                resolvedPath = nil
+                if let tempFinalizingPath = orphanedFinalizingTempPath(for: finalPath, fileManager: fileManager) {
+                    do {
+                        if fileManager.fileExists(atPath: finalPath) {
+                            try fileManager.removeItem(atPath: finalPath)
+                        }
+                        try fileManager.moveItem(atPath: tempFinalizingPath, toPath: finalPath)
+                        resolvedPath = finalPath
+                    } catch {
+                        resolvedPath = tempFinalizingPath
+                    }
+                } else {
+                    resolvedPath = nil
+                }
             }
 
             let resolvedAttributes = resolvedPath.flatMap { try? fileManager.attributesOfItem(atPath: $0) }
@@ -576,8 +663,10 @@ actor RecordingLedger {
             appendSystemEvent(
                 recordingID: row.id,
                 level: "WARN",
-                eventType: "abandoned_active_recovered",
-                message: "Recovered stale active recording after app restart",
+                eventType: row.originalStatus == "finalizing" ? "abandoned_finalizing_recovered" : "abandoned_active_recovered",
+                message: row.originalStatus == "finalizing"
+                    ? "Recovered stale finalizing recording after app restart"
+                    : "Recovered stale active recording after app restart",
                 database: database
             )
 
@@ -617,7 +706,7 @@ actor RecordingLedger {
         """
 
         if !includeMissing {
-            sql += " WHERE (COALESCE(r.file_exists, 0) = 1 OR r.status = 'active')"
+            sql += " WHERE (COALESCE(r.file_exists, 0) = 1 OR r.status IN ('active', 'finalizing'))"
         }
         sql += " ORDER BY COALESCE(r.file_last_modified_at, r.ended_at, r.updated_at, r.created_at, 0) DESC"
 
@@ -1138,7 +1227,7 @@ actor RecordingLedger {
         let sql = """
         SELECT id, file_path, status, COALESCE(file_size_bytes, 0), COALESCE(file_last_modified_at, 0)
         FROM recordings
-        WHERE status != 'active'
+        WHERE status NOT IN ('active', 'finalizing')
         """
 
         guard let statement = prepare(database: database, sql: sql) else { return [] }
@@ -1165,10 +1254,11 @@ actor RecordingLedger {
                         r.working_file_path,
                         COALESCE(r.started_at, r.created_at, r.updated_at, 0),
                         COALESCE(r.duration_seconds, 0),
-                        COALESCE(r.file_size_bytes, 0)
+                        COALESCE(r.file_size_bytes, 0),
+                        r.status
                 FROM recordings r
                 JOIN channels c ON c.id = r.channel_id
-        WHERE status = 'active'
+        WHERE status IN ('active', 'finalizing')
                     AND COALESCE(r.updated_at, 0) <= ?
         """
 
@@ -1186,6 +1276,7 @@ actor RecordingLedger {
             let startedAt = sqlite3_column_int64(statement, 4)
             let duration = sqlite3_column_double(statement, 5)
             let sizeBytes = sqlite3_column_int64(statement, 6)
+            let originalStatus = columnText(statement: statement, index: 7) ?? "active"
 
             rows.append(
                 ActiveRecordingRow(
@@ -1195,7 +1286,8 @@ actor RecordingLedger {
                     workingPath: workingPath,
                     startedAt: startedAt,
                     durationSeconds: duration,
-                    sizeBytes: sizeBytes
+                    sizeBytes: sizeBytes,
+                    originalStatus: originalStatus
                 )
             )
         }
@@ -1222,6 +1314,7 @@ actor RecordingLedger {
         var bySize: [Int64: [CatalogEntry]] = [:]
 
         while let fileURL = enumerator.nextObject() as? URL {
+            guard !Self.isIgnoredInProgressFilename(fileURL.lastPathComponent) else { continue }
             guard allowedExtensions.contains(fileURL.pathExtension.lowercased()) else { continue }
             guard let values = try? fileURL.resourceValues(forKeys: Set(keys)), values.isRegularFile == true else {
                 continue
@@ -1398,6 +1491,7 @@ actor RecordingLedger {
         }
 
         return files.compactMap { filename in
+            guard !Self.isIgnoredInProgressFilename(filename) else { return nil }
             let ext = (filename as NSString).pathExtension.lowercased()
             guard allowedExtensions.contains(ext) else { return nil }
             let fullPath = normalizePath((directoryPath as NSString).appendingPathComponent(filename))
@@ -1421,6 +1515,7 @@ actor RecordingLedger {
 
         var results: [String] = []
         while let fileURL = enumerator.nextObject() as? URL {
+            guard !Self.isIgnoredInProgressFilename(fileURL.lastPathComponent) else { continue }
             let ext = fileURL.pathExtension.lowercased()
             guard allowedExtensions.contains(ext) else { continue }
             if (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
