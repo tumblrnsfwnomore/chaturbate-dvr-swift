@@ -34,6 +34,28 @@ private func formatNoPersonDuration(_ seconds: Int) -> String {
     return String(format: "%d:%02d", minutes, remainingSeconds)
 }
 
+private enum RecordingDurationAuditStatus {
+    case insufficientData
+    case ok
+    case mismatch
+}
+
+private func recordingDurationAuditStatus(mediaDurationSeconds: Double, startedAt: Date?, endedAt: Date?) -> RecordingDurationAuditStatus {
+    guard mediaDurationSeconds > 0,
+          let startedAt,
+          let endedAt else {
+        return .insufficientData
+    }
+
+    let periodSeconds = endedAt.timeIntervalSince(startedAt)
+    guard periodSeconds > 0 else {
+        return .insufficientData
+    }
+
+    let deltaSeconds = abs(mediaDurationSeconds - periodSeconds)
+    return deltaSeconds > 5 ? .mismatch : .ok
+}
+
 struct ContentView: View {
     @ObservedObject var manager: ChannelManager
     @State private var showingAddChannel = false
@@ -897,6 +919,9 @@ private struct RecordingLibraryItem: Identifiable {
     let recordingStatus: String
     let fileExtension: String
     let sizeBytes: Int64
+    let durationSeconds: Double
+    let startedAt: Date?
+    let endedAt: Date?
     let modifiedAt: Date
     let thumbnailSourcePath: String?
     let channelThumbnailPath: String?
@@ -1105,6 +1130,7 @@ private struct RecordingThumbnailView: View {
 
 private enum RecordingRepairFilter: Equatable {
     case all
+    case durationMismatch
     case pendingScan
     case scanning
     case good
@@ -1118,6 +1144,7 @@ private enum RecordingRepairFilter: Equatable {
     var label: String {
         switch self {
         case .all:         return "All"
+        case .durationMismatch: return "Duration Mismatch"
         case .pendingScan: return "Pending"
         case .scanning:    return "Scanning"
         case .good:        return "Good"
@@ -1126,13 +1153,14 @@ private enum RecordingRepairFilter: Equatable {
         case .remuxing:    return "Remuxing"
         case .repaired:    return "Repaired"
         case .failed:      return "Failed"
-        case .unsupported: return "No Remux Needed"
+        case .unsupported: return "Excluded"
         }
     }
 
     var tint: Color {
         switch self {
         case .all:         return .primary
+        case .durationMismatch: return .red
         case .pendingScan: return .secondary
         case .scanning:    return .blue
         case .good:        return .green
@@ -1164,6 +1192,7 @@ private enum RecordingRepairFilter: Equatable {
 
 private struct RecordingRepairFilterCounts {
     var all = 0
+    var durationMismatch = 0
     var pendingScan = 0
     var scanning = 0
     var good = 0
@@ -1177,6 +1206,7 @@ private struct RecordingRepairFilterCounts {
     func count(for filter: RecordingRepairFilter) -> Int {
         switch filter {
         case .all: return all
+        case .durationMismatch: return durationMismatch
         case .pendingScan: return pendingScan
         case .scanning: return scanning
         case .good: return good
@@ -1281,6 +1311,7 @@ struct RecordingsLibraryView: View {
 
                     HStack(spacing: 8) {
                         filterChip(.all,         count: counts.count(for: .all))
+                        filterChip(.durationMismatch, count: counts.count(for: .durationMismatch))
                         filterChip(.pendingScan, count: counts.count(for: .pendingScan))
                         filterChip(.scanning,    count: counts.count(for: .scanning))
                         filterChip(.good,        count: counts.count(for: .good))
@@ -1468,6 +1499,9 @@ struct RecordingsLibraryView: View {
         var counts = RecordingRepairFilterCounts()
         counts.all = allRecordings.count
         for item in allRecordings {
+            if hasDurationMismatch(item) {
+                counts.durationMismatch += 1
+            }
             let state = manager.recordingRepairState(
                 for: item.path,
                 fileExtension: item.fileExtension,
@@ -1504,13 +1538,19 @@ struct RecordingsLibraryView: View {
             }
 
             if needsRepairFilter {
-                let state = manager.recordingRepairState(
-                    for: item.path,
-                    fileExtension: item.fileExtension,
-                    recordingStatus: item.recordingStatus
-                )
-                if !repairFilter.matches(state) {
-                    return false
+                if repairFilter == .durationMismatch {
+                    if !hasDurationMismatch(item) {
+                        return false
+                    }
+                } else {
+                    let state = manager.recordingRepairState(
+                        for: item.path,
+                        fileExtension: item.fileExtension,
+                        recordingStatus: item.recordingStatus
+                    )
+                    if !repairFilter.matches(state) {
+                        return false
+                    }
                 }
             }
 
@@ -1679,6 +1719,9 @@ struct RecordingsLibraryView: View {
                 recordingStatus: entry.status,
                 fileExtension: entry.fileExtension,
                 sizeBytes: entry.fileSizeBytes,
+                durationSeconds: entry.durationSeconds,
+                startedAt: entry.startedAt,
+                endedAt: entry.endedAt,
                 modifiedAt: entry.modifiedAt,
                 thumbnailSourcePath: thumbnailSourcePath,
                 channelThumbnailPath: (entry.isActive || entry.isFinalizing) ? activeChannelThumbnails[entry.channelUsername] : nil,
@@ -1716,6 +1759,14 @@ struct RecordingsLibraryView: View {
             cachedPageRecordings = []
         }
         pageCacheVersion &+= 1
+    }
+
+    private func hasDurationMismatch(_ item: RecordingLibraryItem) -> Bool {
+        recordingDurationAuditStatus(
+            mediaDurationSeconds: item.durationSeconds,
+            startedAt: item.startedAt,
+            endedAt: item.endedAt
+        ) == .mismatch
     }
 
     @ViewBuilder
@@ -1809,6 +1860,10 @@ private struct RecordingLibraryCardView: View {
             .lineLimit(1)
 
             HStack(spacing: 0) {
+                if hasDurationMismatch {
+                    badge(label: "Duration Mismatch", tint: .red)
+                    Spacer(minLength: 6)
+                }
                 repairBadge
                 Spacer(minLength: 0)
             }
@@ -1831,6 +1886,14 @@ private struct RecordingLibraryCardView: View {
 
     private func formatSize(_ bytes: Int64) -> String {
         Self.sizeFormatter.string(fromByteCount: bytes)
+    }
+
+    private var hasDurationMismatch: Bool {
+        recordingDurationAuditStatus(
+            mediaDurationSeconds: item.durationSeconds,
+            startedAt: item.startedAt,
+            endedAt: item.endedAt
+        ) == .mismatch
     }
 
     @ViewBuilder
@@ -1874,7 +1937,7 @@ private struct RecordingLibraryCardView: View {
             case .failed:
                 badge(label: "Repair Failed", tint: .red)
             case .unsupported:
-                badge(label: "No Remux Needed", tint: .secondary)
+                badge(label: "Excluded", tint: .secondary)
             }
         }
     }
@@ -4421,6 +4484,9 @@ struct RecordingDetailView: View {
             recordingStatus: detail.status,
             fileExtension: detail.fileExtension,
             sizeBytes: detail.fileSizeBytes,
+            durationSeconds: detail.durationSeconds,
+            startedAt: detail.startedAt,
+            endedAt: detail.endedAt,
             modifiedAt: detail.fileLastModifiedAt ?? detail.fileLastSeenAt ?? Date(),
             thumbnailSourcePath: shouldAllowPlayback(detail) ? detail.path : nil,
             channelThumbnailPath: channelThumbnailPath,
