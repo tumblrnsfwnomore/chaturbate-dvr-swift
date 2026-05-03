@@ -40,8 +40,13 @@ private enum RecordingDurationAuditStatus {
     case mismatch
 }
 
-private func recordingDurationAuditStatus(mediaDurationSeconds: Double, startedAt: Date?, endedAt: Date?) -> RecordingDurationAuditStatus {
-    guard mediaDurationSeconds > 0,
+private func recordingDurationAuditStatus(ledgerDurationSeconds: Double, startedAt: Date?, endedAt: Date?, recordingStatus: String? = nil) -> RecordingDurationAuditStatus {
+    if let recordingStatus,
+       recordingStatus.lowercased().contains("backfill") {
+        return .ok
+    }
+
+    guard ledgerDurationSeconds > 0,
           let startedAt,
           let endedAt else {
         return .insufficientData
@@ -52,8 +57,10 @@ private func recordingDurationAuditStatus(mediaDurationSeconds: Double, startedA
         return .insufficientData
     }
 
-    let deltaSeconds = abs(mediaDurationSeconds - periodSeconds)
-    return deltaSeconds > 5 ? .mismatch : .ok
+    // Recording period can include stalled/retry windows; only flag if ledger
+    // duration exceeds wall-clock period beyond tolerance.
+    let toleranceSeconds = 5.0
+    return ledgerDurationSeconds > (periodSeconds + toleranceSeconds) ? .mismatch : .ok
 }
 
 struct ContentView: View {
@@ -920,6 +927,8 @@ private struct RecordingLibraryItem: Identifiable {
     let fileExtension: String
     let sizeBytes: Int64
     let durationSeconds: Double
+    let mediaDurationSeconds: Double?
+    let mediaDurationCheckedAt: Date?
     let startedAt: Date?
     let endedAt: Date?
     let modifiedAt: Date
@@ -1250,6 +1259,8 @@ struct RecordingsLibraryView: View {
     @State private var currentPage: Int = 0
     @State private var thumbnailPrewarmTask: Task<Void, Never>?
     @State private var thumbnailViewportSize: CGSize = .zero
+    @State private var observedMediaDurationByPath: [String: Double] = [:]
+    @State private var durationProbeTask: Task<Void, Never>?
 
     private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
 
@@ -1460,6 +1471,8 @@ struct RecordingsLibraryView: View {
             refreshTimer = nil
             thumbnailPrewarmTask?.cancel()
             thumbnailPrewarmTask = nil
+            durationProbeTask?.cancel()
+            durationProbeTask = nil
         }
         .onChange(of: repairFilter) { _ in
             currentPage = 0
@@ -1589,7 +1602,17 @@ struct RecordingsLibraryView: View {
                 totalAllRecordingsBytes = recordings.reduce(0) { $0 + $1.sizeBytes }
                 availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
                     .sorted { $0.lowercased() < $1.lowercased() }
-                     applySortOption()
+                applySortOption()
+
+                let validPaths = Set(recordings.map(\ .path))
+                observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
+                for item in recordings {
+                    if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
+                        observedMediaDurationByPath[item.path] = mediaDuration
+                    }
+                }
+
+                scheduleMediaDurationProbes(for: recordings)
 
                 let hasImplicitPendingMP4 = recordings.contains { item in
                     item.fileExtension.lowercased() == "mp4"
@@ -1720,6 +1743,8 @@ struct RecordingsLibraryView: View {
                 fileExtension: entry.fileExtension,
                 sizeBytes: entry.fileSizeBytes,
                 durationSeconds: entry.durationSeconds,
+                mediaDurationSeconds: entry.mediaDurationSeconds,
+                mediaDurationCheckedAt: entry.mediaDurationCheckedAt,
                 startedAt: entry.startedAt,
                 endedAt: entry.endedAt,
                 modifiedAt: entry.modifiedAt,
@@ -1762,11 +1787,107 @@ struct RecordingsLibraryView: View {
     }
 
     private func hasDurationMismatch(_ item: RecordingLibraryItem) -> Bool {
-        recordingDurationAuditStatus(
-            mediaDurationSeconds: item.durationSeconds,
-            startedAt: item.startedAt,
-            endedAt: item.endedAt
-        ) == .mismatch
+        if item.recordingStatus.lowercased().contains("backfill") {
+            return false
+        }
+
+        guard let observedMediaDuration = observedMediaDurationByPath[item.path] ?? item.mediaDurationSeconds,
+              observedMediaDuration > 0,
+              item.durationSeconds > 0 else {
+            return false
+        }
+
+        return abs(observedMediaDuration - item.durationSeconds) > 5
+    }
+
+    private func scheduleMediaDurationProbes(for items: [RecordingLibraryItem]) {
+        durationProbeTask?.cancel()
+
+        let probePaths = items.compactMap { item -> String? in
+            guard !item.isInProgress,
+                  item.isPreviewable,
+                  !item.recordingStatus.lowercased().contains("backfill"),
+                  item.mediaDurationSeconds == nil,
+                  observedMediaDurationByPath[item.path] == nil else {
+                return nil
+            }
+            return item.path
+        }
+
+        guard !probePaths.isEmpty else {
+            return
+        }
+
+        durationProbeTask = Task(priority: .utility) {
+            var pendingUpdates: [String: Double] = [:]
+
+            for path in probePaths {
+                if Task.isCancelled { return }
+
+                if let duration = await probeMediaDurationSeconds(path: path) {
+                    pendingUpdates[path] = duration
+                    await manager.updateRecordingMediaDuration(path: path, mediaDurationSeconds: duration)
+                }
+
+                if pendingUpdates.count >= 20 {
+                    let batch = pendingUpdates
+                    pendingUpdates.removeAll(keepingCapacity: true)
+                    await MainActor.run {
+                        observedMediaDurationByPath.merge(batch) { _, new in new }
+                    }
+                }
+            }
+
+            if !pendingUpdates.isEmpty {
+                await MainActor.run {
+                    observedMediaDurationByPath.merge(pendingUpdates) { _, new in new }
+                }
+            }
+        }
+    }
+
+    private func probeMediaDurationSeconds(path: String) async -> Double? {
+        let expandedPath = (path as NSString).expandingTildeInPath
+        guard FileManager.default.fileExists(atPath: expandedPath) else {
+            return nil
+        }
+
+        let asset = AVURLAsset(url: URL(fileURLWithPath: expandedPath), options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+
+        do {
+            let duration = try await loadMediaDurationWithTimeout(asset: asset, timeoutSeconds: 6)
+            let seconds = CMTimeGetSeconds(duration)
+            guard seconds.isFinite, seconds > 0 else {
+                return nil
+            }
+            return seconds
+        } catch {
+            return nil
+        }
+    }
+
+    private func loadMediaDurationWithTimeout(asset: AVURLAsset, timeoutSeconds: Double) async throws -> CMTime {
+        enum DurationProbeTimeout: Error {
+            case timedOut
+        }
+
+        return try await withThrowingTaskGroup(of: CMTime.self) { group in
+            group.addTask {
+                try await asset.load(.duration)
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(max(timeoutSeconds, 1) * 1_000_000_000))
+                throw DurationProbeTimeout.timedOut
+            }
+
+            guard let first = try await group.next() else {
+                throw DurationProbeTimeout.timedOut
+            }
+
+            group.cancelAll()
+            return first
+        }
     }
 
     @ViewBuilder
@@ -1890,9 +2011,10 @@ private struct RecordingLibraryCardView: View {
 
     private var hasDurationMismatch: Bool {
         recordingDurationAuditStatus(
-            mediaDurationSeconds: item.durationSeconds,
+            ledgerDurationSeconds: item.durationSeconds,
             startedAt: item.startedAt,
-            endedAt: item.endedAt
+            endedAt: item.endedAt,
+            recordingStatus: item.recordingStatus
         ) == .mismatch
     }
 
@@ -3792,6 +3914,7 @@ struct RecordingDetailView: View {
     @State private var posterImage: NSImage?
     @State private var posterLoadTask: Task<Void, Never>?
     @State private var channelThumbnailPath: String?
+    @State private var observedMediaDurationSeconds: Double?
 
     private enum PlayerPreparationError: LocalizedError {
         case timedOut
@@ -4171,7 +4294,7 @@ struct RecordingDetailView: View {
             let v = e.timeIntervalSince(s)
             return v > 0 ? v : nil
         }()
-        let durationDelta: Double? = recordingPeriod.map { detail.durationSeconds - $0 }
+        let durationDelta: Double? = observedMediaDurationSeconds.map { $0 - detail.durationSeconds }
         let deltaAbsSignificant = durationDelta.map { abs($0) > 5 } ?? false
 
         detailCard(title: "Metadata") {
@@ -4179,6 +4302,9 @@ struct RecordingDetailView: View {
             metadataRow("Status", recordingStatusLabel(detail))
             metadataRow("Format", detail.fileExtension.uppercased())
             metadataRow("Duration", formatDuration(detail.durationSeconds))
+            if let observed = observedMediaDurationSeconds {
+                metadataRow("Media Duration", formatDuration(observed))
+            }
             if let period = recordingPeriod {
                 metadataRow("Recording Period", formatDuration(period))
             }
@@ -4189,6 +4315,8 @@ struct RecordingDetailView: View {
                         ? "Mismatch (\(formatDuration(abs(delta))) delta)"
                         : "OK",
                     valueColor: deltaAbsSignificant ? .red : .green)
+            } else {
+                metadataRow("Duration Audit", "Unavailable", valueColor: .secondary)
             }
             metadataRow("File Size", Self.fileSizeFormatter.string(fromByteCount: detail.fileSizeBytes))
             metadataRow("Audio", audioPresenceLabel(detail.audioPresent))
@@ -4276,6 +4404,7 @@ struct RecordingDetailView: View {
     private func loadRecordingDetail() async {
         isLoading = true
         loadError = nil
+        observedMediaDurationSeconds = nil
 
         playerLoadTask?.cancel()
         await MainActor.run {
@@ -4307,6 +4436,7 @@ struct RecordingDetailView: View {
 
         let siblings = await siblingsTask
         let resolvedChannelThumbnailPath = await channelThumbnailTask
+        let observedDuration = await resolveObservedMediaDurationSeconds(for: loadedDetail)
 
         if Task.isCancelled { return }
 
@@ -4314,6 +4444,7 @@ struct RecordingDetailView: View {
             detail = loadedDetail
             siblingEntries = siblings
             channelThumbnailPath = resolvedChannelThumbnailPath
+            observedMediaDurationSeconds = observedDuration ?? loadedDetail.mediaDurationSeconds
             isLoading = false
         }
 
@@ -4485,6 +4616,8 @@ struct RecordingDetailView: View {
             fileExtension: detail.fileExtension,
             sizeBytes: detail.fileSizeBytes,
             durationSeconds: detail.durationSeconds,
+            mediaDurationSeconds: detail.mediaDurationSeconds,
+            mediaDurationCheckedAt: detail.mediaDurationCheckedAt,
             startedAt: detail.startedAt,
             endedAt: detail.endedAt,
             modifiedAt: detail.fileLastModifiedAt ?? detail.fileLastSeenAt ?? Date(),
@@ -4524,6 +4657,47 @@ struct RecordingDetailView: View {
         try await withThrowingTaskGroup(of: Bool.self) { group in
             group.addTask {
                 try await asset.load(.isReadable)
+            }
+
+            group.addTask {
+                let delay = UInt64(max(timeoutSeconds, 1) * 1_000_000_000)
+                try await Task.sleep(nanoseconds: delay)
+                throw PlayerPreparationError.timedOut
+            }
+
+            guard let first = try await group.next() else {
+                throw PlayerPreparationError.timedOut
+            }
+
+            group.cancelAll()
+            return first
+        }
+    }
+
+    private func resolveObservedMediaDurationSeconds(for detail: RecordingLedgerDetail) async -> Double? {
+        guard detail.fileExists else { return nil }
+
+        let fileURL = URL(fileURLWithPath: (detail.path as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
+
+        let asset = AVURLAsset(url: fileURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: false])
+        do {
+            let duration = try await loadDurationWithTimeout(asset, timeoutSeconds: 8)
+            let seconds = CMTimeGetSeconds(duration)
+            guard seconds.isFinite, seconds > 0 else {
+                return detail.mediaDurationSeconds
+            }
+            await manager.updateRecordingMediaDuration(path: detail.path, mediaDurationSeconds: seconds)
+            return seconds
+        } catch {
+            return detail.mediaDurationSeconds
+        }
+    }
+
+    private func loadDurationWithTimeout(_ asset: AVURLAsset, timeoutSeconds: Double) async throws -> CMTime {
+        try await withThrowingTaskGroup(of: CMTime.self) { group in
+            group.addTask {
+                try await asset.load(.duration)
             }
 
             group.addTask {

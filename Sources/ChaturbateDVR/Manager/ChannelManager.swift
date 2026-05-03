@@ -1560,6 +1560,11 @@ class ChannelManager: ObservableObject {
         return await recordingLedger.fetchRecordingDetail(filePath: normalizedPath)
     }
 
+    func updateRecordingMediaDuration(path: String, mediaDurationSeconds: Double?) async {
+        let normalizedPath = (path as NSString).expandingTildeInPath
+        await recordingLedger.updateMediaDuration(filePath: normalizedPath, mediaDurationSeconds: mediaDurationSeconds)
+    }
+
     func getActivelyFinalizingPaths() async -> Set<String> {
         await Channel.activelyFinalizingPaths()
     }
