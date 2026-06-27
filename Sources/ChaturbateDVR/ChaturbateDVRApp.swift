@@ -1,12 +1,22 @@
 import SwiftUI
 import AppKit
 
+struct TerminationProgressStatus: Sendable {
+    let blockingCount: Int
+    let reason: String
+}
+
 final class AppDelegate: NSObject, NSApplicationDelegate {
     private let minimumMainWindowSize = NSSize(width: 1200, height: 820)
+    private let terminationGracePeriodSeconds: UInt64 = 20
     var gracefulShutdownHandler: (() async -> Void)?
-    var terminationBlockReasonProvider: (() -> String?)?
+    var terminationStatusProvider: (() async -> TerminationProgressStatus)?
     private var hasStartedTermination = false
+    private var hasCompletedTermination = false
     private var terminationProgressWindow: NSWindow?
+    private var terminationProgressPollingTask: Task<Void, Never>?
+    private var terminationTimeoutTask: Task<Void, Never>?
+    private var terminationDetailLabel: NSTextField?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupTemporaryPreviewFiles()
@@ -20,38 +30,108 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func applicationWillTerminate(_ notification: Notification) {
+        terminationProgressPollingTask?.cancel()
+        terminationProgressPollingTask = nil
+        terminationTimeoutTask?.cancel()
+        terminationTimeoutTask = nil
         dismissTerminationProgressWindow()
         cleanupTemporaryPreviewFiles()
     }
 
     func applicationShouldTerminate(_ sender: NSApplication) -> NSApplication.TerminateReply {
+        Task {
+            await FileLogger.shared.log("[app] applicationShouldTerminate requested")
+        }
+
         guard !hasStartedTermination else {
             return .terminateLater
         }
-
-        let pendingReason = terminationBlockReasonProvider?()
 
         guard let gracefulShutdownHandler else {
             return .terminateNow
         }
 
         hasStartedTermination = true
-
-        if let pendingReason {
-            showTerminationProgressWindow(reason: pendingReason)
-        }
+        hasCompletedTermination = false
+        showTerminationProgressWindow(reason: "Stopping channels and background workers...")
+        startTerminationProgressPolling()
+        startTerminationTimeout()
 
         Task { @MainActor in
             await gracefulShutdownHandler()
+            guard !hasCompletedTermination else { return }
+            hasCompletedTermination = true
+            terminationProgressPollingTask?.cancel()
+            terminationProgressPollingTask = nil
+            terminationTimeoutTask?.cancel()
+            terminationTimeoutTask = nil
             dismissTerminationProgressWindow()
+            await FileLogger.shared.log("[app] applicationShouldTerminate completed")
             NSApp.reply(toApplicationShouldTerminate: true)
         }
 
         return .terminateLater
     }
 
+    private func startTerminationTimeout() {
+        terminationTimeoutTask?.cancel()
+        terminationTimeoutTask = Task { [weak self] in
+            guard let self else { return }
+
+            do {
+                try await Task.sleep(nanoseconds: terminationGracePeriodSeconds * 1_000_000_000)
+            } catch {
+                return
+            }
+
+            await MainActor.run {
+                guard self.hasStartedTermination, !self.hasCompletedTermination else { return }
+
+                self.hasCompletedTermination = true
+                self.terminationProgressPollingTask?.cancel()
+                self.terminationProgressPollingTask = nil
+                self.terminationTimeoutTask = nil
+                self.dismissTerminationProgressWindow()
+                Task {
+                    await FileLogger.shared.log("[app] termination grace period expired; allowing quit to continue", level: "WARN")
+                }
+                NSApp.reply(toApplicationShouldTerminate: true)
+            }
+        }
+    }
+
+    private func startTerminationProgressPolling() {
+        guard let terminationStatusProvider else { return }
+
+        terminationProgressPollingTask?.cancel()
+        terminationProgressPollingTask = Task { [weak self] in
+            guard let self else { return }
+
+            while !Task.isCancelled {
+                let status = await terminationStatusProvider()
+
+                await MainActor.run {
+                    guard self.hasStartedTermination else { return }
+                    let fallbackReason = "Still shutting down background tasks..."
+                    let visibleReason = status.blockingCount > 0 ? status.reason : fallbackReason
+                    self.showTerminationProgressWindow(reason: visibleReason)
+                }
+
+                try? await Task.sleep(nanoseconds: 300_000_000)
+            }
+        }
+    }
+
+    private func terminationProgressMessage(blockingCount: Int) -> String {
+        if blockingCount == 1 {
+            return "1 video finalization task is blocking quit."
+        }
+        return "\(blockingCount) video finalization tasks are blocking quit."
+    }
+
     private func showTerminationProgressWindow(reason: String) {
         if let existing = terminationProgressWindow {
+            terminationDetailLabel?.stringValue = reason
             existing.makeKeyAndOrderFront(nil)
             return
         }
@@ -66,6 +146,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         panel.title = "Quitting ChaturbateDVR"
         panel.isReleasedWhenClosed = false
         panel.level = .modalPanel
+        panel.hidesOnDeactivate = false
+        panel.collectionBehavior = [.canJoinAllSpaces, .moveToActiveSpace]
         panel.standardWindowButton(.closeButton)?.isHidden = true
         panel.standardWindowButton(.miniaturizeButton)?.isHidden = true
         panel.standardWindowButton(.zoomButton)?.isHidden = true
@@ -90,6 +172,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         detailLabel.textColor = .secondaryLabelColor
         detailLabel.maximumNumberOfLines = 3
         detailLabel.translatesAutoresizingMaskIntoConstraints = false
+        terminationDetailLabel = detailLabel
 
         container.addSubview(spinner)
         container.addSubview(titleLabel)
@@ -110,6 +193,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         ])
 
         terminationProgressWindow = panel
+        panel.orderFrontRegardless()
         panel.makeKeyAndOrderFront(nil)
         NSApp.activate(ignoringOtherApps: true)
     }
@@ -117,6 +201,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func dismissTerminationProgressWindow() {
         terminationProgressWindow?.close()
         terminationProgressWindow = nil
+        terminationDetailLabel = nil
     }
 
     private func cleanupTemporaryPreviewFiles() {

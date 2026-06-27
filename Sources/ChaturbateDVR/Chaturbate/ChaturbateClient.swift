@@ -154,8 +154,10 @@ actor ChaturbateClient {
         debugLines.append("fallback_online_has_login_form=\(looksLikeLoginPage(onlineBody))")
         debugLines.append("fallback_offline_has_login_form=\(looksLikeLoginPage(offlineBody))")
 
-        let online = parseFollowedUsernames(from: onlineBody)
-        let offline = parseFollowedUsernames(from: offlineBody)
+        // Safety-first fallback: only trust strict room-card extraction on followed pages.
+        // Avoid scanning arbitrary links/JSON blobs that can include site/category slugs.
+        let online = parseFollowedUsernames(from: onlineBody, allowLooseFallback: false)
+        let offline = parseFollowedUsernames(from: offlineBody, allowLooseFallback: false)
         let combined = online.union(offline)
         debugLines.append("fallback_online_usernames=\(online.count)")
         debugLines.append("fallback_offline_usernames=\(offline.count)")
@@ -431,33 +433,48 @@ actor ChaturbateClient {
         }
 
         var usernames = Set<String>()
+        var sawFollowingFlag = false
 
         // IMPORTANT: Do not recurse through arbitrary JSON here.
         // Explicit endpoints can include recommendation/metadata blocks that contain
         // many usernames not in the user's followed list.
         if let root = json as? [String: Any] {
             if let rooms = root["rooms"] as? [[String: Any]] {
-                usernames.formUnion(parseUsernamesFromExplicitRoomArray(rooms))
+                sawFollowingFlag = sawFollowingFlag || rooms.contains { $0["is_following"] != nil }
+                usernames.formUnion(parseUsernamesFromExplicitRoomArray(rooms, requireFollowingFlag: false))
             }
 
             if let results = root["results"] as? [[String: Any]] {
-                usernames.formUnion(parseUsernamesFromExplicitRoomArray(results))
+                sawFollowingFlag = sawFollowingFlag || results.contains { $0["is_following"] != nil }
+                usernames.formUnion(parseUsernamesFromExplicitRoomArray(results, requireFollowingFlag: false))
             }
 
             if let users = root["users"] as? [[String: Any]] {
-                usernames.formUnion(parseUsernamesFromExplicitRoomArray(users))
+                sawFollowingFlag = sawFollowingFlag || users.contains { $0["is_following"] != nil }
+                usernames.formUnion(parseUsernamesFromExplicitRoomArray(users, requireFollowingFlag: false))
             }
         } else if let array = json as? [[String: Any]] {
-            usernames.formUnion(parseUsernamesFromExplicitRoomArray(array))
+            sawFollowingFlag = array.contains { $0["is_following"] != nil }
+            usernames.formUnion(parseUsernamesFromExplicitRoomArray(array, requireFollowingFlag: false))
+        }
+
+        // Safety: if explicit endpoints do not expose follow state,
+        // treat them as untrusted and ignore to avoid importing category/recommendation rows.
+        if !sawFollowingFlag {
+            return []
         }
 
         return usernames
     }
 
-    private func parseUsernamesFromExplicitRoomArray(_ rows: [[String: Any]]) -> Set<String> {
+    private func parseUsernamesFromExplicitRoomArray(_ rows: [[String: Any]], requireFollowingFlag: Bool) -> Set<String> {
         var usernames = Set<String>()
 
         for row in rows {
+            if requireFollowingFlag, row["is_following"] == nil {
+                continue
+            }
+
             // If an explicit follow signal exists, honor it strictly.
             if let isFollowing = row["is_following"] as? Bool, !isFollowing {
                 continue
@@ -561,26 +578,54 @@ actor ChaturbateClient {
     }
 
     private func extractUsernameCandidate(_ value: Any) -> String? {
-        guard let raw = value as? String else {
+        guard let rawValue = value as? String else {
             return nil
         }
 
-        // Accept plain usernames and /username-style links.
-        var candidate = raw
-        if let firstSegment = raw.split(separator: "/").first(where: { !$0.isEmpty }) {
-            if raw.contains("/") {
-                candidate = String(firstSegment)
-            }
+        let raw = rawValue.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !raw.isEmpty else {
+            return nil
+        }
+
+        // Support plain usernames and URL/path forms while avoiding page slugs.
+        let candidate: String
+        if let pathCandidate = extractUsernameFromPath(raw) {
+            candidate = pathCandidate
+        } else {
+            candidate = raw
         }
 
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
         let sanitized = candidate.components(separatedBy: allowed.inverted).joined().lowercased()
 
-        guard !sanitized.isEmpty, sanitized.count <= 50 else {
+        guard isLikelyUsername(sanitized) else {
             return nil
         }
 
         return sanitized
+    }
+
+    private func extractUsernameFromPath(_ raw: String) -> String? {
+        var pathComponents: [String] = []
+
+        if let url = URL(string: raw),
+           let host = url.host,
+           !host.isEmpty {
+            pathComponents = url.pathComponents.filter { $0 != "/" && !$0.isEmpty }
+        } else if raw.contains("/") {
+            let stripped = raw.split(separator: "?", maxSplits: 1).first.map(String.init) ?? raw
+            pathComponents = stripped.split(separator: "/").map(String.init)
+        }
+
+        guard !pathComponents.isEmpty else {
+            return nil
+        }
+
+        if pathComponents[0].lowercased() == "p", pathComponents.count > 1 {
+            return pathComponents[1]
+        }
+
+        return pathComponents[0]
     }
 
     private func parseFollowedUsernames(from body: String, allowLooseFallback: Bool = true) -> Set<String> {
@@ -831,7 +876,7 @@ actor ChaturbateClient {
             let raw = String(liHTML[usernameRange])
             let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
             let sanitized = raw.components(separatedBy: allowed.inverted).joined().lowercased()
-            if !sanitized.isEmpty {
+            if isLikelyUsername(sanitized) {
                 return sanitized
             }
         }
@@ -1104,5 +1149,55 @@ actor ChaturbateClient {
         ]
 
         return known[code] ?? rawLanguage
+    }
+
+    /// Export raw followed import payloads (HTML and API JSON) for debugging, on demand.
+    func exportFollowedImportDebugPayloads(progress: ((String) -> Void)? = nil) async {
+        let appSupport = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
+        let debugDir = appSupport.appendingPathComponent("ChaturbateDVR/FollowedImportDebug", isDirectory: true)
+        try? FileManager.default.createDirectory(at: debugDir, withIntermediateDirectories: true)
+        
+        func save(_ data: Data, name: String) {
+            let url = debugDir.appendingPathComponent(name)
+            try? data.write(to: url)
+        }
+        
+        progress?("Fetching followed online rooms API...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)api/ts/roomlist/room-list/?show=follow&limit=100&offset=0")
+            save(data, name: "roomlist-follow.json")
+        } catch { progress?("Failed to fetch online rooms API: \(error)") }
+        
+        progress?("Fetching followed offline rooms API...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)api/ts/roomlist/room-list/?show=follow_offline&limit=100&offset=0")
+            save(data, name: "roomlist-follow_offline.json")
+        } catch { progress?("Failed to fetch offline rooms API: \(error)") }
+        
+        progress?("Fetching explicit online_followed_rooms API...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)api/online_followed_rooms/")
+            save(data, name: "explicit-followed-online.json")
+        } catch { progress?("Failed to fetch explicit online_followed_rooms: \(error)") }
+        
+        progress?("Fetching explicit offline_followed_rooms API...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)api/offline_followed_rooms/")
+            save(data, name: "explicit-followed-offline.json")
+        } catch { progress?("Failed to fetch explicit offline_followed_rooms: \(error)") }
+        
+        progress?("Fetching followed-cams HTML...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)followed-cams/")
+            save(data, name: "followed-cams.html")
+        } catch { progress?("Failed to fetch followed-cams HTML: \(error)") }
+        
+        progress?("Fetching followed-cams/offline HTML...")
+        do {
+            let (data, _) = try await httpClient.getDataWithStatus("\(config.domain)followed-cams/offline/")
+            save(data, name: "followed-cams-offline.html")
+        } catch { progress?("Failed to fetch followed-cams/offline HTML: \(error)") }
+        
+        progress?("Export complete. Files are in \(debugDir.path)")
     }
 }

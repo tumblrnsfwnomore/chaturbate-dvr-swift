@@ -9,7 +9,16 @@ private actor MP4Finalizer {
         let audioSourcePath: String?
         let destinationPath: String
         let channel: String
+        let preferRetimingOnFailure: Bool
+        let queuedAt: Date
         let onCompletion: (@Sendable (RepairOutcome) -> Void)?
+    }
+
+    private struct ActiveJob {
+        let sourcePath: String
+        let destinationPath: String
+        let channel: String
+        let startedAt: Date
     }
 
     private static let minDurationRetentionRatio: Double = 0.90
@@ -33,6 +42,7 @@ private actor MP4Finalizer {
 
     private var inFlightPaths: Set<String> = []
     private var activelyProcessingPaths: Set<String> = []
+    private var activeJobs: [String: ActiveJob] = [:]
     private var pendingJobs: [PendingJob] = []
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private var maxConcurrentFinalizations: Int = 1
@@ -41,11 +51,46 @@ private actor MP4Finalizer {
         activelyProcessingPaths
     }
 
+    func terminationProgressStatus() -> TerminationProgressStatus {
+        let blockingCount = inFlightPaths.count
+        guard blockingCount > 0 else {
+            return TerminationProgressStatus(blockingCount: 0, reason: "")
+        }
+
+        let pendingCount = pendingJobs.count
+
+        if let longestActive = activeJobs.values.min(by: { $0.startedAt < $1.startedAt }) {
+            let fileName = URL(fileURLWithPath: longestActive.destinationPath).lastPathComponent
+            let elapsed = formatDuration(Date().timeIntervalSince(longestActive.startedAt))
+            let base = "Finalizing @\(longestActive.channel): \(fileName) (\(elapsed))."
+            if pendingCount > 0 {
+                return TerminationProgressStatus(
+                    blockingCount: blockingCount,
+                    reason: "\(base) \(pendingCount) additional finalization task(s) queued."
+                )
+            }
+            return TerminationProgressStatus(blockingCount: blockingCount, reason: base)
+        }
+
+        if pendingCount > 0 {
+            return TerminationProgressStatus(
+                blockingCount: blockingCount,
+                reason: "\(pendingCount) finalization task(s) queued to start."
+            )
+        }
+
+        return TerminationProgressStatus(
+            blockingCount: blockingCount,
+            reason: "\(blockingCount) video finalization task(s) are blocking quit."
+        )
+    }
+
     func enqueue(
         sourcePath: String,
         audioSourcePath: String? = nil,
         destinationPath: String,
         channel: String,
+        preferRetimingOnFailure: Bool = false,
         onCompletion: (@Sendable (RepairOutcome) -> Void)? = nil
     ) {
         guard inFlightPaths.insert(sourcePath).inserted else { return }
@@ -55,6 +100,8 @@ private actor MP4Finalizer {
             audioSourcePath: audioSourcePath,
             destinationPath: destinationPath,
             channel: channel,
+            preferRetimingOnFailure: preferRetimingOnFailure,
+            queuedAt: Date(),
             onCompletion: onCompletion
         ))
         startNextJobsIfPossible()
@@ -70,10 +117,21 @@ private actor MP4Finalizer {
             return .skipped("repair already in progress")
         }
 
-        return await finalize(sourcePath: path, destinationPath: path, channel: channel)
+        return await finalize(
+            sourcePath: path,
+            destinationPath: path,
+            channel: channel,
+            preferRetimingOnFailure: true
+        )
     }
 
-    private func finalize(sourcePath: String, audioSourcePath: String? = nil, destinationPath: String, channel: String) async -> RepairOutcome {
+    private func finalize(
+        sourcePath: String,
+        audioSourcePath: String? = nil,
+        destinationPath: String,
+        channel: String,
+        preferRetimingOnFailure: Bool
+    ) async -> RepairOutcome {
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: $0) }
         let destinationURL = URL(fileURLWithPath: destinationPath)
@@ -93,13 +151,40 @@ private actor MP4Finalizer {
         do {
             let sourceAttributes = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
             let sourceMetrics = try await loadMediaMetrics(for: sourceURL)
-            try await exportPassthrough(
-                sourceURL: sourceURL,
-                audioSourceURL: hasAudioSidecar ? audioSourceURL : nil,
-                destinationURL: tempURL
-            )
-            let exportedMetrics = try await loadMediaMetrics(for: tempURL)
-            try validateExport(source: sourceMetrics, exported: exportedMetrics)
+            var finalizedWithRetiming = false
+
+            do {
+                try await exportPassthrough(
+                    sourceURL: sourceURL,
+                    audioSourceURL: hasAudioSidecar ? audioSourceURL : nil,
+                    destinationURL: tempURL
+                )
+                let exportedMetrics = try await loadMediaMetrics(for: tempURL)
+                try validateExport(source: sourceMetrics, exported: exportedMetrics)
+            } catch {
+                try? FileManager.default.removeItem(at: tempURL)
+
+                guard preferRetimingOnFailure else {
+                    throw error
+                }
+
+                guard let ffmpegPath = resolveFFMPEGPath() else {
+                    throw ChaturbateError.fileError("ffmpeg is required for retime fallback")
+                }
+
+                let fps = await detectSourceFPS(for: sourceURL)
+                try await retimeWithFFMPEG(
+                    ffmpegPath: ffmpegPath,
+                    sourceURL: sourceURL,
+                    audioSourceURL: hasAudioSidecar ? audioSourceURL : nil,
+                    destinationURL: tempURL,
+                    fps: fps
+                )
+
+                let retimedMetrics = try await loadMediaMetrics(for: tempURL)
+                try validateExport(source: sourceMetrics, exported: retimedMetrics)
+                finalizedWithRetiming = true
+            }
 
             if FileManager.default.fileExists(atPath: sourceURL.path) {
                 try FileManager.default.removeItem(at: sourceURL)
@@ -124,7 +209,19 @@ private actor MP4Finalizer {
                 try? FileManager.default.removeItem(at: audioSourceURL)
             }
 
-            await FileLogger.shared.log("[recording] finalized mp4 for fast open/seek (duration \(formatSeconds(exportedMetrics.durationSeconds)) size \(exportedMetrics.sizeBytes) bytes)", channel: channel)
+            let destinationMetrics = try await loadMediaMetrics(for: destinationURL)
+            if finalizedWithRetiming {
+                await FileLogger.shared.log(
+                    "[recording] finalized mp4 via retime fallback (duration \(formatSeconds(destinationMetrics.durationSeconds)) size \(destinationMetrics.sizeBytes) bytes)",
+                    channel: channel,
+                    level: "WARN"
+                )
+            } else {
+                await FileLogger.shared.log(
+                    "[recording] finalized mp4 for fast open/seek (duration \(formatSeconds(destinationMetrics.durationSeconds)) size \(destinationMetrics.sizeBytes) bytes)",
+                    channel: channel
+                )
+            }
             return .succeeded
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
@@ -135,7 +232,7 @@ private actor MP4Finalizer {
 
     private func exportPassthrough(sourceURL: URL, audioSourceURL: URL? = nil, destinationURL: URL) async throws {
         if let ffmpegPath = resolveFFMPEGPath() {
-            try remuxWithFFMPEG(
+            try await remuxWithFFMPEG(
                 ffmpegPath: ffmpegPath,
                 sourceURL: sourceURL,
                 audioSourceURL: audioSourceURL,
@@ -157,7 +254,7 @@ private actor MP4Finalizer {
         try await export.export(to: destinationURL, as: .mp4)
     }
 
-    private func remuxWithFFMPEG(ffmpegPath: String, sourceURL: URL, audioSourceURL: URL? = nil, destinationURL: URL) throws {
+    private func remuxWithFFMPEG(ffmpegPath: String, sourceURL: URL, audioSourceURL: URL? = nil, destinationURL: URL) async throws {
         var arguments: [String] = [
             "-nostdin",
             "-hide_banner",
@@ -185,7 +282,7 @@ private actor MP4Finalizer {
             ]
         }
 
-        let result = runProcess(executablePath: ffmpegPath, arguments: arguments)
+        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments)
 
         guard result.status == 0 else {
             let details = result.stderr.isEmpty ? result.stdout : result.stderr
@@ -195,6 +292,93 @@ private actor MP4Finalizer {
             }
             throw ChaturbateError.fileError("ffmpeg remux failed: \(trimmed)")
         }
+    }
+
+    private func retimeWithFFMPEG(
+        ffmpegPath: String,
+        sourceURL: URL,
+        audioSourceURL: URL? = nil,
+        destinationURL: URL,
+        fps: Double
+    ) async throws {
+        let fpsText = String(format: "%.6f", fps)
+        var arguments: [String] = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-i", sourceURL.path,
+        ]
+
+        if let audioSourceURL {
+            arguments += ["-i", audioSourceURL.path]
+        }
+
+        let audioInputIndex = audioSourceURL == nil ? 0 : 1
+        let hasAudio = await probeHasAudioStream(fileURL: audioSourceURL ?? sourceURL)
+
+        arguments += [
+            "-analyzeduration", "100M",
+            "-probesize", "100M",
+        ]
+
+        if hasAudio {
+            // Normalize both timelines to start at zero so retimed video does not
+            // drift from copied/offset audio timestamps.
+            let filter = "[0:v:0]setpts=N/(\(fpsText)*TB),fps=\(fpsText),format=yuv420p[v];[\(audioInputIndex):a:0]aresample=async=1:first_pts=0[a]"
+            arguments += [
+                "-filter_complex", filter,
+                "-map", "[v]",
+                "-map", "[a]",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "20",
+                "-c:a", "aac",
+                "-b:a", "192k",
+                "-ar", "48000",
+                "-ac", "2",
+                "-shortest",
+                "-movflags", "+faststart",
+                destinationURL.path,
+            ]
+        } else {
+            arguments += [
+                "-vf", "setpts=N/(\(fpsText)*TB),fps=\(fpsText),format=yuv420p",
+                "-map", "0:v:0",
+                "-c:v", "libx264",
+                "-preset", "veryfast",
+                "-crf", "20",
+                "-movflags", "+faststart",
+                destinationURL.path,
+            ]
+        }
+
+        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments)
+        guard result.status == 0 else {
+            let details = result.stderr.isEmpty ? result.stdout : result.stderr
+            let trimmed = details.trimmingCharacters(in: .whitespacesAndNewlines)
+            if trimmed.isEmpty {
+                throw ChaturbateError.fileError("ffmpeg retime failed with status \(result.status)")
+            }
+            throw ChaturbateError.fileError("ffmpeg retime failed: \(trimmed)")
+        }
+    }
+
+    private func probeHasAudioStream(fileURL: URL) async -> Bool {
+        guard let ffprobePath = resolveFFProbePath() else { return false }
+        let result = await runProcess(
+            executablePath: ffprobePath,
+            arguments: [
+                "-v", "error",
+                "-select_streams", "a:0",
+                "-show_entries", "stream=index",
+                "-of", "default=nokey=1:noprint_wrappers=1",
+                fileURL.path,
+            ]
+        )
+
+        guard result.status == 0 else { return false }
+        return !result.stdout.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
     }
 
     private func loadMediaMetrics(for fileURL: URL) async throws -> MediaMetrics {
@@ -253,6 +437,16 @@ private actor MP4Finalizer {
         String(format: "%.1f%%", ratio * 100)
     }
 
+    private func formatDuration(_ seconds: TimeInterval) -> String {
+        let clamped = max(0, Int(seconds.rounded(.down)))
+        let minutes = clamped / 60
+        let secs = clamped % 60
+        if minutes > 0 {
+            return "\(minutes)m \(secs)s"
+        }
+        return "\(secs)s"
+    }
+
     private func resolveFFMPEGPath() -> String? {
         let candidates = [
             "/opt/homebrew/bin/ffmpeg",
@@ -263,30 +457,86 @@ private actor MP4Finalizer {
         return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
     }
 
-    private func runProcess(executablePath: String, arguments: [String]) -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
-        process.arguments = arguments
+    private func resolveFFProbePath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffprobe",
+            "/usr/local/bin/ffprobe",
+            "/usr/bin/ffprobe",
+        ]
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
 
-        do {
-            try process.run()
-            process.waitUntilExit()
+    private func detectSourceFPS(for fileURL: URL) async -> Double {
+        if let ffprobePath = resolveFFProbePath() {
+            for probeArguments in [
+                ["-select_streams", "v:0", "-show_entries", "stream=avg_frame_rate"],
+                ["-select_streams", "v:0", "-show_entries", "stream=r_frame_rate"],
+            ] {
+                let result = await runProcess(
+                    executablePath: ffprobePath,
+                    arguments: ["-v", "error"] + probeArguments + ["-of", "default=nokey=1:noprint_wrappers=1", fileURL.path]
+                )
+                if result.status == 0,
+                   let raw = result.stdout.split(whereSeparator: \ .isNewline).first,
+                   let parsed = parseFPS(String(raw)) {
+                    return parsed
+                }
+            }
+        }
 
-            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+        return 30.0
+    }
 
-            return ProcessResult(
-                status: process.terminationStatus,
-                stdout: String(decoding: stdoutData, as: UTF8.self),
-                stderr: String(decoding: stderrData, as: UTF8.self)
-            )
-        } catch {
-            return ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+    private func parseFPS(_ raw: String) -> Double? {
+        let trimmed = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        guard !trimmed.isEmpty else { return nil }
+
+        if let direct = Double(trimmed), direct.isFinite, direct > 0 {
+            return direct
+        }
+
+        let parts = trimmed.split(separator: "/", omittingEmptySubsequences: false)
+        guard parts.count == 2,
+              let numerator = Double(parts[0]),
+              let denominator = Double(parts[1]),
+              denominator > 0 else {
+            return nil
+        }
+
+        let fps = numerator / denominator
+        guard fps.isFinite, fps > 0 else { return nil }
+        return fps
+    }
+
+    private func runProcess(executablePath: String, arguments: [String]) async -> ProcessResult {
+        await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executablePath)
+                process.arguments = arguments
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+
+                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+                    continuation.resume(returning: ProcessResult(
+                        status: process.terminationStatus,
+                        stdout: String(decoding: stdoutData, as: UTF8.self),
+                        stderr: String(decoding: stderrData, as: UTF8.self)
+                    ))
+                } catch {
+                    continuation.resume(returning: ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription))
+                }
+            }
         }
     }
 
@@ -305,13 +555,20 @@ private actor MP4Finalizer {
               !pendingJobs.isEmpty {
             let job = pendingJobs.removeFirst()
             activelyProcessingPaths.insert(job.sourcePath)
+            activeJobs[job.sourcePath] = ActiveJob(
+                sourcePath: job.sourcePath,
+                destinationPath: job.destinationPath,
+                channel: job.channel,
+                startedAt: Date()
+            )
 
             Task(priority: .utility) { [self] in
                 let outcome = await finalize(
                     sourcePath: job.sourcePath,
                     audioSourcePath: job.audioSourcePath,
                     destinationPath: job.destinationPath,
-                    channel: job.channel
+                    channel: job.channel,
+                    preferRetimingOnFailure: job.preferRetimingOnFailure
                 )
                 finishJob(sourcePath: job.sourcePath)
                 job.onCompletion?(outcome)
@@ -321,6 +578,7 @@ private actor MP4Finalizer {
 
     private func finishJob(sourcePath: String) {
         activelyProcessingPaths.remove(sourcePath)
+        activeJobs.removeValue(forKey: sourcePath)
         inFlightPaths.remove(sourcePath)
         startNextJobsIfPossible()
 
@@ -359,7 +617,7 @@ actor Channel {
     private static let recordingPreviewMaxBytes = 12 * 1024 * 1024
     private static let waitingStatusCheckIntervalSeconds: TimeInterval = 30
     private static let waitingPreviewMinInterval: TimeInterval = 120
-    private static let waitingOfflineConfirmAttempts: Int = 2
+    private static let waitingOfflineConfirmAttempts: Int = 3
     private static let breakStaticMotionThreshold: Double = 0.003
     private static let breakLowMotionThreshold: Double = 0.015
     private static let breakAnalysisImageSize: Int = 64
@@ -372,7 +630,11 @@ actor Channel {
     private static let segmentTimelineMismatchMaxRatio: Double = 2.0
     private static let segmentTimelineMismatchRequiredEvents: Int = 3
     private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 20
+    private static let minRolloverFragmentDurationSeconds: Double = 8.0
+    private static let minRolloverFragmentSizeBytes = 256 * 1024
     private static let maxAudioLeadSeconds: Double = 0.75
+    private static let activeRecordingTransientFailureWindowSeconds: TimeInterval = 25
+    private static let activeRecordingTransientFailureThreshold: Int = 6
 
     private struct PreviewSegmentChunk {
         let data: Data
@@ -385,6 +647,7 @@ actor Channel {
     }
 
     private(set) var config: ChannelConfig
+    private let onRecordingFinalized: (@Sendable (String) -> Void)?
     private(set) var isOnline: Bool = false
     private(set) var streamedAt: Date?
     private(set) var duration: Double = 0 // seconds
@@ -437,6 +700,7 @@ actor Channel {
     private var cumulativeClaimedSegmentDuration: Double = 0
     private var cumulativeObservedSegmentDuration: Double = 0
     private var segmentTimelineMismatchEvents: Int = 0
+    private var consecutiveUnobservedFragmentTimings: Int = 0
     private var pendingTimestampDiscontinuity: Bool = false
     private var sessionStartedAt: Date? // tracks session start for session duration limits
     private var lastPreviewFailureLogAt: Date = Date.distantPast
@@ -451,6 +715,8 @@ actor Channel {
     private var lastBreakLumaFrame: [UInt8]?
     private var latestPersonDetected: Bool?
     private var lastPersonSeenAt: Date?
+    private var activeRecordingTransientFailureCount: Int = 0
+    private var activeRecordingTransientFailureStartedAt: Date?
     private var isNoPersonLikely: Bool = false
     private var noPersonStreakSeconds: TimeInterval = 0
     private var noPersonCarryExpiryAt: Date?
@@ -458,15 +724,19 @@ actor Channel {
     private var activePersonMotionSeconds: TimeInterval = 0
     private var breakEnforced: Bool = false
     private var breakEnforcedAt: Date?
+    private var manualBreakOverrideActive: Bool = false
     private var staticFrameStreakSeconds: TimeInterval = 0
     private var noPersonNoMotionStreakSeconds: TimeInterval = 0
     private var pendingBreakOfflineReason: String?
     private let requestCoordinator: RequestCoordinator
+    private let recordingRequestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
     private let recordingLedger: RecordingLedger
     private var activeRecordingID: Int64?
     private var activeRecordingStartedAt: Date?
     private var activeRecordingFirstPersonDetectedAt: Date?
+    private var currentRecordingTimingSuspect: Bool = false
+    private var currentRecordingTimingIssueReasons: Set<String> = []
     private var lastRecordingProgressPersistAt: Date = .distantPast
     private var isFirstCheck: Bool = true
     private var isInGlobalRecordingPauseMode: Bool = false
@@ -475,13 +745,17 @@ actor Channel {
         config: ChannelConfig,
         appConfig: AppConfig,
         requestCoordinator: RequestCoordinator,
+        recordingRequestCoordinator: RequestCoordinator,
         recordingCoordinator: RecordingCoordinator,
-        recordingLedger: RecordingLedger
+        recordingLedger: RecordingLedger,
+        onRecordingFinalized: (@Sendable (String) -> Void)? = nil
     ) {
         self.config = config
+        self.onRecordingFinalized = onRecordingFinalized
         self.appConfig = appConfig
         self.client = ChaturbateClient(config: appConfig)
         self.requestCoordinator = requestCoordinator
+        self.recordingRequestCoordinator = recordingRequestCoordinator
         self.recordingCoordinator = recordingCoordinator
         self.recordingLedger = recordingLedger
         self.isInvalid = config.isInvalid
@@ -508,6 +782,7 @@ actor Channel {
     
     func pause() {
         let wasOnline = isOnline
+        clearActiveRecordingTransientFailureState()
         config.isPaused = true
         isPausedBySessionLimit = false
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
@@ -527,6 +802,7 @@ actor Channel {
     
     func pauseForSessionLimit(reason: String) {
         let wasOnline = isOnline
+        clearActiveRecordingTransientFailureState()
         config.isPaused = true
         isPausedBySessionLimit = true
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
@@ -541,6 +817,7 @@ actor Channel {
     }
     
     func resume() {
+        clearActiveRecordingTransientFailureState()
         config.isPaused = false
         isPausedBySessionLimit = false
         pausedOnlineStickyUntil = nil
@@ -556,6 +833,7 @@ actor Channel {
     }
     
     func stopForDeletion() {
+        clearActiveRecordingTransientFailureState()
         config.isPaused = true
         pausedOnlineStickyUntil = nil
         resetBreakDetectionState()
@@ -585,6 +863,10 @@ actor Channel {
         await mp4Finalizer.waitUntilIdle()
     }
 
+    static func terminationProgressStatus() async -> TerminationProgressStatus {
+        await mp4Finalizer.terminationProgressStatus()
+    }
+
     static func activelyFinalizingPaths() async -> Set<String> {
         await mp4Finalizer.activelyFinalizingPaths()
     }
@@ -594,7 +876,12 @@ actor Channel {
     }
 
     static func enqueueExistingMP4Repair(path: String, channel: String) async {
-        await mp4Finalizer.enqueue(sourcePath: path, destinationPath: path, channel: channel)
+        await mp4Finalizer.enqueue(
+            sourcePath: path,
+            destinationPath: path,
+            channel: channel,
+            preferRetimingOnFailure: true
+        )
     }
 
     static func repairExistingMP4(path: String, channel: String) async -> String? {
@@ -652,6 +939,26 @@ actor Channel {
         addLog("Channel renamed from \(oldUsername) to \(newUsername)")
     }
     
+    func setManualBreakOverrideEnabled(_ enabled: Bool) {
+        manualBreakOverrideActive = enabled
+        if enabled {
+            let reason = "Manual break override: channel marked as on break"
+            breakEnforced = true
+            breakEnforcedAt = Date()
+            pendingBreakOfflineReason = reason
+            lastBreakAnalysisAt = nil
+            lastBreakLumaFrame = nil
+            addLog(reason)
+        } else {
+            addLog("Manual break override cleared")
+            breakEnforced = false
+            breakEnforcedAt = nil
+            pendingBreakOfflineReason = nil
+            lastBreakAnalysisAt = nil
+            lastBreakLumaFrame = nil
+        }
+    }
+
     func getInfo() -> ChannelInfo {
         let formatter = DateFormatter()
         formatter.dateFormat = "yyyy-MM-dd hh:mm a"
@@ -694,7 +1001,8 @@ actor Channel {
             timelineMismatchCount: timelineMismatchCount,
             lastTimelineMismatchAt: lastTimelineMismatchAt.map { formatter.string(from: $0) },
             bioMetadata: config.bioMetadata,
-            globalRecordingEnabled: appConfig.recordingEnabled
+            globalRecordingEnabled: appConfig.recordingEnabled,
+            isManualBreakOverrideActive: manualBreakOverrideActive
         )
     }
 
@@ -717,7 +1025,7 @@ actor Channel {
         // Use rate limiter for normal background checks.
         // Startup/import sweeps can bypass this for faster online detection.
         if !bypassRateLimit {
-            await requestCoordinator.acquireSlot()
+            await requestCoordinator.acquireSlot(priority: .normal)
         }
         isChecking = true
 
@@ -784,7 +1092,7 @@ actor Channel {
         }
 
         do {
-            let stream = try await withRequestSlot {
+            let stream = try await withRequestSlot(priority: .normal) {
                 try await client.getStream(username: config.username)
             }
             playbackOfflineProbeFailures = 0
@@ -830,7 +1138,7 @@ actor Channel {
         defer { isChecking = false }
 
         do {
-            let stream = try await withRequestSlot {
+            let stream = try await withRequestSlot(priority: .normal) {
                 try await client.getStream(username: config.username)
             }
 
@@ -896,7 +1204,9 @@ actor Channel {
             )
 
             let httpClient = HTTPClient(config: appConfig)
-            let mediaPlaylistContent = try await httpClient.get(playlist.playlistURL)
+            let mediaPlaylistContent = try await withRequestSlot(priority: .low) {
+                try await httpClient.get(playlist.playlistURL)
+            }
             let segments = try M3U8Parser.parseMediaPlaylist(mediaPlaylistContent)
             let recentSegments = Array(segments.suffix(4)).reversed()
             guard !recentSegments.isEmpty else { return }
@@ -1009,6 +1319,7 @@ actor Channel {
             do {
                 try await recordStream()
                 // Success - reset Cloudflare block count and first check flag
+                clearActiveRecordingTransientFailureState()
                 cloudflareBlockCount = 0
                 isFirstCheck = false
             } catch {
@@ -1030,6 +1341,15 @@ actor Channel {
                             // Retry sooner for break-gated holds so recovery is detected quickly.
                             waitTime = min(waitTime, 45)
                         }
+
+                        let isActivelyRecording = currentFile != nil || activeRecordingID != nil
+                        if isActivelyRecording && !shouldForceOfflineForActiveRecordingTransientFailure() {
+                            waitTime = max(15, min(waitTime, 60))
+                            addLog("Active recording hit a temporary offline signal; backing off for \(formatWaitTime(waitTime)) before forcing a full offline transition")
+                            cloudflareBlockCount = 0
+                            break
+                        }
+
                         markOfflineAndClearDegradedState()
                         if let breakReason {
                             addLog("\(breakReason). Treating stream as offline, trying again in \(formatWaitTime(waitTime))")
@@ -1040,6 +1360,13 @@ actor Channel {
                         }
                         cloudflareBlockCount = 0 // Reset on normal offline
                     case .privateStream:
+                        let isActivelyRecording = currentFile != nil || activeRecordingID != nil
+                        if isActivelyRecording && !shouldForceOfflineForActiveRecordingTransientFailure() {
+                            waitTime = max(15, min(waitTime, 60))
+                            addLog("Active recording hit a temporary private-stream signal; backing off for \(formatWaitTime(waitTime)) before forcing a full offline transition")
+                            cloudflareBlockCount = 0
+                            break
+                        }
                         markOfflineAndClearDegradedState()
                         if isFirstCheck {
                             addLog("Channel is offline or private (initial check)")
@@ -1053,6 +1380,13 @@ actor Channel {
                         addLog("Authentication required (session expired). Re-login in Settings. Retrying in \(formatWaitTime(waitTime))")
                         cloudflareBlockCount = 0
                     case .cloudflareBlocked:
+                        let isActivelyRecording = currentFile != nil || activeRecordingID != nil
+                        if isActivelyRecording && !shouldForceOfflineForActiveRecordingTransientFailure() {
+                            waitTime = max(15, min(waitTime, 60))
+                            addLog("Active recording hit a temporary Cloudflare block; backing off for \(formatWaitTime(waitTime)) before forcing a full offline transition")
+                            cloudflareBlockCount += 1
+                            break
+                        }
                         cloudflareBlockCount += 1
                         waitTime = calculateExponentialBackoff(baseInterval: waitTime, blockCount: cloudflareBlockCount)
                         addLog("Blocked by Cloudflare (block #\(cloudflareBlockCount)). Using exponential backoff, trying again in \(formatWaitTime(waitTime))")
@@ -1112,7 +1446,7 @@ actor Channel {
         isChecking = true
 
         do {
-            let stream = try await withRequestSlot {
+            let stream = try await withRequestSlot(priority: .normal) {
                 try await client.getStream(username: config.username)
             }
             liveStreamURL = stream.hlsSource
@@ -1166,9 +1500,12 @@ actor Channel {
     
     private func recordStream() async throws {
         isChecking = true
+        defer {
+            manualBreakOverrideActive = false
+        }
         prepareForRecordingAttempt()
 
-        let stream = try await withRequestSlot {
+        let stream = try await withRequestSlot(priority: .high) {
             try await client.getStream(username: config.username)
         }
         liveStreamURL = stream.hlsSource
@@ -1196,13 +1533,13 @@ actor Channel {
                 try await withRecordingSlot {
                     // Refresh stream setup after slot acquisition so we do not
                     // start from stale waiting-time metadata.
-                    let refreshedStream = try await withRequestSlot {
+                    let refreshedStream = try await withRequestSlot(priority: .high) {
                         try await client.getStream(username: config.username)
                     }
                     activeHlsSource = refreshedStream.hlsSource
                     liveStreamURL = refreshedStream.hlsSource
 
-                    let playlist = try await withRequestSlot {
+                    let playlist = try await withRequestSlot(priority: .high) {
                         try await client.getPlaylist(
                             hlsSource: activeHlsSource,
                             resolution: config.resolution,
@@ -1263,7 +1600,7 @@ actor Channel {
 
                 if isRetryableSetupError, setupAttempt < 2, !config.isPaused {
                     addLog("Stream setup returned offline/private, refreshing stream source and retrying once")
-                    let refreshed = try await withRequestSlot {
+                    let refreshed = try await withRequestSlot(priority: .high) {
                         try await client.getStream(username: config.username)
                     }
                     activeHlsSource = refreshed.hlsSource
@@ -1325,9 +1662,9 @@ actor Channel {
         guard isWaitingForRecordingSlot, !config.isPaused else { return nil }
 
         isChecking = true
+        let wasOnlineBeforeFailure = isOnline
         do {
-            let wasOnline = isOnline
-            let stream = try await withRequestSlot {
+            let stream = try await withRequestSlot(priority: .high) {
                 try await client.getStream(username: config.username)
             }
             liveStreamURL = stream.hlsSource
@@ -1335,7 +1672,7 @@ actor Channel {
             waitingOfflineProbeFailures = 0
             markChannelValid()
             isOnline = true
-            if !wasOnline {
+            if !wasOnlineBeforeFailure {
                 markLastOnlineNow()
             }
             return stream.hlsSource
@@ -1350,7 +1687,10 @@ actor Channel {
                     addLog("Waiting for slot: channel returned 404 (marked invalid)")
                 case .channelOffline, .privateStream, .authenticationRequired:
                     waitingOfflineProbeFailures += 1
-                    if waitingOfflineProbeFailures >= Self.waitingOfflineConfirmAttempts {
+                    if Self.shouldTreatWaitingProbeFailureAsOffline(
+                        failureCount: waitingOfflineProbeFailures,
+                        wasOnlineBeforeFailure: wasOnlineBeforeFailure
+                    ) {
                         endWaitingForSlotMonitoring()
                         markOfflineAndClearDegradedState()
                     }
@@ -1368,6 +1708,13 @@ actor Channel {
     private func refreshWaitingForSlotState(hlsSource: String) async {
         guard isWaitingForRecordingSlot else { return }
         await updateWaitingChannelThumbnailIfNeeded(hlsSource: hlsSource)
+    }
+
+    static func shouldTreatWaitingProbeFailureAsOffline(failureCount: Int, wasOnlineBeforeFailure: Bool) -> Bool {
+        guard wasOnlineBeforeFailure else {
+            return failureCount >= 1
+        }
+        return failureCount >= Self.waitingOfflineConfirmAttempts
     }
 
     private func updateWaitingChannelThumbnailIfNeeded(hlsSource: String) async {
@@ -1392,7 +1739,9 @@ actor Channel {
             )
 
             let httpClient = HTTPClient(config: appConfig)
-            let mediaPlaylistContent = try await httpClient.get(playlist.playlistURL)
+            let mediaPlaylistContent = try await withRequestSlot(priority: .low) {
+                try await httpClient.get(playlist.playlistURL)
+            }
             let segments = try M3U8Parser.parseMediaPlaylist(mediaPlaylistContent)
             let recentSegments = Array(segments.suffix(4)).reversed()
             guard !recentSegments.isEmpty else { return }
@@ -1504,14 +1853,17 @@ actor Channel {
         noPersonEvidenceExpiryAt = nil
     }
 
-    private func withRequestSlot<T>(_ operation: () async throws -> T) async throws -> T {
-        await requestCoordinator.acquireSlot()
+    private func withRequestSlot<T>(priority: RequestPriority = .normal, _ operation: () async throws -> T) async throws -> T {
+        // HIGH priority requests (recording operations) use a dedicated coordinator with guaranteed slots.
+        // NORMAL and LOW priority requests use the user-configurable coordinator.
+        let coordinator = priority == .high ? recordingRequestCoordinator : requestCoordinator
+        await coordinator.acquireSlot(priority: priority)
         do {
             let result = try await operation()
-            await requestCoordinator.releaseSlot()
+            await coordinator.releaseSlot()
             return result
         } catch {
-            await requestCoordinator.releaseSlot()
+            await coordinator.releaseSlot()
             throw error
         }
     }
@@ -1541,11 +1893,14 @@ actor Channel {
         var emptySegmentCount = 0
         
         while !Task.isCancelled && !config.isPaused && appConfig.recordingEnabled {
-            let content = try await httpClient.get(playlist.playlistURL)
+            let content = try await withRequestSlot(priority: .high) {
+                try await httpClient.get(playlist.playlistURL)
+            }
             try await refreshActiveInitSegment(
                 mediaPlaylistContent: content,
                 playlistURL: playlist.playlistURL,
-                httpClient: httpClient
+                httpClient: httpClient,
+                priority: .high
             )
             let segments = try M3U8Parser.parseMediaPlaylist(content)
 
@@ -1577,18 +1932,22 @@ actor Channel {
                 let segmentData = try await downloadSegmentWithRetry(
                     httpClient: httpClient,
                     url: segmentURL,
-                    maxRetries: 3
+                    maxRetries: 3,
+                    priority: .high
                 )
 
                 try await handleSegment(data: segmentData, duration: segment.duration)
             }
 
             if let audioPlaylistURL = activeAudioPlaylistURL {
-                let audioContent = try await httpClient.get(audioPlaylistURL)
+                let audioContent = try await withRequestSlot(priority: .high) {
+                    try await httpClient.get(audioPlaylistURL)
+                }
                 try await refreshActiveAudioInitSegment(
                     mediaPlaylistContent: audioContent,
                     playlistURL: audioPlaylistURL,
-                    httpClient: httpClient
+                    httpClient: httpClient,
+                    priority: .high
                 )
                 let audioSegments = try M3U8Parser.parseMediaPlaylist(audioContent)
 
@@ -1615,7 +1974,8 @@ actor Channel {
                         httpClient: httpClient,
                         url: segmentURL,
                         maxRetries: 2,
-                        updateStreamHealth: false
+                        updateStreamHealth: false,
+                        priority: .high
                     )
 
                     let appended = try await handleAudioSegment(data: audioData, duration: segment.duration)
@@ -1666,7 +2026,8 @@ actor Channel {
         url: String,
         maxRetries: Int,
         allowPaused: Bool = false,
-        updateStreamHealth: Bool = true
+        updateStreamHealth: Bool = true,
+        priority: RequestPriority = .normal
     ) async throws -> Data {
         var lastError: Error?
         
@@ -1676,7 +2037,9 @@ actor Channel {
             }
 
             do {
-                let data = try await httpClient.getData(url)
+                let data = try await withRequestSlot(priority: priority) {
+                    try await httpClient.getData(url)
+                }
                 try validateDownloadedSegmentPayload(data, url: url)
                 if updateStreamHealth, attempt > 1 {
                     segmentRetryCount += (attempt - 1)
@@ -1839,6 +2202,39 @@ actor Channel {
         degradedRecoveryStartedAt = nil
     }
 
+    private func clearActiveRecordingTransientFailureState() {
+        activeRecordingTransientFailureCount = 0
+        activeRecordingTransientFailureStartedAt = nil
+    }
+
+    private func shouldForceOfflineForActiveRecordingTransientFailure() -> Bool {
+        let now = Date()
+        let windowSeconds = activeRecordingTransientFailureStartedAt.map { now.timeIntervalSince($0) } ?? 0
+        if activeRecordingTransientFailureStartedAt == nil || windowSeconds > Self.activeRecordingTransientFailureWindowSeconds {
+            activeRecordingTransientFailureCount = 1
+            activeRecordingTransientFailureStartedAt = now
+        } else {
+            activeRecordingTransientFailureCount += 1
+        }
+
+        let shouldForceOffline = Self.shouldTreatTransientRecordingFailureAsOffline(
+            consecutiveFailures: activeRecordingTransientFailureCount,
+            failureWindowSeconds: windowSeconds
+        )
+
+        if shouldForceOffline {
+            clearActiveRecordingTransientFailureState()
+        }
+        return shouldForceOffline
+    }
+
+    static func shouldTreatTransientRecordingFailureAsOffline(consecutiveFailures: Int, failureWindowSeconds: TimeInterval) -> Bool {
+        guard consecutiveFailures >= Self.activeRecordingTransientFailureThreshold else {
+            return false
+        }
+        return failureWindowSeconds <= Self.activeRecordingTransientFailureWindowSeconds
+    }
+
     private func noteFailedSegmentDownload() {
         consecutiveSegmentFailures += 1
         lastSegmentFailureAt = Date()
@@ -1876,13 +2272,30 @@ actor Channel {
 
         let normalizedSegment = normalizeFragmentDecodeTimeIfNeeded(data)
         let normalizedSegmentData = normalizedSegment.data
+        let hadPreviousDecodeStart = previousSegmentDecodeStartTime != nil
         let observedSegmentDuration = observedSegmentDurationFromDecodeStart(normalizedSegment.decodeStartTime)
+        if activeInitSegmentData != nil,
+           activeFragmentTimescale != nil,
+           hadPreviousDecodeStart {
+            if observedSegmentDuration == nil {
+                consecutiveUnobservedFragmentTimings += 1
+                if consecutiveUnobservedFragmentTimings >= 3 {
+                    markCurrentRecordingTimingSuspect(reason: "fragment_timing_unobserved")
+                }
+            } else {
+                consecutiveUnobservedFragmentTimings = 0
+            }
+        }
         let effectiveSegmentDuration = observedSegmentDuration ?? duration
         try validateSegmentTimeline(claimedDuration: duration, observedDuration: observedSegmentDuration)
 
         if pendingTimestampDiscontinuity && filesize > 0 {
-            addLog("Timestamp discontinuity detected; dropping current segment and rolling to a new recording file")
-            try await nextFile()
+            if Self.shouldRollToNewRecordingFileAfterStreamChange(filesizeBytes: filesize, durationSeconds: duration) {
+                addLog("Timestamp discontinuity detected; dropping current segment and rolling to a new recording file")
+                try await nextFile()
+            } else {
+                addLog("Timestamp discontinuity detected but current fragment is still too small; discarding the segment without creating a new file")
+            }
             pendingTimestampDiscontinuity = false
             return
         }
@@ -2104,14 +2517,11 @@ actor Channel {
         currentAudioWorkingFilename = audioWorkingURL?.path
         currentAudioFilesize = 0
 
-        config.recordingHistory.append(fileURL.path)
-        if config.recordingHistory.count > 200 {
-            config.recordingHistory.removeFirst(config.recordingHistory.count - 200)
-        }
-
         let startedAt = Date()
         activeRecordingStartedAt = startedAt
         activeRecordingFirstPersonDetectedAt = nil
+        currentRecordingTimingSuspect = false
+        currentRecordingTimingIssueReasons.removeAll(keepingCapacity: false)
         lastRecordingProgressPersistAt = .distantPast
         activeRecordingID = await recordingLedger.startRecording(
             channelUsername: config.username,
@@ -2139,7 +2549,11 @@ actor Channel {
         let recordingID = activeRecordingID
         let durationSnapshot = duration
         let filesizeSnapshot = filesize
+        let recordingTimingWasSuspect = currentRecordingTimingSuspect
+        let recordingTimingIssueSummary = currentRecordingTimingIssueReasons.sorted().joined(separator: ",")
         let endedAt = Date()
+        let recordingFinalizedCallback = self.onRecordingFinalized
+        let terminationReason = currentRecordingTerminationReason()
 
         if let file = currentFile {
             do {
@@ -2171,7 +2585,32 @@ actor Channel {
             return audioWorkingPath
         }()
 
-        if shouldFinalizeMP4, let workingPath, let finalPath {
+        if Self.shouldDiscardRecordingFragmentForTermination(
+            durationSeconds: durationSnapshot,
+            filesizeBytes: filesizeSnapshot,
+            terminationReason: terminationReason
+        ) {
+            for path in [finalPath, workingPath, audioWorkingPath].compactMap({ $0 }) {
+                if FileManager.default.fileExists(atPath: path) {
+                    try? FileManager.default.removeItem(atPath: path)
+                }
+            }
+            if let recordingID {
+                let recordingLedger = self.recordingLedger
+                Task {
+                    await recordingLedger.finishRecording(
+                        recordingID: recordingID,
+                        endedAt: endedAt,
+                        durationSeconds: durationSnapshot,
+                        fileSizeBytes: Int64(filesizeSnapshot),
+                        finalPath: finalPath ?? workingPath ?? audioWorkingPath ?? "",
+                        wasRemuxed: false,
+                        status: "discarded"
+                    )
+                }
+            }
+            addLog("Discarding short fragment after break detection (duration \(formatDuration(durationSnapshot)), size \(formatFilesize(filesizeSnapshot)))")
+        } else if shouldFinalizeMP4, let workingPath, let finalPath {
             let channelName = config.username
             let recordingLedger = self.recordingLedger
             Task {
@@ -2182,19 +2621,39 @@ actor Channel {
                     sourcePath: workingPath,
                     audioSourcePath: usableAudioWorkingPath,
                     destinationPath: finalPath,
-                    channel: channelName
+                    channel: channelName,
+                    preferRetimingOnFailure: recordingTimingWasSuspect
                 ) { outcome in
                     guard let recordingID else { return }
                     Task {
                         let resolvedPath: String
                         if FileManager.default.fileExists(atPath: finalPath) {
                             resolvedPath = finalPath
+                        } else if FileManager.default.fileExists(atPath: workingPath) {
+                            do {
+                                if FileManager.default.fileExists(atPath: finalPath) {
+                                    try FileManager.default.removeItem(atPath: finalPath)
+                                }
+                                try FileManager.default.moveItem(atPath: workingPath, toPath: finalPath)
+                                resolvedPath = finalPath
+                            } catch {
+                                resolvedPath = workingPath
+                            }
                         } else {
                             resolvedPath = workingPath
                         }
 
+                        await self.appendRecordingHistoryIfPresent(path: resolvedPath)
+
                         let remuxed = outcome == .succeeded
-                        let status = remuxed ? "completed" : "completed_with_remux_warning"
+                        let status: String
+                        if remuxed {
+                            status = "completed"
+                        } else if recordingTimingWasSuspect {
+                            status = "completed_invalid"
+                        } else {
+                            status = "completed_with_remux_warning"
+                        }
                         await recordingLedger.finishRecording(
                             recordingID: recordingID,
                             endedAt: endedAt,
@@ -2208,10 +2667,20 @@ actor Channel {
                             await recordingLedger.appendEvent(
                                 recordingID: recordingID,
                                 level: "WARN",
-                                eventType: "remux_skipped",
-                                message: reason
+                                eventType: recordingTimingWasSuspect ? "recording_invalid" : "remux_skipped",
+                                message: recordingTimingWasSuspect && !recordingTimingIssueSummary.isEmpty
+                                    ? "\(reason) [timing=\(recordingTimingIssueSummary)]"
+                                    : reason
+                            )
+                        } else if recordingTimingWasSuspect && !recordingTimingIssueSummary.isEmpty {
+                            await recordingLedger.appendEvent(
+                                recordingID: recordingID,
+                                level: "WARN",
+                                eventType: "retime_repair_applied",
+                                message: "Applied retime fallback after timing issues [timing=\(recordingTimingIssueSummary)]"
                             )
                         }
+                        recordingFinalizedCallback?(resolvedPath)
                     }
                 }
             }
@@ -2231,6 +2700,8 @@ actor Channel {
                 try? FileManager.default.removeItem(atPath: usableAudioWorkingPath)
             }
 
+            appendRecordingHistoryIfPresent(path: finalPath)
+
             if let recordingID {
                 let recordingLedger = self.recordingLedger
                 let resolvedFinalPath = FileManager.default.fileExists(atPath: finalPath) ? finalPath : workingPath
@@ -2247,6 +2718,8 @@ actor Channel {
                 }
             }
         } else if let finalPath, let recordingID {
+            appendRecordingHistoryIfPresent(path: finalPath)
+
             let recordingLedger = self.recordingLedger
             Task {
                 await recordingLedger.finishRecording(
@@ -2273,9 +2746,42 @@ actor Channel {
             currentAudioWorkingFilename = nil
             currentAudioFilesize = 0
             currentAudioDuration = 0
+            currentRecordingTimingSuspect = false
+            currentRecordingTimingIssueReasons.removeAll(keepingCapacity: false)
             pendingFilenameBase = nil
             currentFileDecodeTimeOffset = nil
             resetSegmentTimelineTracking()
+        }
+    }
+
+    private func currentRecordingTerminationReason() -> String? {
+        guard breakEnforced else { return nil }
+        guard let reason = pendingBreakOfflineReason else { return nil }
+        return reason.contains("Break detection") ? "break_detection" : nil
+    }
+
+    nonisolated static func shouldDiscardRecordingFragmentForTermination(durationSeconds: Double, filesizeBytes: Int, terminationReason: String?) -> Bool {
+        guard terminationReason == "break_detection" else { return false }
+
+        return shouldRollToNewRecordingFileAfterStreamChange(filesizeBytes: filesizeBytes, durationSeconds: durationSeconds)
+            ? false
+            : true
+    }
+
+    nonisolated static func shouldRollToNewRecordingFileAfterStreamChange(filesizeBytes: Int, durationSeconds: Double) -> Bool {
+        let minDurationSeconds = Self.minRolloverFragmentDurationSeconds
+        let minFilesizeBytes = Self.minRolloverFragmentSizeBytes
+        return durationSeconds >= minDurationSeconds || filesizeBytes >= minFilesizeBytes
+    }
+
+    private func appendRecordingHistoryIfPresent(path: String) {
+        guard FileManager.default.fileExists(atPath: path) else {
+            return
+        }
+
+        config.recordingHistory.append(path)
+        if config.recordingHistory.count > 200 {
+            config.recordingHistory.removeFirst(config.recordingHistory.count - 200)
         }
     }
 
@@ -2306,11 +2812,13 @@ actor Channel {
            rawDecodeStartTime < previousRaw {
             pendingTimestampDiscontinuity = true
             previousSegmentDecodeStartTime = nil
+            markCurrentRecordingTimingSuspect(reason: "decode_timeline_rewind")
             addLog("fMP4 decode timeline rewind detected (raw tfdt \(rawDecodeStartTime) < \(previousRaw)); rolling to a new recording file")
         } else if let previousRaw = previousRawSegmentDecodeStartTime,
                   isForwardDecodeTimeJump(rawDecodeStartTime, previousRawDecodeStartTime: previousRaw) {
             pendingTimestampDiscontinuity = true
             previousSegmentDecodeStartTime = nil
+            markCurrentRecordingTimingSuspect(reason: "decode_timeline_jump")
 
             if let timescale = activeFragmentTimescale, timescale > 0 {
                 let deltaSeconds = Double(rawDecodeStartTime - previousRaw) / Double(timescale)
@@ -2595,7 +3103,7 @@ actor Channel {
         }
     }
 
-    private func refreshActiveInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws {
+    private func refreshActiveInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient, priority: RequestPriority = .normal) async throws {
         guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
             if ingestContainerMode != .transportStream {
                 ingestContainerMode = .transportStream
@@ -2623,22 +3131,34 @@ actor Channel {
            previousInit != initURI,
            currentFile != nil,
            filesize > 0 {
-            addLog("Init segment changed, rolling to a new recording file")
-            try await nextFile()
+            if Self.shouldRollToNewRecordingFileAfterStreamChange(filesizeBytes: filesize, durationSeconds: duration) {
+                addLog("Init segment changed, rolling to a new recording file")
+                try await nextFile()
+            } else {
+                addLog("Init segment changed but current fragment is still too small; keeping the current recording file")
+            }
         }
 
         let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
-        let initData = try await httpClient.getData(resolvedInitURL)
+        let initData = try await withRequestSlot(priority: priority) {
+            try await httpClient.getData(resolvedInitURL)
+        }
         activeInitSegmentURI = initURI
         activeInitSegmentData = initData
         activeFragmentTimescale = extractMDHDTimescale(from: initData)
 
         if activeFragmentTimescale == nil {
+            markCurrentRecordingTimingSuspect(reason: "missing_fragment_timescale")
             addLog("Could not read fMP4 timescale from init segment; duration guard disabled for this stream")
         }
     }
 
-    private func refreshActiveAudioInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient) async throws {
+    private func markCurrentRecordingTimingSuspect(reason: String) {
+        currentRecordingTimingSuspect = true
+        currentRecordingTimingIssueReasons.insert(reason)
+    }
+
+    private func refreshActiveAudioInitSegment(mediaPlaylistContent: String, playlistURL: String, httpClient: HTTPClient, priority: RequestPriority = .normal) async throws {
         guard let initURI = M3U8Parser.parseInitSegmentURI(mediaPlaylistContent), !initURI.isEmpty else {
             activeAudioInitSegmentURI = nil
             activeAudioInitSegmentData = nil
@@ -2650,7 +3170,9 @@ actor Channel {
         }
 
         let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
-        let initData = try await httpClient.getData(resolvedInitURL)
+        let initData = try await withRequestSlot(priority: priority) {
+            try await httpClient.getData(resolvedInitURL)
+        }
         activeAudioInitSegmentURI = initURI
         activeAudioInitSegmentData = initData
     }
@@ -2661,6 +3183,7 @@ actor Channel {
         cumulativeClaimedSegmentDuration = 0
         cumulativeObservedSegmentDuration = 0
         segmentTimelineMismatchEvents = 0
+        consecutiveUnobservedFragmentTimings = 0
     }
 
     private func observedSegmentDurationFromDecodeStart(_ decodeStartTime: UInt64?) -> Double? {
@@ -2717,6 +3240,7 @@ actor Channel {
                 let observed = formatDuration(cumulativeObservedSegmentDuration)
                 timelineMismatchCount += 1
                 lastTimelineMismatchAt = Date()
+                markCurrentRecordingTimingSuspect(reason: "timeline_mismatch")
                 addLog("Timeline mismatch guard triggered (claimed \(claimed) vs media \(observed)); restarting stream capture")
                 throw ChaturbateError.parsingError("Segment timeline mismatch")
             }
@@ -2802,7 +3326,9 @@ actor Channel {
         }
 
         let resolvedInitURL = resolveSegmentURL(initURI, playlistURL: playlistURL)
-        return try await httpClient.getData(resolvedInitURL)
+        return try await withRequestSlot(priority: .low) {
+            try await httpClient.getData(resolvedInitURL)
+        }
     }
     
     private func cleanupThumbnail() {
@@ -3081,6 +3607,10 @@ actor Channel {
     private func prepareForRecordingAttempt() {
         let now = Date()
 
+        if manualBreakOverrideActive {
+            addLog("Manual break override applied for this check cycle")
+        }
+
         if let carryExpiry = noPersonCarryExpiryAt, now > carryExpiry {
             noPersonStreakSeconds = 0
             noPersonNoMotionStreakSeconds = 0
@@ -3183,7 +3713,7 @@ actor Channel {
         purpose: String,
         analyzeForBreak: Bool
     ) async throws -> ThumbnailGenerationResult {
-        let playlist = try await withRequestSlot {
+        let playlist = try await withRequestSlot(priority: .high) {
             try await client.getPlaylist(
                 hlsSource: hlsSource,
                 resolution: config.resolution,
@@ -3192,7 +3722,7 @@ actor Channel {
         }
 
         let httpClient = HTTPClient(config: appConfig)
-        let mediaPlaylistContent = try await withRequestSlot {
+        let mediaPlaylistContent = try await withRequestSlot(priority: .high) {
             try await httpClient.get(playlist.playlistURL)
         }
         let segments = try M3U8Parser.parseMediaPlaylist(mediaPlaylistContent)
@@ -3258,6 +3788,15 @@ actor Channel {
     }
 
     private func evaluateBreakSignalIfNeeded(frameImage: CGImage) -> Bool {
+        if manualBreakOverrideActive {
+            if !breakEnforced {
+                breakEnforced = true
+                breakEnforcedAt = Date()
+                pendingBreakOfflineReason = "Manual break override: channel marked as on break"
+            }
+            return true
+        }
+
         let analysisIntervalSeconds = TimeInterval(max(5, min(60, appConfig.breakAnalysisIntervalSeconds)))
         // Break analysis currently runs via thumbnail refresh (~5s cadence).
         // Cap the effective interval to this cadence to avoid extra lag.

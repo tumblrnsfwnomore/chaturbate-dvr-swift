@@ -63,6 +63,19 @@ private func recordingDurationAuditStatus(ledgerDurationSeconds: Double, started
     return ledgerDurationSeconds > (periodSeconds + toleranceSeconds) ? .mismatch : .ok
 }
 
+private struct TrimPlayerHeightLimit: ViewModifier {
+    let maxVideoHeight: CGFloat?
+
+    @ViewBuilder
+    func body(content: Content) -> some View {
+        if let maxVideoHeight {
+            content.frame(maxHeight: maxVideoHeight, alignment: .top)
+        } else {
+            content
+        }
+    }
+}
+
 struct ContentView: View {
     @ObservedObject var manager: ChannelManager
     @State private var showingAddChannel = false
@@ -915,6 +928,8 @@ private enum RecordingSortOption: String, CaseIterable, Identifiable {
     case largest = "Largest"
     case smallest = "Smallest"
     case filename = "Filename"
+    case channelAZ = "Channel (A–Z)"
+    case channelZA = "Channel (Z–A)"
 
     var id: String { rawValue }
 }
@@ -936,6 +951,7 @@ private struct RecordingLibraryItem: Identifiable {
     let channelThumbnailPath: String?
     let isInProgress: Bool
     let isActivelyFinalizing: Bool
+    let isMissing: Bool
     let isPreviewable: Bool
     let isOpenable: Bool
 
@@ -957,6 +973,11 @@ private actor RecordingThumbnailStore {
     private let failureRetryInterval: TimeInterval = 300
     private let fileManager = FileManager.default
     private let cacheDirectory: URL
+    
+    // In-memory LRU cache for decoded images (max 64 images)
+    private var imageCache: [String: NSImage] = [:]
+    private var imageCacheOrder: [String] = []
+    private let maxCachedImages: Int = 64
 
     init() {
         let cachesRoot = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -1010,7 +1031,57 @@ private actor RecordingThumbnailStore {
     func prewarm(items: [RecordingLibraryItem]) async {
         for item in items {
             if Task.isCancelled { return }
-            _ = await thumbnailPath(for: item)
+            if let path = await thumbnailPath(for: item) {
+                _ = await getDecodedImage(fromPath: path)
+            }
+        }
+    }
+
+    func getDecodedImage(fromPath path: String?) async -> NSImage? {
+        guard let path else { return nil }
+
+        if let cached = imageCache[path] {
+            touchCacheEntry(path)
+            return cached
+        }
+
+        let expandedPath = (path as NSString).expandingTildeInPath
+        let fileURL = URL(fileURLWithPath: expandedPath)
+
+        let data = await Task.detached(priority: .utility) {
+            try? Data(contentsOf: fileURL, options: [.mappedIfSafe])
+        }.value
+
+        guard let data, let image = NSImage(data: data) else { return nil }
+
+        cacheDecodedImage(image, forPath: path)
+        return image
+    }
+
+    private func cacheDecodedImage(_ image: NSImage, forPath path: String) {
+        imageCache[path] = image
+
+        if !imageCacheOrder.contains(path) {
+            imageCacheOrder.append(path)
+        } else {
+            if let index = imageCacheOrder.firstIndex(of: path) {
+                imageCacheOrder.remove(at: index)
+                imageCacheOrder.append(path)
+            }
+        }
+
+        if imageCacheOrder.count > maxCachedImages {
+            if let lruPath = imageCacheOrder.first {
+                imageCacheOrder.removeFirst()
+                imageCache.removeValue(forKey: lruPath)
+            }
+        }
+    }
+
+    private func touchCacheEntry(_ path: String) {
+        if let index = imageCacheOrder.firstIndex(of: path) {
+            imageCacheOrder.remove(at: index)
+            imageCacheOrder.append(path)
         }
     }
 
@@ -1107,6 +1178,24 @@ private struct RecordingThumbnailView: View {
         }
         .frame(height: 120)
         .clipShape(RoundedRectangle(cornerRadius: 8, style: .continuous))
+        .overlay(alignment: .bottomLeading) {
+            if item.isActivelyFinalizing {
+                HStack(spacing: 4) {
+                    ProgressView()
+                        .scaleEffect(0.5)
+                        .frame(width: 10, height: 10)
+                    Text("Remuxing")
+                        .font(.caption2)
+                        .fontWeight(.semibold)
+                }
+                .padding(.horizontal, 7)
+                .padding(.vertical, 4)
+                .background(.ultraThinMaterial)
+                .foregroundColor(.primary)
+                .clipShape(Capsule())
+                .padding(6)
+            }
+        }
         .task(id: item.thumbnailCacheKey) {
             isLoading = true
             thumbnailImage = nil
@@ -1115,7 +1204,7 @@ private struct RecordingThumbnailView: View {
                 thumbnailImage = await loadImage(atPath: item.channelThumbnailPath)
             } else {
                 let generatedPath = await RecordingThumbnailStore.shared.thumbnailPath(for: item)
-                thumbnailImage = await loadImage(atPath: generatedPath)
+                thumbnailImage = await RecordingThumbnailStore.shared.getDecodedImage(fromPath: generatedPath)
             }
 
             isLoading = false
@@ -1139,6 +1228,7 @@ private struct RecordingThumbnailView: View {
 
 private enum RecordingRepairFilter: Equatable {
     case all
+    case missing
     case durationMismatch
     case pendingScan
     case scanning
@@ -1153,6 +1243,7 @@ private enum RecordingRepairFilter: Equatable {
     var label: String {
         switch self {
         case .all:         return "All"
+        case .missing:     return "Missing"
         case .durationMismatch: return "Duration Mismatch"
         case .pendingScan: return "Pending"
         case .scanning:    return "Scanning"
@@ -1169,6 +1260,7 @@ private enum RecordingRepairFilter: Equatable {
     var tint: Color {
         switch self {
         case .all:         return .primary
+        case .missing:     return .orange
         case .durationMismatch: return .red
         case .pendingScan: return .secondary
         case .scanning:    return .blue
@@ -1201,6 +1293,7 @@ private enum RecordingRepairFilter: Equatable {
 
 private struct RecordingRepairFilterCounts {
     var all = 0
+    var missing = 0
     var durationMismatch = 0
     var pendingScan = 0
     var scanning = 0
@@ -1215,6 +1308,7 @@ private struct RecordingRepairFilterCounts {
     func count(for filter: RecordingRepairFilter) -> Int {
         switch filter {
         case .all: return all
+        case .missing: return missing
         case .durationMismatch: return durationMismatch
         case .pendingScan: return pendingScan
         case .scanning: return scanning
@@ -1230,6 +1324,17 @@ private struct RecordingRepairFilterCounts {
 }
 
 struct RecordingsLibraryView: View {
+    private enum RefreshTimeoutError: LocalizedError {
+        case timedOut(String)
+
+        var errorDescription: String? {
+            switch self {
+            case let .timedOut(step):
+                return "Timed out while \(step)."
+            }
+        }
+    }
+
     @ObservedObject var manager: ChannelManager
     let refreshGeneration: Int
     var onOpenRecording: ((String, String, [String]) -> Void)? = nil
@@ -1239,6 +1344,7 @@ struct RecordingsLibraryView: View {
     private static let thumbnailCardEstimatedHeight: CGFloat = 230
     private static let thumbnailPrewarmDebounceNanoseconds: UInt64 = 180_000_000
     private static let pageSize = 60
+    private static let backgroundDiskRescanInterval: TimeInterval = 10 * 60
 
     @State private var allRecordings: [RecordingLibraryItem] = []
     @State private var sortedRecordings: [RecordingLibraryItem] = []
@@ -1247,10 +1353,13 @@ struct RecordingsLibraryView: View {
     @State private var cachedVisibleRecordings: [RecordingLibraryItem] = []
     @State private var cachedPageRecordings: [RecordingLibraryItem] = []
     @State private var cachedVisibleBytes: Int64 = 0
+    @State private var lastDiskRescanAt: Date?
     @State private var cachedTotalPages: Int = 1
     @State private var pageCacheVersion: Int = 0
     @State private var searchText: String = ""
     @State private var selectedChannelFilter: String = "All Channels"
+    @State private var isDateFilterEnabled: Bool = false
+    @State private var selectedDateFilter: Date = Date()
     @State private var repairFilter: RecordingRepairFilter = .all
     @State private var sortOption: RecordingSortOption = .newest
     @State private var isScanning = false
@@ -1261,6 +1370,7 @@ struct RecordingsLibraryView: View {
     @State private var thumbnailViewportSize: CGSize = .zero
     @State private var observedMediaDurationByPath: [String: Double] = [:]
     @State private var durationProbeTask: Task<Void, Never>?
+    @State private var refreshRecordingsTask: Task<Void, Never>?
 
     private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
 
@@ -1300,8 +1410,46 @@ struct RecordingsLibraryView: View {
                         .pickerStyle(.menu)
                         .frame(width: 170)
 
+                        HStack(spacing: 6) {
+                            Button {
+                                shiftDateFilter(byDays: -1)
+                            } label: {
+                                Image(systemName: "chevron.left")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            DatePicker(
+                                "Date",
+                                selection: $selectedDateFilter,
+                                displayedComponents: .date
+                            )
+                            .datePickerStyle(.compact)
+                            .labelsHidden()
+                            .disabled(!isDateFilterEnabled)
+
+                            Button(isDateFilterEnabled ? "Clear" : "Date") {
+                                if isDateFilterEnabled {
+                                    isDateFilterEnabled = false
+                                } else {
+                                    selectedDateFilter = Date()
+                                    isDateFilterEnabled = true
+                                }
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+
+                            Button {
+                                shiftDateFilter(byDays: 1)
+                            } label: {
+                                Image(systemName: "chevron.right")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
+
                         Button {
-                            refreshRecordings()
+                            refreshRecordings(rescanFromDisk: true)
                         } label: {
                             Label("Refresh", systemImage: "arrow.clockwise")
                         }
@@ -1321,17 +1469,9 @@ struct RecordingsLibraryView: View {
                     }
 
                     HStack(spacing: 8) {
-                        filterChip(.all,         count: counts.count(for: .all))
-                        filterChip(.durationMismatch, count: counts.count(for: .durationMismatch))
-                        filterChip(.pendingScan, count: counts.count(for: .pendingScan))
-                        filterChip(.scanning,    count: counts.count(for: .scanning))
-                        filterChip(.good,        count: counts.count(for: .good))
-                        filterChip(.needsRemux,  count: counts.count(for: .needsRemux))
-                        filterChip(.queued,      count: counts.count(for: .queued))
-                        filterChip(.remuxing,    count: counts.count(for: .remuxing))
-                        filterChip(.repaired,    count: counts.count(for: .repaired))
-                        filterChip(.failed,      count: counts.count(for: .failed))
-                        filterChip(.unsupported, count: counts.count(for: .unsupported))
+                        ForEach(visibleRepairFilters(for: counts), id: \.label) { filter in
+                            filterChip(filter, count: counts.count(for: filter))
+                        }
 
                         if manager.isRecordingRepairScanActive {
                             HStack(spacing: 6) {
@@ -1403,12 +1543,12 @@ struct RecordingsLibraryView: View {
                                 ForEach(pageItems) { item in
                                     Button {
                                         let contextPaths = cachedVisibleRecordings
-                                            .filter(\ .isOpenable)
                                             .map(\ .path)
                                         onOpenRecording?(item.path, item.channelName, contextPaths)
                                     } label: {
                                         RecordingLibraryCardView(
                                             item: item,
+                                            hasDurationMismatch: hasDurationMismatch(item),
                                             repairState: manager.recordingRepairState(
                                                 for: item.path,
                                                 fileExtension: item.fileExtension,
@@ -1417,7 +1557,6 @@ struct RecordingsLibraryView: View {
                                         )
                                     }
                                     .buttonStyle(.plain)
-                                    .disabled(!item.isOpenable)
                                 }
                             }
                             .padding(16)
@@ -1463,12 +1602,14 @@ struct RecordingsLibraryView: View {
         }
         .onAppear {
             manager.ensureRecordingRepairMaintenanceRunning()
-            refreshRecordings()
+            refreshRecordings(rescanFromDisk: false)
             startRefreshTimer()
         }
         .onDisappear {
             refreshTimer?.invalidate()
             refreshTimer = nil
+            refreshRecordingsTask?.cancel()
+            refreshRecordingsTask = nil
             thumbnailPrewarmTask?.cancel()
             thumbnailPrewarmTask = nil
             durationProbeTask?.cancel()
@@ -1485,6 +1626,16 @@ struct RecordingsLibraryView: View {
         .onChange(of: searchText) { _ in
             currentPage = 0
             recomputeVisibleCaches()
+        }
+        .onChange(of: isDateFilterEnabled) { _ in
+            currentPage = 0
+            recomputeVisibleCaches()
+        }
+        .onChange(of: selectedDateFilter) { _ in
+            if isDateFilterEnabled {
+                currentPage = 0
+                recomputeVisibleCaches()
+            }
         }
         .onChange(of: sortOption) { _ in
             applySortOption()
@@ -1507,11 +1658,17 @@ struct RecordingsLibraryView: View {
     }
 
     private var repairFilterCounts: RecordingRepairFilterCounts {
-        // Derive counts using the same per-item logic as buildVisibleRecordings so
-        // the badge numbers always match the number of items shown by each filter.
+        // Derive counts from the currently scoped set (channel/date/search), then
+        // split by repair state so chips stay in sync while browsing by date.
         var counts = RecordingRepairFilterCounts()
-        counts.all = allRecordings.count
-        for item in allRecordings {
+        let scopedItems = recordingsScopedByNonRepairFilters
+        counts.all = scopedItems.count
+        for item in scopedItems {
+            if item.isMissing {
+                counts.missing += 1
+                continue
+            }
+
             if hasDurationMismatch(item) {
                 counts.durationMismatch += 1
             }
@@ -1535,22 +1692,73 @@ struct RecordingsLibraryView: View {
         return counts
     }
 
-    private func buildVisibleRecordings() -> [RecordingLibraryItem] {
+    private var recordingsScopedByNonRepairFilters: [RecordingLibraryItem] {
         let query = searchText.trimmingCharacters(in: Self.queryTrimSet)
         let needsChannelFilter = selectedChannelFilter != "All Channels"
-        let needsRepairFilter = repairFilter != .all
+        let needsDateFilter = isDateFilterEnabled
         let needsQuery = !query.isEmpty
 
-        if !needsChannelFilter && !needsRepairFilter && !needsQuery {
+        if !needsChannelFilter && !needsDateFilter && !needsQuery {
             return sortedRecordings
         }
+
+        let calendar = Calendar.current
 
         return sortedRecordings.filter { item in
             if needsChannelFilter && item.channelName != selectedChannelFilter {
                 return false
             }
 
+            if needsDateFilter {
+                let itemDate = item.startedAt ?? item.modifiedAt
+                if !calendar.isDate(itemDate, inSameDayAs: selectedDateFilter) {
+                    return false
+                }
+            }
+
+            if needsQuery {
+                return item.filename.localizedCaseInsensitiveContains(query)
+                    || item.channelName.localizedCaseInsensitiveContains(query)
+            }
+
+            return true
+        }
+    }
+
+    private func buildVisibleRecordings() -> [RecordingLibraryItem] {
+        let query = searchText.trimmingCharacters(in: Self.queryTrimSet)
+        let needsChannelFilter = selectedChannelFilter != "All Channels"
+        let needsDateFilter = isDateFilterEnabled
+        let needsRepairFilter = repairFilter != .all
+        let needsQuery = !query.isEmpty
+
+        if !needsChannelFilter && !needsDateFilter && !needsRepairFilter && !needsQuery {
+            return sortedRecordings
+        }
+
+        let calendar = Calendar.current
+
+        return sortedRecordings.filter { item in
+            if needsChannelFilter && item.channelName != selectedChannelFilter {
+                return false
+            }
+
+            if needsDateFilter {
+                let itemDate = item.startedAt ?? item.modifiedAt
+                if !calendar.isDate(itemDate, inSameDayAs: selectedDateFilter) {
+                    return false
+                }
+            }
+
             if needsRepairFilter {
+                if repairFilter == .missing {
+                    return item.isMissing
+                }
+
+                if item.isMissing {
+                    return false
+                }
+
                 if repairFilter == .durationMismatch {
                     if !hasDurationMismatch(item) {
                         return false
@@ -1576,6 +1784,22 @@ struct RecordingsLibraryView: View {
         }
     }
 
+    static func shouldScheduleBackgroundDiskRescan(hasCachedEntries: Bool, lastDiskRescanAt: Date?, now: Date, force: Bool) -> Bool {
+        if force {
+            return true
+        }
+
+        if !hasCachedEntries {
+            return lastDiskRescanAt == nil
+        }
+
+        guard let lastDiskRescanAt else {
+            return true
+        }
+
+        return now.timeIntervalSince(lastDiskRescanAt) >= Self.backgroundDiskRescanInterval
+    }
+
     private func startRefreshTimer() {
         refreshTimer?.invalidate()
         refreshTimer = Timer.scheduledTimer(withTimeInterval: 20.0, repeats: true) { _ in
@@ -1583,52 +1807,123 @@ struct RecordingsLibraryView: View {
         }
     }
 
-    private func refreshRecordings() {
-        isScanning = true
+    private func refreshRecordings(rescanFromDisk: Bool = false) {
+        if isScanning && !rescanFromDisk {
+            return
+        }
+
+        let shouldShowSpinner = rescanFromDisk || allRecordings.isEmpty
+        let shouldBackgroundRescan = Self.shouldScheduleBackgroundDiskRescan(
+            hasCachedEntries: !allRecordings.isEmpty,
+            lastDiskRescanAt: lastDiskRescanAt,
+            now: Date(),
+            force: rescanFromDisk
+        )
+
+        refreshRecordingsTask?.cancel()
+        if shouldShowSpinner {
+            isScanning = true
+        }
         scanError = nil
         manager.ensureRecordingRepairMaintenanceRunning()
 
-        Task {
-            let entries = await manager.getRecordingLibraryEntries()
-            let activelyFinalizingPaths = await manager.getActivelyFinalizingPaths()
-            let activeChannelThumbnails = await loadActiveChannelThumbnails(entries: entries)
-
-            let recordings = await Task.detached(priority: .utility) {
-                Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
-            }.value
-
-            await MainActor.run {
-                allRecordings = recordings
-                totalAllRecordingsBytes = recordings.reduce(0) { $0 + $1.sizeBytes }
-                availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
-                    .sorted { $0.lowercased() < $1.lowercased() }
-                applySortOption()
-
-                let validPaths = Set(recordings.map(\ .path))
-                observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
-                for item in recordings {
-                    if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
-                        observedMediaDurationByPath[item.path] = mediaDuration
+        refreshRecordingsTask = Task {
+            do {
+                if shouldBackgroundRescan || rescanFromDisk {
+                    try await withTimeout(seconds: 45, step: "rescanning recordings from disk") {
+                        await manager.rescanRecordingLibraryFromDisk()
+                    }
+                    await MainActor.run {
+                        lastDiskRescanAt = Date()
                     }
                 }
 
-                scheduleMediaDurationProbes(for: recordings)
+                let entries = try await withTimeout(seconds: 20, step: "loading recording entries") {
+                    await manager.getRecordingLibraryEntries(includeMissing: true)
+                }
+                let activelyFinalizingPaths = try await withTimeout(seconds: 20, step: "loading finalization state") {
+                    await manager.getActivelyFinalizingPaths()
+                }
+                let activeChannelThumbnails = try await withTimeout(seconds: 20, step: "loading active thumbnails") {
+                    await loadActiveChannelThumbnails(entries: entries)
+                }
 
-                let hasImplicitPendingMP4 = recordings.contains { item in
-                    item.fileExtension.lowercased() == "mp4"
-                        && !manager.hasExplicitRecordingRepairState(for: item.path)
-                }
-                if hasImplicitPendingMP4 {
-                    manager.ensureRecordingRepairMaintenanceRunning(forceRescan: true)
+                let recordings = await Task.detached(priority: .utility) {
+                    Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
+                }.value
+
+                if Task.isCancelled {
+                    await MainActor.run {
+                        isScanning = false
+                    }
+                    return
                 }
 
-                if selectedChannelFilter != "All Channels",
-                   !availableChannelFilters.contains(selectedChannelFilter) {
-                    selectedChannelFilter = "All Channels"
+                await MainActor.run {
+                    allRecordings = recordings
+                    totalAllRecordingsBytes = recordings.reduce(0) { $0 + $1.sizeBytes }
+                    availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
+                        .sorted { $0.lowercased() < $1.lowercased() }
+                    applySortOption()
+
+                    let validPaths = Set(recordings.map(\ .path))
+                    observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
+                    for item in recordings {
+                        if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
+                            observedMediaDurationByPath[item.path] = mediaDuration
+                        }
+                    }
+
+                    scheduleMediaDurationProbes(for: recordings)
+
+                    let hasImplicitPendingMP4 = recordings.contains { item in
+                        item.fileExtension.lowercased() == "mp4"
+                            && !manager.hasExplicitRecordingRepairState(for: item.path)
+                    }
+                    if hasImplicitPendingMP4 {
+                        manager.ensureRecordingRepairMaintenanceRunning()
+                    }
+
+                    if selectedChannelFilter != "All Channels",
+                       !availableChannelFilters.contains(selectedChannelFilter) {
+                        selectedChannelFilter = "All Channels"
+                    }
+                    isScanning = false
+                    scheduleThumbnailPrewarm(debounceNanoseconds: 0)
                 }
-                isScanning = false
-                scheduleThumbnailPrewarm(debounceNanoseconds: 0)
+            } catch is CancellationError {
+                await MainActor.run {
+                    isScanning = false
+                }
+            } catch {
+                await MainActor.run {
+                    scanError = error.localizedDescription
+                    isScanning = false
+                }
             }
+        }
+    }
+
+    private func withTimeout<T>(
+        seconds: TimeInterval,
+        step: String,
+        operation: @escaping @Sendable () async -> T
+    ) async throws -> T {
+        try await withThrowingTaskGroup(of: T.self) { group in
+            group.addTask {
+                await operation()
+            }
+
+            group.addTask {
+                try await Task.sleep(nanoseconds: UInt64(seconds * 1_000_000_000))
+                throw RefreshTimeoutError.timedOut(step)
+            }
+
+            defer { group.cancelAll() }
+            guard let first = try await group.next() else {
+                throw RefreshTimeoutError.timedOut(step)
+            }
+            return first
         }
     }
 
@@ -1646,6 +1941,16 @@ struct RecordingsLibraryView: View {
             sorted.sort { $0.sizeBytes < $1.sizeBytes }
         case .filename:
             sorted.sort { $0.filename.lowercased() < $1.filename.lowercased() }
+        case .channelAZ:
+            sorted.sort {
+                $0.channelName.localizedCaseInsensitiveCompare($1.channelName) == .orderedAscending ? true :
+                ($0.channelName.localizedCaseInsensitiveCompare($1.channelName) == .orderedSame ? $0.filename.lowercased() < $1.filename.lowercased() : false)
+            }
+        case .channelZA:
+            sorted.sort {
+                $0.channelName.localizedCaseInsensitiveCompare($1.channelName) == .orderedDescending ? true :
+                ($0.channelName.localizedCaseInsensitiveCompare($1.channelName) == .orderedSame ? $0.filename.lowercased() < $1.filename.lowercased() : false)
+            }
         }
 
         sortedRecordings = sorted
@@ -1719,7 +2024,7 @@ struct RecordingsLibraryView: View {
     ) -> [RecordingLibraryItem] {
         let fileManager = FileManager.default
 
-        return entries.map { entry in
+        return entries.compactMap { entry in
             let finalPath = (entry.path as NSString).expandingTildeInPath
             let fileURL = URL(fileURLWithPath: finalPath)
             let finalExists = fileManager.fileExists(atPath: finalPath)
@@ -1727,10 +2032,14 @@ struct RecordingsLibraryView: View {
             let workingPath = entry.workingFilePath.map { ($0 as NSString).expandingTildeInPath }
             let workingExists = workingPath.map { fileManager.fileExists(atPath: $0) } ?? false
             let isActivelyFinalizing = entry.isFinalizing && activelyFinalizingPaths.contains(finalPath)
-            // Active/finalizing recordings use channel thumbnails; don't generate from incomplete files.
+            let isMissing = !entry.isActive && !entry.isFinalizing && !finalExists && !workingExists
+            // Active recordings use channel thumbnails; their working file is still open.
+            // Finalizing recordings have a complete source file — thumbnail from it.
             let thumbnailSourcePath: String?
-            if entry.isActive || entry.isFinalizing {
+            if entry.isActive {
                 thumbnailSourcePath = nil
+            } else if entry.isFinalizing {
+                thumbnailSourcePath = workingExists ? workingPath : (finalExists ? finalPath : nil)
             } else {
                 thumbnailSourcePath = finalExists ? finalPath : (workingExists ? workingPath : nil)
             }
@@ -1749,9 +2058,10 @@ struct RecordingsLibraryView: View {
                 endedAt: entry.endedAt,
                 modifiedAt: entry.modifiedAt,
                 thumbnailSourcePath: thumbnailSourcePath,
-                channelThumbnailPath: (entry.isActive || entry.isFinalizing) ? activeChannelThumbnails[entry.channelUsername] : nil,
-                isInProgress: entry.isActive || entry.isFinalizing,
+                channelThumbnailPath: entry.isActive ? activeChannelThumbnails[entry.channelUsername] : nil,
+                isInProgress: entry.isActive,
                 isActivelyFinalizing: isActivelyFinalizing,
+                isMissing: isMissing,
                 isPreviewable: finalExists,
                 isOpenable: finalExists || workingExists
             )
@@ -1762,7 +2072,10 @@ struct RecordingsLibraryView: View {
         let visible = buildVisibleRecordings()
         cachedVisibleRecordings = visible
 
-        if selectedChannelFilter == "All Channels" && repairFilter == .all && searchText.trimmingCharacters(in: Self.queryTrimSet).isEmpty {
+        if selectedChannelFilter == "All Channels"
+            && !isDateFilterEnabled
+            && repairFilter == .all
+            && searchText.trimmingCharacters(in: Self.queryTrimSet).isEmpty {
             cachedVisibleBytes = totalAllRecordingsBytes
         } else {
             cachedVisibleBytes = visible.reduce(0) { $0 + $1.sizeBytes }
@@ -1922,10 +2235,57 @@ struct RecordingsLibraryView: View {
         formatter.countStyle = .file
         return formatter.string(fromByteCount: bytes)
     }
+
+    private func visibleRepairFilters(for counts: RecordingRepairFilterCounts) -> [RecordingRepairFilter] {
+        let ordered: [RecordingRepairFilter] = [
+            .all,
+            .missing,
+            .durationMismatch,
+            .pendingScan,
+            .scanning,
+            .good,
+            .needsRemux,
+            .queued,
+            .remuxing,
+            .repaired,
+            .failed,
+            .unsupported
+        ]
+
+        let alwaysVisible: Set<RecordingRepairFilter> = [
+            .all,
+            .durationMismatch,
+            .good,
+            .needsRemux,
+            .repaired,
+            .failed,
+            .unsupported
+        ]
+
+        return ordered.filter { filter in
+            if alwaysVisible.contains(filter) {
+                return true
+            }
+            if repairFilter == filter {
+                return true
+            }
+            return counts.count(for: filter) > 0
+        }
+    }
+
+    private func shiftDateFilter(byDays offset: Int) {
+        let calendar = Calendar.current
+        let baseDate = calendar.startOfDay(for: selectedDateFilter)
+        if let shiftedDate = calendar.date(byAdding: .day, value: offset, to: baseDate) {
+            selectedDateFilter = shiftedDate
+        }
+        isDateFilterEnabled = true
+    }
 }
 
 private struct RecordingLibraryCardView: View {
     let item: RecordingLibraryItem
+    let hasDurationMismatch: Bool
     let repairState: RecordingRepairState
 
     private static let modifiedDateFormatter: DateFormatter = {
@@ -2009,18 +2369,11 @@ private struct RecordingLibraryCardView: View {
         Self.sizeFormatter.string(fromByteCount: bytes)
     }
 
-    private var hasDurationMismatch: Bool {
-        recordingDurationAuditStatus(
-            ledgerDurationSeconds: item.durationSeconds,
-            startedAt: item.startedAt,
-            endedAt: item.endedAt,
-            recordingStatus: item.recordingStatus
-        ) == .mismatch
-    }
-
     @ViewBuilder
     private var repairBadge: some View {
-        if item.recordingStatus == "finalizing" {
+        if item.isMissing {
+            badge(label: "Missing", tint: .orange)
+        } else if item.recordingStatus == "finalizing" {
             if item.isActivelyFinalizing {
                 HStack(spacing: 4) {
                     ProgressView()
@@ -2036,7 +2389,7 @@ private struct RecordingLibraryCardView: View {
                 .foregroundColor(.blue)
                 .clipShape(Capsule())
             } else {
-                badge(label: "Queued", tint: .secondary)
+                badge(label: "Finalizing", tint: .blue)
             }
         } else if item.isInProgress {
             badge(label: "Recording", tint: .orange)
@@ -2175,6 +2528,7 @@ struct ChannelPreviewCard: View {
     private var isDegraded: Bool { info.consecutiveSegmentFailures > 0 }
     private var hasTimelineMismatchAlert: Bool { info.timelineMismatchCount > 0 }
     private var showNoPersonBadge: Bool { info.isOnline && info.isNoPersonDetected && !info.isInvalid }
+    private var showManualBreakOverrideBadge: Bool { info.isManualBreakOverrideActive }
 
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
@@ -2365,6 +2719,18 @@ struct ChannelPreviewCard: View {
                                     .cornerRadius(6)
                                     .lineLimit(1)
                             }
+
+                            if showManualBreakOverrideBadge {
+                                Text("On Break")
+                                    .font(.caption2)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.orange)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 2)
+                                    .background(Color.orange.opacity(0.14))
+                                    .cornerRadius(6)
+                                    .lineLimit(1)
+                            }
                         }
                         .fixedSize(horizontal: true, vertical: false)
                     }
@@ -2522,6 +2888,23 @@ struct ActivitySidebarView: View {
                             .foregroundStyle(manager.appConfig.recordingEnabled ? Color.red : Color.orange)
                         }
                         .toggleStyle(.switch)
+
+                        HStack {
+                            Text("Sleep")
+                                .font(.subheadline)
+                                .foregroundColor(.secondary)
+                            Spacer()
+                            Menu {
+                                Button("Off") { setSleepMode(.off) }
+                                Button("Timer (60 min)") { setSleepMode(.timer) }
+                                Button("Auto sleep") { setSleepMode(.auto) }
+                            } label: {
+                                Label(sleepModeLabel, systemImage: sleepModeSymbol)
+                                    .font(.callout)
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
 
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
@@ -2798,6 +3181,38 @@ struct ActivitySidebarView: View {
         )
     }
 
+    private var sleepModeLabel: String {
+        switch manager.appConfig.sleepMode {
+        case .off:
+            return "Off"
+        case .timer:
+            return "Timer (60 min)"
+        case .auto:
+            return "Auto sleep"
+        }
+    }
+
+    private var sleepModeSymbol: String {
+        switch manager.appConfig.sleepMode {
+        case .off:
+            return "moon"
+        case .timer:
+            return "bed.double"
+        case .auto:
+            return "sparkles"
+        }
+    }
+
+    private func setSleepMode(_ mode: SleepMode) {
+        manager.appConfig.sleepMode = mode
+        if mode == .timer {
+            manager.appConfig.sleepTimerEndsAt = Int64(Date().timeIntervalSince1970) + Int64(max(1, manager.appConfig.sleepTimerMinutes)) * 60
+        } else {
+            manager.appConfig.sleepTimerEndsAt = nil
+        }
+        manager.saveAppConfig()
+    }
+
     private var activeRecordingCount: Int {
         manager.runtimeDiagnostics.activeRecordings
     }
@@ -3051,11 +3466,13 @@ struct ChannelDetailView: View {
     @State private var recordingsCache: [RecordingLedgerEntry] = []
     @State private var recordingsScanTask: Task<Void, Never>?
     @State private var lastRecordingsScanKey: String = ""
+    @State private var lastRecordingsScanAt: Date = .distantPast
     @State private var showingChannelPage = false
     @State private var isDetailProbeInFlight = false
     @State private var lastDetailProbeAt = Date.distantPast
 
     private let detailProbeInterval: TimeInterval = 5
+    private let recordingsCacheRefreshInterval: TimeInterval = 15
 
     init(
         manager: ChannelManager,
@@ -3312,6 +3729,18 @@ struct ChannelDetailView: View {
                 .controlSize(.small)
 
                 HStack(spacing: 8) {
+                    Button(action: {
+                        Task {
+                            await manager.setManualBreakOverride(username: username, enabled: !info.isManualBreakOverrideActive)
+                        }
+                    }) {
+                        Label(info.isManualBreakOverrideActive ? "Clear Break" : "Mark Break", systemImage: info.isManualBreakOverrideActive ? "checkmark.circle.fill" : "pause.circle")
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .tint(info.isManualBreakOverrideActive ? .orange : .secondary)
+
                     if info.isPaused {
                         Button(action: {
                             Task {
@@ -3533,10 +3962,13 @@ struct ChannelDetailView: View {
         ].joined(separator: "|")
 
         if !force, scanKey == lastRecordingsScanKey {
-            return
+            if Date().timeIntervalSince(lastRecordingsScanAt) < recordingsCacheRefreshInterval {
+                return
+            }
         }
 
         lastRecordingsScanKey = scanKey
+        lastRecordingsScanAt = Date()
         recordingsScanTask?.cancel()
 
         let username = info.username
@@ -3557,6 +3989,9 @@ struct ChannelDetailView: View {
         if entry.isFinalizing {
             return "Finalizing"
         }
+        if entry.status == "completed_invalid" {
+            return "Invalid"
+        }
         if entry.status == "deleted" {
             return "Deleted"
         }
@@ -3572,6 +4007,9 @@ struct ChannelDetailView: View {
         }
         if entry.isFinalizing {
             return .orange
+        }
+        if entry.status == "completed_invalid" {
+            return .red
         }
         if entry.status == "deleted" {
             return .secondary
@@ -3915,6 +4353,16 @@ struct RecordingDetailView: View {
     @State private var posterLoadTask: Task<Void, Never>?
     @State private var channelThumbnailPath: String?
     @State private var observedMediaDurationSeconds: Double?
+    @State private var isTrimEditorActive = false
+    @State private var trimStartSecondsText = ""
+    @State private var trimEndSecondsText = ""
+    @State private var trimErrorMessage: String?
+    @State private var isTrimming = false
+    @State private var trimSaveAsNewFile = false
+    @State private var trimPreviewPositionSeconds: Double = 0
+    @State private var trimPreviewDurationSeconds: Double = 0
+    @State private var trimPreviewTimer: Timer?
+    @State private var activeTrimTrackInteraction: TrimTrackInteraction?
 
     private enum PlayerPreparationError: LocalizedError {
         case timedOut
@@ -3946,6 +4394,13 @@ struct RecordingDetailView: View {
         formatter.countStyle = .file
         return formatter
     }()
+
+    private enum TrimTrackInteraction {
+        case startHandle(initialStart: Double, fixedEnd: Double)
+        case endHandle(fixedStart: Double, initialEnd: Double)
+        case selectedRange(initialStart: Double, initialEnd: Double, initialPreview: Double)
+        case playhead
+    }
 
     var body: some View {
         Group {
@@ -3979,7 +4434,15 @@ struct RecordingDetailView: View {
             await loadRecordingDetail()
         }
         .onDisappear {
+            stopTrimPreviewTimer()
             cleanupPlayer()
+        }
+        .onChange(of: isTrimEditorActive) { active in
+            if active {
+                startTrimPreviewTimer()
+            } else {
+                stopTrimPreviewTimer()
+            }
         }
     }
 
@@ -3987,31 +4450,61 @@ struct RecordingDetailView: View {
     private func recordingDetailBody(_ detail: RecordingLedgerDetail) -> some View {
         GeometryReader { geometry in
             let sideWidth = min(max(geometry.size.width * 0.31, 320), 420)
+            let editingContentMaxWidth = min(max(geometry.size.width - 40, 320), 980)
+            let editingPlayerMaxHeight = min(max(geometry.size.height * 0.44, 220), 460)
 
             VStack(alignment: .leading, spacing: 0) {
                 header(detail)
 
                 Divider()
 
-                HStack(alignment: .top, spacing: 16) {
-                    VStack(alignment: .leading, spacing: 16) {
-                        playerSection(detail)
-                        eventsSection(detail)
-                    }
-                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
-
+                if isTrimEditorActive {
                     ScrollView {
-                        VStack(alignment: .leading, spacing: 12) {
-                            metadataSection(detail)
-                            metricsSection(detail)
-                            fileSection(detail)
+                        VStack(alignment: .leading, spacing: 16) {
+                            playerSection(detail, maxVideoHeight: editingPlayerMaxHeight)
+                            trimEditorPanel
+
+                            GroupBox {
+                                HStack(spacing: 12) {
+                                    Text("Editing")
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                    statusBadge(label: detail.fileExtension.uppercased(), color: .accentColor)
+                                    Spacer(minLength: 0)
+                                    Text(URL(fileURLWithPath: detail.path).lastPathComponent)
+                                        .font(.caption)
+                                        .foregroundColor(.secondary)
+                                        .lineLimit(1)
+                                }
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.vertical, 2)
+                            }
                         }
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                        .padding(.vertical, 2)
+                        .frame(maxWidth: editingContentMaxWidth, alignment: .leading)
+                        .frame(maxWidth: .infinity, alignment: .center)
+                        .padding(20)
                     }
-                    .frame(width: sideWidth)
+                } else {
+                    HStack(alignment: .top, spacing: 16) {
+                        VStack(alignment: .leading, spacing: 16) {
+                            playerSection(detail)
+                            eventsSection(detail)
+                        }
+                        .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .top)
+
+                        ScrollView {
+                            VStack(alignment: .leading, spacing: 12) {
+                                metadataSection(detail)
+                                metricsSection(detail)
+                                fileSection(detail)
+                            }
+                            .frame(maxWidth: .infinity, alignment: .leading)
+                            .padding(.vertical, 2)
+                        }
+                        .frame(width: sideWidth)
+                    }
+                    .padding(20)
                 }
-                .padding(20)
             }
         }
     }
@@ -4105,6 +4598,14 @@ struct RecordingDetailView: View {
                 }
                 .buttonStyle(.bordered)
 
+                Button {
+                    prepareTrimForm(detail)
+                } label: {
+                    Label(isTrimEditorActive ? "Done Editing" : "Trim", systemImage: isTrimEditorActive ? "checkmark.circle" : "scissors")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canTrim(detail) || isTrimming)
+
                 Button(role: .destructive) {
                     moveRecordingToTrash(detail)
                 } label: {
@@ -4120,7 +4621,7 @@ struct RecordingDetailView: View {
     }
 
     @ViewBuilder
-    private func playerSection(_ detail: RecordingLedgerDetail) -> some View {
+    private func playerSection(_ detail: RecordingLedgerDetail, maxVideoHeight: CGFloat? = nil) -> some View {
         VStack(alignment: .leading, spacing: 8) {
             Text(shouldAllowPlayback(detail) ? "Playback" : "Preview")
                 .font(.headline)
@@ -4214,6 +4715,7 @@ struct RecordingDetailView: View {
             }
             .frame(maxWidth: .infinity)
             .aspectRatio(16 / 9, contentMode: .fit)
+            .modifier(TrimPlayerHeightLimit(maxVideoHeight: maxVideoHeight))
 
             if let playerError {
                 Text(playerError)
@@ -4625,6 +5127,7 @@ struct RecordingDetailView: View {
             channelThumbnailPath: channelThumbnailPath,
             isInProgress: detail.isActive || detail.isFinalizing,
             isActivelyFinalizing: detail.isFinalizing,
+            isMissing: !detail.fileExists && !detail.isActive && !detail.isFinalizing,
             isPreviewable: detail.fileExists,
             isOpenable: detail.fileExists || hasWorkingFile
         )
@@ -4757,6 +5260,455 @@ struct RecordingDetailView: View {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
     }
 
+    private var trimEditorPanel: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(alignment: .firstTextBaseline, spacing: 12) {
+                Text("Trim Recording")
+                    .font(.headline)
+                Text("Edit in place while watching the preview.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+                Spacer(minLength: 0)
+            }
+
+            HStack(alignment: .bottom, spacing: 12) {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Start (s)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("0", text: $trimStartSecondsText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("End (s)")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                    TextField("120", text: $trimEndSecondsText)
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+                }
+
+                Toggle("Save as new file", isOn: $trimSaveAsNewFile)
+                    .font(.caption)
+
+                Spacer(minLength: 0)
+            }
+
+            if trimPreviewDurationSeconds > 0 {
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 10) {
+                        Text("Scrubber")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Text("\(formatTrimSeconds(trimPreviewPositionSeconds)) / \(formatTrimSeconds(trimPreviewDurationSeconds))")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                        Spacer(minLength: 0)
+                    }
+
+                    trimRangeMarkerTrack
+
+                    Text("Drag the start/end handles or the playhead directly. Type values only if you need precise fallback edits.")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                Text("Playback preview is still preparing. Use Reload Video in the header if needed.")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+            }
+
+            if let trimErrorMessage, !trimErrorMessage.isEmpty {
+                Text(trimErrorMessage)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            HStack {
+                Button("Cancel Editing") {
+                    if !isTrimming {
+                        isTrimEditorActive = false
+                    }
+                }
+                .disabled(isTrimming)
+
+                Spacer(minLength: 0)
+
+                Button {
+                    applyTrim()
+                } label: {
+                    if isTrimming {
+                        HStack(spacing: 8) {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Trimming...")
+                        }
+                    } else {
+                        Text(trimSaveAsNewFile ? "Trim & Save As New" : "Trim & Replace")
+                    }
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isTrimming)
+            }
+        }
+        .padding(12)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor).opacity(0.34))
+        .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+    }
+
+    private var trimRangeMarkerTrack: some View {
+        GeometryReader { proxy in
+            let width = max(proxy.size.width, 1)
+            let range = resolvedTrimRangeSeconds
+            let startX = width * (range.start / trimPreviewDurationSeconds)
+            let endX = width * (range.end / trimPreviewDurationSeconds)
+            let current = min(max(trimPreviewPositionSeconds, 0), trimPreviewDurationSeconds)
+            let currentX = width * (current / trimPreviewDurationSeconds)
+
+            ZStack(alignment: .leading) {
+                Capsule()
+                    .fill(Color.secondary.opacity(0.18))
+                    .frame(height: 8)
+
+                Capsule()
+                    .fill(Color.accentColor.opacity(0.34))
+                    .frame(width: max(endX - startX, 2), height: 8)
+                    .offset(x: startX)
+
+                Circle()
+                    .fill(Color.accentColor)
+                    .overlay(Circle().stroke(Color(NSColor.windowBackgroundColor), lineWidth: 1))
+                    .frame(width: 12, height: 12)
+                    .offset(x: min(max(startX - 6, 0), max(width - 12, 0)))
+
+                Circle()
+                    .fill(Color.accentColor)
+                    .overlay(Circle().stroke(Color(NSColor.windowBackgroundColor), lineWidth: 1))
+                    .frame(width: 12, height: 12)
+                    .offset(x: min(max(endX - 6, 0), max(width - 12, 0)))
+
+                Rectangle()
+                    .fill(Color.primary.opacity(0.85))
+                    .frame(width: 2, height: 16)
+                    .offset(x: max(currentX - 1, 0))
+
+                Circle()
+                    .fill(Color.primary)
+                    .frame(width: 8, height: 8)
+                    .offset(x: max(currentX - 4, 0), y: -7)
+
+                Rectangle()
+                    .fill(Color.clear)
+                    .contentShape(Rectangle())
+                    .gesture(
+                        DragGesture(minimumDistance: 0)
+                            .onChanged { value in
+                                handleTrimTrackDragChanged(
+                                    startLocationX: value.startLocation.x,
+                                    startLocationY: value.startLocation.y,
+                                    currentLocationX: value.location.x,
+                                    translationX: value.translation.width,
+                                    trackWidth: width
+                                )
+                            }
+                            .onEnded { _ in
+                                finishTrimTrackInteraction()
+                            }
+                    )
+            }
+            .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .leading)
+        }
+        .frame(height: 24)
+        .accessibilityHidden(true)
+    }
+
+    private var resolvedTrimRangeSeconds: (start: Double, end: Double) {
+        guard trimPreviewDurationSeconds > 0 else { return (start: 0, end: 0) }
+
+        let defaultStart = 0.0
+        let defaultEnd = trimPreviewDurationSeconds
+
+        let startRaw = trimStartSecondsText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endRaw = trimEndSecondsText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        let start = Double(startRaw) ?? defaultStart
+        let end = Double(endRaw) ?? defaultEnd
+
+        let clampedStart = min(max(start, 0), trimPreviewDurationSeconds)
+        let clampedEnd = min(max(end, 0), trimPreviewDurationSeconds)
+
+        let minGap = min(0.1, max(trimPreviewDurationSeconds / 1000, 0.01))
+        if clampedEnd - clampedStart <= minGap {
+            let adjustedEnd = min(trimPreviewDurationSeconds, clampedStart + minGap)
+            if adjustedEnd - clampedStart > minGap / 2 {
+                return (start: clampedStart, end: adjustedEnd)
+            }
+            let adjustedStart = max(0, clampedEnd - minGap)
+            return (start: adjustedStart, end: clampedEnd)
+        }
+
+        return (start: clampedStart, end: clampedEnd)
+    }
+
+    private func handleTrimTrackDragChanged(startLocationX: CGFloat, startLocationY: CGFloat, currentLocationX: CGFloat, translationX: CGFloat, trackWidth: CGFloat) {
+        let range = resolvedTrimRangeSeconds
+        let startX = CGFloat(range.start / max(trimPreviewDurationSeconds, 0.0001)) * trackWidth
+        let endX = CGFloat(range.end / max(trimPreviewDurationSeconds, 0.0001)) * trackWidth
+        let playhead = clampedTrimPreviewPosition()
+        let playheadX = CGFloat(playhead / max(trimPreviewDurationSeconds, 0.0001)) * trackWidth
+        let handleY: CGFloat = 12
+        let playheadY: CGFloat = 5
+        let handleHitRadius: CGFloat = 14
+        let playheadHitRadius: CGFloat = 12
+
+        if activeTrimTrackInteraction == nil {
+            let startDistance = hypot(startLocationX - startX, startLocationY - handleY)
+            let endDistance = hypot(startLocationX - endX, startLocationY - handleY)
+            let playheadDistance = hypot(startLocationX - playheadX, startLocationY - playheadY)
+
+            if playheadDistance <= playheadHitRadius && playheadDistance <= min(startDistance, endDistance) {
+                activeTrimTrackInteraction = .playhead
+            } else if startDistance <= handleHitRadius && startDistance <= endDistance {
+                activeTrimTrackInteraction = .startHandle(initialStart: range.start, fixedEnd: range.end)
+            } else if endDistance <= handleHitRadius {
+                activeTrimTrackInteraction = .endHandle(fixedStart: range.start, initialEnd: range.end)
+            } else if startLocationX >= startX && startLocationX <= endX {
+                activeTrimTrackInteraction = .selectedRange(initialStart: range.start, initialEnd: range.end, initialPreview: playhead)
+            } else {
+                activeTrimTrackInteraction = .playhead
+            }
+        }
+
+        guard let activeTrimTrackInteraction else { return }
+
+        switch activeTrimTrackInteraction {
+        case let .startHandle(initialStart, fixedEnd):
+            let seconds = initialStart + trimSeconds(forDelta: translationX, trackWidth: trackWidth)
+            let clampedStart = min(max(seconds, 0), max(fixedEnd - trimMinimumGapSeconds, 0))
+            setTrimRange(start: clampedStart, end: fixedEnd)
+            trimPreviewPositionSeconds = clampedStart
+            seekTrimPreview(to: clampedStart)
+
+        case let .endHandle(fixedStart, initialEnd):
+            let seconds = initialEnd + trimSeconds(forDelta: translationX, trackWidth: trackWidth)
+            let clampedEnd = max(min(seconds, trimPreviewDurationSeconds), min(fixedStart + trimMinimumGapSeconds, trimPreviewDurationSeconds))
+            setTrimRange(start: fixedStart, end: clampedEnd)
+            trimPreviewPositionSeconds = clampedEnd
+            seekTrimPreview(to: clampedEnd)
+
+        case let .selectedRange(initialStart, initialEnd, initialPreview):
+            let deltaSeconds = trimSeconds(forDelta: translationX, trackWidth: trackWidth)
+            let widthSeconds = initialEnd - initialStart
+            var newStart = initialStart + deltaSeconds
+            var newEnd = initialEnd + deltaSeconds
+
+            if newStart < 0 {
+                newEnd -= newStart
+                newStart = 0
+            }
+            if newEnd > trimPreviewDurationSeconds {
+                let overflow = newEnd - trimPreviewDurationSeconds
+                newStart -= overflow
+                newEnd = trimPreviewDurationSeconds
+            }
+            if newEnd - newStart < widthSeconds {
+                newEnd = min(trimPreviewDurationSeconds, newStart + widthSeconds)
+            }
+
+            setTrimRange(start: newStart, end: newEnd)
+            let preview = min(max(initialPreview + deltaSeconds, newStart), newEnd)
+            trimPreviewPositionSeconds = preview
+            seekTrimPreview(to: preview)
+
+        case .playhead:
+            let seconds = clampedSecondsToTrimRange(trimSeconds(for: currentLocationX, trackWidth: trackWidth))
+            trimPreviewPositionSeconds = seconds
+            seekTrimPreview(to: seconds)
+        }
+    }
+
+    private func finishTrimTrackInteraction() {
+        let range = resolvedTrimRangeSeconds
+        switch activeTrimTrackInteraction {
+        case .startHandle:
+            trimPreviewPositionSeconds = range.start
+            seekTrimPreview(to: range.start)
+        case .endHandle:
+            trimPreviewPositionSeconds = range.end
+            seekTrimPreview(to: range.end)
+        case .selectedRange:
+            trimPreviewPositionSeconds = clampedSecondsToTrimRange(trimPreviewPositionSeconds)
+            seekTrimPreview(to: trimPreviewPositionSeconds)
+        case .playhead:
+            trimPreviewPositionSeconds = clampedSecondsToTrimRange(trimPreviewPositionSeconds)
+            seekTrimPreview(to: trimPreviewPositionSeconds)
+        case nil:
+            break
+        }
+        activeTrimTrackInteraction = nil
+    }
+
+    private func trimSeconds(for locationX: CGFloat, trackWidth: CGFloat) -> Double {
+        guard trimPreviewDurationSeconds > 0, trackWidth > 0 else { return 0 }
+        let clampedX = min(max(locationX, 0), trackWidth)
+        return (Double(clampedX) / Double(trackWidth)) * trimPreviewDurationSeconds
+    }
+
+    private func trimSeconds(forDelta deltaX: CGFloat, trackWidth: CGFloat) -> Double {
+        guard trimPreviewDurationSeconds > 0, trackWidth > 0 else { return 0 }
+        return (Double(deltaX) / Double(trackWidth)) * trimPreviewDurationSeconds
+    }
+
+    private func clampedSecondsToTrimRange(_ seconds: Double) -> Double {
+        let range = resolvedTrimRangeSeconds
+        return min(max(seconds, range.start), range.end)
+    }
+
+    private func clampedTrimPreviewPosition() -> Double {
+        clampedSecondsToTrimRange(trimPreviewPositionSeconds)
+    }
+
+    private var trimMinimumGapSeconds: Double {
+        min(0.1, max(trimPreviewDurationSeconds / 1000, 0.01))
+    }
+
+    private func setTrimRange(start: Double, end: Double) {
+        let clampedStart = min(max(start, 0), trimPreviewDurationSeconds)
+        let clampedEnd = min(max(end, 0), trimPreviewDurationSeconds)
+        trimStartSecondsText = String(format: "%.2f", clampedStart)
+        trimEndSecondsText = String(format: "%.2f", clampedEnd)
+        trimPreviewPositionSeconds = min(max(trimPreviewPositionSeconds, clampedStart), clampedEnd)
+    }
+
+    private func prepareTrimForm(_ detail: RecordingLedgerDetail) {
+        if isTrimEditorActive {
+            isTrimEditorActive = false
+            return
+        }
+
+        let duration = observedMediaDurationSeconds ?? detail.mediaDurationSeconds ?? detail.durationSeconds
+        trimStartSecondsText = "0"
+        if duration > 0 {
+            trimEndSecondsText = String(format: "%.2f", duration)
+        } else {
+            trimEndSecondsText = ""
+        }
+        trimSaveAsNewFile = false
+        trimErrorMessage = nil
+        trimPreviewDurationSeconds = duration
+        trimPreviewPositionSeconds = min(trimPreviewPositionSeconds, max(duration, 0))
+        isTrimEditorActive = true
+    }
+
+    private func canTrim(_ detail: RecordingLedgerDetail) -> Bool {
+        detail.fileExists && !detail.isActive && !detail.isFinalizing
+    }
+
+    private func applyTrim() {
+        guard let detail else {
+            trimErrorMessage = "Recording detail is unavailable."
+            return
+        }
+
+        let startRaw = trimStartSecondsText.trimmingCharacters(in: .whitespacesAndNewlines)
+        let endRaw = trimEndSecondsText.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        guard let start = Double(startRaw),
+              let end = Double(endRaw),
+              start >= 0,
+              end > start else {
+            trimErrorMessage = "Enter a valid time range where end is greater than start."
+            return
+        }
+
+        trimErrorMessage = nil
+        isTrimming = true
+
+        Task {
+            do {
+                let outputPath = try await manager.trimRecording(
+                    path: detail.path,
+                    startSeconds: start,
+                    endSeconds: end,
+                    saveAsNewFile: trimSaveAsNewFile
+                )
+                await MainActor.run {
+                    isTrimming = false
+                    isTrimEditorActive = false
+                }
+                if trimSaveAsNewFile {
+                    await MainActor.run {
+                        onSelectRecording(outputPath, detail.channelUsername)
+                    }
+                } else {
+                    await loadRecordingDetail()
+                }
+            } catch {
+                await MainActor.run {
+                    isTrimming = false
+                    trimErrorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
+
+    private func startTrimPreviewTimer() {
+        stopTrimPreviewTimer()
+
+        if let detail {
+            let expectedDuration = observedMediaDurationSeconds ?? detail.mediaDurationSeconds ?? detail.durationSeconds
+            if expectedDuration > 0 {
+                trimPreviewDurationSeconds = expectedDuration
+            }
+        }
+
+        trimPreviewTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { _ in
+            updateTrimPreviewSnapshot()
+        }
+        updateTrimPreviewSnapshot()
+    }
+
+    private func stopTrimPreviewTimer() {
+        trimPreviewTimer?.invalidate()
+        trimPreviewTimer = nil
+    }
+
+    private func updateTrimPreviewSnapshot() {
+        guard let player else { return }
+
+        let current = CMTimeGetSeconds(player.currentTime())
+        if current.isFinite, current >= 0 {
+            trimPreviewPositionSeconds = current
+        }
+
+        let duration = CMTimeGetSeconds(player.currentItem?.duration ?? .invalid)
+        if duration.isFinite, duration > 0 {
+            trimPreviewDurationSeconds = duration
+            if trimPreviewPositionSeconds > duration {
+                trimPreviewPositionSeconds = duration
+            }
+        }
+    }
+
+    private func seekTrimPreview(to seconds: Double) {
+        guard let player else { return }
+        let safeSeconds = min(max(seconds, 0), max(trimPreviewDurationSeconds, 0))
+        let target = CMTime(seconds: safeSeconds, preferredTimescale: 600)
+        player.seek(to: target, toleranceBefore: .zero, toleranceAfter: .zero)
+        trimPreviewPositionSeconds = safeSeconds
+    }
+
+    private func formatTrimSeconds(_ seconds: Double) -> String {
+        guard seconds.isFinite, seconds >= 0 else { return "0:00" }
+        let whole = Int(seconds.rounded())
+        let minutes = whole / 60
+        let secs = whole % 60
+        return String(format: "%d:%02d", minutes, secs)
+    }
+
     private func openRecordingFolder(_ path: String) {
         let folderURL = URL(fileURLWithPath: path).deletingLastPathComponent()
         NSWorkspace.shared.open(folderURL)
@@ -4777,7 +5729,7 @@ struct RecordingDetailView: View {
         }
 
         Task {
-            await manager.markRecordingMovedToTrash(path: detail.path)
+            await manager.markRecordingMovedToTrash(recordingID: detail.id, path: detail.path)
             await MainActor.run {
                 onMoveToTrash?(detail.path)
 
@@ -4802,6 +5754,9 @@ struct RecordingDetailView: View {
         if detail.isFinalizing {
             return "Finalizing"
         }
+        if detail.status == "completed_invalid" {
+            return "Invalid"
+        }
         if detail.status == "deleted" {
             return "Deleted"
         }
@@ -4817,6 +5772,9 @@ struct RecordingDetailView: View {
         }
         if detail.isFinalizing {
             return .orange
+        }
+        if detail.status == "completed_invalid" {
+            return .red
         }
         if detail.status == "deleted" {
             return .secondary
@@ -5526,6 +6484,7 @@ struct ImportChannelsView: View {
     @State private var importErrorMessage: String?
     @State private var showingImportError = false
     @State private var followedImportPreview: FollowedImportPreview?
+    @State private var diagnosticsStatus: String? = nil
 
     var body: some View {
         VStack(spacing: 0) {
@@ -5574,6 +6533,15 @@ struct ImportChannelsView: View {
                             }
                         }
 
+                        HStack(spacing: 12) {
+                            Button(action: runDiagnostics) {
+                                Label("Export Followed Import Diagnostics", systemImage: "stethoscope")
+                                    .frame(maxWidth: .infinity)
+                            }
+                            .buttonStyle(.bordered)
+                            .disabled(isImporting)
+                        }
+
                         Text("Import from folders or directly from your followed cams list (online + offline).")
                             .font(.caption)
                             .foregroundColor(.secondary)
@@ -5584,6 +6552,12 @@ struct ImportChannelsView: View {
 
                         if let importStatusMessage {
                             Text(importStatusMessage)
+                                .font(.caption)
+                                .foregroundColor(.secondary)
+                        }
+
+                        if let diagnosticsStatus {
+                            Text(diagnosticsStatus)
                                 .font(.caption)
                                 .foregroundColor(.secondary)
                         }
@@ -5722,6 +6696,24 @@ struct ImportChannelsView: View {
             isImporting = false
             followedImportPreview = nil
             importStatusMessage = "Imported \(result.imported) followed channel\(result.imported == 1 ? "" : "s"), skipped \(result.skipped)."
+        }
+    }
+
+    private func runDiagnostics() {
+        followedImportPreview = nil
+        diagnosticsStatus = "Running diagnostics..."
+        isImporting = true
+        importStatusMessage = nil
+
+        Task { @MainActor in
+            let client = ChaturbateClient(config: manager.appConfig)
+            await client.exportFollowedImportDebugPayloads(progress: { message in
+                Task { @MainActor in
+                    diagnosticsStatus = message
+                }
+            })
+            isImporting = false
+            diagnosticsStatus = "Diagnostics export complete. See Application Support/ChaturbateDVR/FollowedImportDebug."
         }
     }
 }

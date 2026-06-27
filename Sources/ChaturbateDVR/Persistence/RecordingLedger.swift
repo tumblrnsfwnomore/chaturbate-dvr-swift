@@ -24,6 +24,12 @@ struct ActiveRecordingRecoverySummary {
     var autoRepairCandidates: [ActiveRecordingAutoRepairCandidate]
 }
 
+struct OrphanAudioCleanupSummary {
+    var scanned: Int
+    var removed: Int
+    var failed: Int
+}
+
 struct ActiveRecordingAutoRepairCandidate: Sendable {
     let path: String
     let channelUsername: String
@@ -50,6 +56,14 @@ struct RecordingLedgerEntry: Sendable {
 
     var isFinalizing: Bool {
         status == "finalizing"
+    }
+
+    var isDiscarded: Bool {
+        status == "discarded"
+    }
+
+    var isMissing: Bool {
+        !isActive && !isFinalizing && !isDiscarded && !fileExists
     }
 }
 
@@ -98,6 +112,14 @@ struct RecordingLedgerDetail: Sendable {
 
     var isFinalizing: Bool {
         status == "finalizing"
+    }
+
+    var isDiscarded: Bool {
+        status == "discarded"
+    }
+
+    var isMissing: Bool {
+        !isActive && !isFinalizing && !isDiscarded && !fileExists
     }
 }
 
@@ -509,6 +531,17 @@ actor RecordingLedger {
         var consumedPaths = Set<String>()
 
         for row in recordings {
+            if let entry = catalogEntryIfExists(path: row.path) {
+                consumedPaths.insert(entry.path)
+                let wasMissing = row.status == "missing"
+                updateRecordingAsSeen(rowID: row.id, status: wasMissing ? "recovered" : row.status, entry: entry, database: database)
+                if wasMissing {
+                    summary.recovered += 1
+                    appendSystemEvent(recordingID: row.id, level: "INFO", eventType: "filesystem_recovered", message: "Recording file is available again at original path", database: database)
+                }
+                continue
+            }
+
             if let entry = catalog.byPath[row.path] {
                 consumedPaths.insert(entry.path)
                 let wasMissing = row.status == "missing"
@@ -528,6 +561,41 @@ actor RecordingLedger {
                 continue
             }
 
+            if let orphanRecovery = recoverFromOrphanWorkingFile(for: row) {
+                consumedPaths.insert(orphanRecovery.entry.path)
+                switch orphanRecovery.kind {
+                case .promotedToFinalPath:
+                    let removedAudioCount = purgeOrphanAudioSidecars(forFinalPath: row.path, removeAll: true)
+                    let wasMissing = row.status == "missing"
+                    updateRecordingAsSeen(rowID: row.id, status: wasMissing ? "recovered" : row.status, entry: orphanRecovery.entry, database: database)
+                    summary.recovered += 1
+                    appendSystemEvent(
+                        recordingID: row.id,
+                        level: "WARN",
+                        eventType: "filesystem_working_recovered",
+                        message: "Recovered recording from orphan in-progress/work file (audio_removed=\(removedAudioCount))",
+                        database: database
+                    )
+                case .keptAtOrphanPath:
+                    let cleanup = purgeOrphanArtifacts(finalPath: row.path, orphanVideoPath: orphanRecovery.entry.path)
+                    markRecordingInvalidFromOrphan(
+                        rowID: row.id,
+                        orphanEntry: orphanRecovery.entry,
+                        fileExists: !cleanup.removedVideo,
+                        database: database
+                    )
+                    summary.recovered += 1
+                    appendSystemEvent(
+                        recordingID: row.id,
+                        level: "WARN",
+                        eventType: "filesystem_working_invalid",
+                        message: "Found orphan in-progress/work file but could not promote; marked invalid after cleanup (video_removed=\(cleanup.removedVideo ? 1 : 0), audio_removed=\(cleanup.removedAudioCount))",
+                        database: database
+                    )
+                }
+                continue
+            }
+
             let wasAlreadyMissing = row.status == "missing"
             markRecordingMissing(rowID: row.id, alreadyMissing: wasAlreadyMissing, database: database)
             if !wasAlreadyMissing {
@@ -537,6 +605,129 @@ actor RecordingLedger {
         }
 
         return summary
+    }
+
+    private func catalogEntryIfExists(path: String) -> CatalogEntry? {
+        let normalizedPath = normalizePath(path)
+        guard FileManager.default.fileExists(atPath: normalizedPath) else {
+            return nil
+        }
+
+        guard let attributes = try? FileManager.default.attributesOfItem(atPath: normalizedPath) else {
+            return nil
+        }
+
+        let sizeBytes = (attributes[.size] as? NSNumber)?.int64Value ?? 0
+        let modifiedAt = Int64((attributes[.modificationDate] as? Date ?? Date.distantPast).timeIntervalSince1970)
+        return CatalogEntry(path: normalizedPath, sizeBytes: sizeBytes, modifiedAt: modifiedAt)
+    }
+
+    private enum OrphanRecoveryKind {
+        case promotedToFinalPath
+        case keptAtOrphanPath
+    }
+
+    private struct OrphanRecovery {
+        let entry: CatalogEntry
+        let kind: OrphanRecoveryKind
+    }
+
+    private func recoverFromOrphanWorkingFile(for row: RecordingRow) -> OrphanRecovery? {
+        let finalPath = normalizePath(row.path)
+        guard !FileManager.default.fileExists(atPath: finalPath) else {
+            if let entry = catalogEntryIfExists(path: finalPath) {
+                return OrphanRecovery(entry: entry, kind: .promotedToFinalPath)
+            }
+            return nil
+        }
+
+        guard let orphanPath = matchingOrphanWorkingPath(forFinalPath: finalPath),
+              FileManager.default.fileExists(atPath: orphanPath) else {
+            return nil
+        }
+
+        do {
+            try FileManager.default.moveItem(atPath: orphanPath, toPath: finalPath)
+            if let entry = catalogEntryIfExists(path: finalPath) {
+                return OrphanRecovery(entry: entry, kind: .promotedToFinalPath)
+            }
+            return nil
+        } catch {
+            // If promotion fails, still classify against the discovered orphan path.
+            if let entry = catalogEntryIfExists(path: orphanPath) {
+                return OrphanRecovery(entry: entry, kind: .keptAtOrphanPath)
+            }
+            return nil
+        }
+    }
+
+    private func matchingOrphanWorkingPath(forFinalPath finalPath: String) -> String? {
+        let finalURL = URL(fileURLWithPath: finalPath)
+        let directoryPath = finalURL.deletingLastPathComponent().path
+        let finalName = finalURL.lastPathComponent
+        let legacyName = "\(Self.legacyWorkingFilePrefix)\(finalName)"
+        let hiddenName = "\(Self.workingFilePrefix)\(finalName)"
+        let visibleName = "\(Self.visibleWorkingFilePrefix)\(finalName)"
+
+        let candidates = [legacyName, hiddenName, visibleName]
+            .map { normalizePath((directoryPath as NSString).appendingPathComponent($0)) }
+
+        return candidates.first { FileManager.default.fileExists(atPath: $0) }
+    }
+
+    private struct OrphanCleanupResult {
+        let removedVideo: Bool
+        let removedAudioCount: Int
+    }
+
+    private func purgeOrphanArtifacts(finalPath: String, orphanVideoPath: String) -> OrphanCleanupResult {
+        let fm = FileManager.default
+        var removedVideo = false
+
+        if fm.fileExists(atPath: orphanVideoPath) {
+            do {
+                try fm.removeItem(atPath: orphanVideoPath)
+                removedVideo = true
+            } catch {
+                removedVideo = false
+            }
+        }
+
+        let removedAudioCount = purgeOrphanAudioSidecars(forFinalPath: finalPath, removeAll: true)
+        return OrphanCleanupResult(removedVideo: removedVideo, removedAudioCount: removedAudioCount)
+    }
+
+    private func purgeOrphanAudioSidecars(forFinalPath finalPath: String, removeAll: Bool) -> Int {
+        let fm = FileManager.default
+        let finalURL = URL(fileURLWithPath: normalizePath(finalPath))
+        let directoryPath = finalURL.deletingLastPathComponent().path
+        let baseName = finalURL.deletingPathExtension().lastPathComponent
+
+        let candidateNames = [
+            "\(Self.legacyWorkingFilePrefix)\(baseName)_audio.m4a",
+            "\(Self.workingFilePrefix)\(baseName)_audio.m4a",
+            "\(Self.visibleWorkingFilePrefix)\(baseName)_audio.m4a"
+        ]
+
+        var removed = 0
+        for name in Set(candidateNames) {
+            let path = normalizePath((directoryPath as NSString).appendingPathComponent(name))
+            guard fm.fileExists(atPath: path) else { continue }
+
+            let sizeBytes = ((try? fm.attributesOfItem(atPath: path)[.size]) as? NSNumber)?.int64Value ?? 0
+            guard removeAll || sizeBytes == 0 else {
+                continue
+            }
+
+            do {
+                try fm.removeItem(atPath: path)
+                removed += 1
+            } catch {
+                continue
+            }
+        }
+
+        return removed
     }
 
     func recoverAbandonedActiveRecordings(activeBefore cutoffUnix: Int64) async -> ActiveRecordingRecoverySummary {
@@ -733,6 +924,36 @@ actor RecordingLedger {
                         channelUsername: row.channelUsername
                     )
                 )
+            }
+        }
+
+        return summary
+    }
+
+    func cleanupOrphanAudioSidecars(rootPath: String) async -> OrphanAudioCleanupSummary {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return OrphanAudioCleanupSummary(scanned: 0, removed: 0, failed: 0)
+        }
+
+        let normalizedRoot = normalizePath((rootPath as NSString).expandingTildeInPath)
+        guard FileManager.default.fileExists(atPath: normalizedRoot) else {
+            return OrphanAudioCleanupSummary(scanned: 0, removed: 0, failed: 0)
+        }
+
+        let protected = protectedOrphanAudioSidecarPaths(database: database)
+        let candidates = listOrphanAudioSidecarFilesRecursively(at: normalizedRoot)
+
+        var summary = OrphanAudioCleanupSummary(scanned: candidates.count, removed: 0, failed: 0)
+        for path in candidates {
+            if protected.contains(path) {
+                continue
+            }
+
+            do {
+                try FileManager.default.removeItem(atPath: path)
+                summary.removed += 1
+            } catch {
+                summary.failed += 1
             }
         }
 
@@ -1036,6 +1257,221 @@ actor RecordingLedger {
         _ = sqlite3_step(statement)
     }
 
+    func markRecordingTrimmed(
+        filePath: String,
+        durationSeconds: Double,
+        fileSizeBytes: Int64,
+        trimStartSeconds: Double,
+        trimEndSeconds: Double
+    ) async {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return
+        }
+
+        let normalizedPath = normalizePath(filePath)
+        let now = nowUnix()
+        let attributes = try? FileManager.default.attributesOfItem(atPath: normalizedPath)
+        let modifiedAtUnix = ((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970).map(Int64.init)
+        let observedSize = (attributes?[.size] as? NSNumber)?.int64Value ?? fileSizeBytes
+        let exists = FileManager.default.fileExists(atPath: normalizedPath)
+        let audioPresent = exists ? await audioPresenceFromMediaFile(path: normalizedPath) : -1
+
+        let sql = """
+        UPDATE recordings
+        SET duration_seconds = ?,
+            media_duration_seconds = ?,
+            media_duration_checked_at = ?,
+            file_size_bytes = ?,
+            is_remuxed = 1,
+            remuxed_at = CASE WHEN remuxed_at IS NULL THEN ? ELSE remuxed_at END,
+            audio_present = ?,
+            file_exists = ?,
+            missing_since = CASE WHEN ? = 1 THEN NULL ELSE COALESCE(missing_since, ?) END,
+            file_last_seen_at = CASE WHEN ? = 1 THEN ? ELSE file_last_seen_at END,
+            file_last_modified_at = COALESCE(?, file_last_modified_at),
+            updated_at = ?
+        WHERE file_path = ?
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_double(statement, 1, durationSeconds)
+        sqlite3_bind_double(statement, 2, durationSeconds)
+        sqlite3_bind_int64(statement, 3, now)
+        sqlite3_bind_int64(statement, 4, observedSize)
+        sqlite3_bind_int64(statement, 5, now)
+        sqlite3_bind_int(statement, 6, Int32(audioPresent))
+        sqlite3_bind_int(statement, 7, exists ? 1 : 0)
+        sqlite3_bind_int(statement, 8, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 9, now)
+        sqlite3_bind_int(statement, 10, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 11, now)
+        if let modifiedAtUnix {
+            sqlite3_bind_int64(statement, 12, modifiedAtUnix)
+        } else {
+            sqlite3_bind_null(statement, 12)
+        }
+        sqlite3_bind_int64(statement, 13, now)
+        bindText(statement: statement, index: 14, value: normalizedPath)
+
+        _ = sqlite3_step(statement)
+
+        if let recordingID = recordingID(forPath: normalizedPath, database: database) {
+            appendSystemEvent(
+                recordingID: recordingID,
+                level: "INFO",
+                eventType: "manual_trim_applied",
+                message: String(format: "Recording trimmed to %.2fs-%.2fs", trimStartSeconds, trimEndSeconds),
+                database: database
+            )
+        }
+    }
+
+    func registerManualTrimmedCopy(
+        sourceFilePath: String,
+        newFilePath: String,
+        channelUsername: String,
+        durationSeconds: Double,
+        fileSizeBytes: Int64,
+        trimStartSeconds: Double,
+        trimEndSeconds: Double
+    ) async {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return
+        }
+
+        let normalizedSourcePath = normalizePath(sourceFilePath)
+        let normalizedNewPath = normalizePath(newFilePath)
+        guard normalizedSourcePath != normalizedNewPath else {
+            await markRecordingTrimmed(
+                filePath: normalizedSourcePath,
+                durationSeconds: durationSeconds,
+                fileSizeBytes: fileSizeBytes,
+                trimStartSeconds: trimStartSeconds,
+                trimEndSeconds: trimEndSeconds
+            )
+            return
+        }
+
+        let now = nowUnix()
+        let channelID = ensureChannelID(username: channelUsername, database: database)
+        guard channelID > 0 else { return }
+
+        let attributes = try? FileManager.default.attributesOfItem(atPath: normalizedNewPath)
+        let modifiedAtUnix = ((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970).map(Int64.init) ?? now
+        let observedSize = (attributes?[.size] as? NSNumber)?.int64Value ?? fileSizeBytes
+        let exists = FileManager.default.fileExists(atPath: normalizedNewPath)
+        let audioPresent = exists ? await audioPresenceFromMediaFile(path: normalizedNewPath) : -1
+        let container = URL(fileURLWithPath: normalizedNewPath).pathExtension.lowercased()
+
+        var sourceStartedAt: Int64?
+        var sourceEndedAt: Int64?
+        let sourceTimesSQL = "SELECT started_at, ended_at FROM recordings WHERE file_path = ? LIMIT 1"
+        if let timesStmt = prepare(database: database, sql: sourceTimesSQL) {
+            bindText(statement: timesStmt, index: 1, value: normalizedSourcePath)
+            if sqlite3_step(timesStmt) == SQLITE_ROW {
+                if sqlite3_column_type(timesStmt, 0) != SQLITE_NULL {
+                    sourceStartedAt = sqlite3_column_int64(timesStmt, 0)
+                }
+                if sqlite3_column_type(timesStmt, 1) != SQLITE_NULL {
+                    sourceEndedAt = sqlite3_column_int64(timesStmt, 1)
+                }
+            }
+            sqlite3_finalize(timesStmt)
+        }
+
+        let derivedStartedAt: Int64? = sourceStartedAt.map { $0 + Int64(trimStartSeconds.rounded()) }
+        let derivedEndedAt: Int64? = {
+            guard let startedAt = sourceStartedAt else { return nil }
+            let candidate = startedAt + Int64(trimEndSeconds.rounded())
+            if let sourceEndedAt {
+                return min(candidate, sourceEndedAt)
+            }
+            return candidate
+        }()
+
+        let sql = """
+        INSERT INTO recordings (
+            channel_id, started_at, ended_at, duration_seconds, media_duration_seconds,
+            media_duration_checked_at, file_size_bytes, file_path, working_file_path,
+            container, status, is_remuxed, remuxed_at, audio_present,
+            missing_since, file_last_seen_at, file_last_modified_at,
+            file_exists, is_backfilled, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'completed', 1, ?, ?, NULL, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            started_at = excluded.started_at,
+            ended_at = excluded.ended_at,
+            duration_seconds = excluded.duration_seconds,
+            media_duration_seconds = excluded.media_duration_seconds,
+            media_duration_checked_at = excluded.media_duration_checked_at,
+            file_size_bytes = excluded.file_size_bytes,
+            container = excluded.container,
+            status = 'completed',
+            is_remuxed = 1,
+            remuxed_at = excluded.remuxed_at,
+            audio_present = excluded.audio_present,
+            missing_since = NULL,
+            file_last_seen_at = excluded.file_last_seen_at,
+            file_last_modified_at = excluded.file_last_modified_at,
+            file_exists = excluded.file_exists,
+            is_backfilled = 0,
+            updated_at = excluded.updated_at
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, channelID)
+        if let derivedStartedAt {
+            sqlite3_bind_int64(statement, 2, derivedStartedAt)
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+        if let derivedEndedAt {
+            sqlite3_bind_int64(statement, 3, derivedEndedAt)
+        } else {
+            sqlite3_bind_null(statement, 3)
+        }
+        sqlite3_bind_double(statement, 4, durationSeconds)
+        sqlite3_bind_double(statement, 5, durationSeconds)
+        sqlite3_bind_int64(statement, 6, now)
+        sqlite3_bind_int64(statement, 7, observedSize)
+        bindText(statement: statement, index: 8, value: normalizedNewPath)
+        bindText(statement: statement, index: 9, value: container)
+        sqlite3_bind_int64(statement, 10, now)
+        sqlite3_bind_int(statement, 11, Int32(audioPresent))
+        sqlite3_bind_int64(statement, 12, now)
+        sqlite3_bind_int64(statement, 13, modifiedAtUnix)
+        sqlite3_bind_int(statement, 14, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 15, now)
+        sqlite3_bind_int64(statement, 16, now)
+
+        _ = sqlite3_step(statement)
+
+        if let newRecordingID = recordingID(forPath: normalizedNewPath, database: database) {
+            appendSystemEvent(
+                recordingID: newRecordingID,
+                level: "INFO",
+                eventType: "manual_trim_created_copy",
+                message: String(format: "Trimmed copy created from %.2fs-%.2fs", trimStartSeconds, trimEndSeconds),
+                database: database
+            )
+        }
+
+        if let sourceRecordingID = recordingID(forPath: normalizedSourcePath, database: database) {
+            appendSystemEvent(
+                recordingID: sourceRecordingID,
+                level: "INFO",
+                eventType: "manual_trim_created_sibling",
+                message: "Created trimmed sibling file: \(URL(fileURLWithPath: normalizedNewPath).lastPathComponent)",
+                database: database
+            )
+        }
+    }
+
     func fetchStatusByPath(paths: [String]) async -> [String: String] {
         guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
             return [:]
@@ -1078,7 +1514,7 @@ actor RecordingLedger {
         return statuses
     }
 
-    func markRecordingMovedToTrash(filePath: String) async {
+    func markRecordingMovedToTrash(recordingID: Int64, filePath: String) async {
         guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
             return
         }
@@ -1091,20 +1527,21 @@ actor RecordingLedger {
             file_exists = 0,
             missing_since = NULL,
             updated_at = ?
-        WHERE file_path = ?
+        WHERE id = ? OR file_path = ?
         """
 
         guard let statement = prepare(database: database, sql: sql) else { return }
         defer { sqlite3_finalize(statement) }
 
         sqlite3_bind_int64(statement, 1, now)
-        sqlite3_bind_int64(statement, 2, now)
+        sqlite3_bind_int64(statement, 2, recordingID)
         bindText(statement: statement, index: 3, value: normalizedPath)
         _ = sqlite3_step(statement)
 
-        if let recordingID = recordingID(forPath: normalizedPath, database: database) {
+        let eventRecordingID = recordingID > 0 ? recordingID : self.recordingID(forPath: normalizedPath, database: database)
+        if let eventRecordingID {
             appendSystemEvent(
-                recordingID: recordingID,
+                recordingID: eventRecordingID,
                 level: "INFO",
                 eventType: "moved_to_trash",
                 message: "Recording was explicitly moved to Trash",
@@ -1294,6 +1731,30 @@ actor RecordingLedger {
             // Legacy releases used 'missing' for explicit trash actions.
             _ = sqlite3_exec(database, "UPDATE recordings SET status = 'deleted' WHERE status = 'missing';", nil, nil, nil)
             setDatabaseUserVersion(database: database, version: 1)
+        }
+
+        if currentVersion < 2 {
+            // Repair rows that were explicitly trashed but later regressed to missing.
+            _ = sqlite3_exec(
+                database,
+                """
+                UPDATE recordings
+                SET status = 'deleted',
+                    missing_since = NULL,
+                    updated_at = strftime('%s','now')
+                WHERE status = 'missing'
+                  AND EXISTS (
+                    SELECT 1
+                    FROM recording_events e
+                    WHERE e.recording_id = recordings.id
+                      AND e.event_type = 'moved_to_trash'
+                  );
+                """,
+                nil,
+                nil,
+                nil
+            )
+            setDatabaseUserVersion(database: database, version: 2)
         }
     }
 
@@ -1734,6 +2195,35 @@ actor RecordingLedger {
         _ = sqlite3_step(statement)
     }
 
+    private func markRecordingInvalidFromOrphan(rowID: Int64, orphanEntry: CatalogEntry, fileExists: Bool, database: OpaquePointer) {
+        let sql = """
+        UPDATE recordings
+        SET file_path = ?,
+            status = 'completed_invalid',
+            file_exists = ?,
+            missing_since = NULL,
+            file_size_bytes = ?,
+            file_last_modified_at = ?,
+            file_last_seen_at = ?,
+            updated_at = ?
+        WHERE id = ?
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        let now = nowUnix()
+        bindText(statement: statement, index: 1, value: orphanEntry.path)
+        sqlite3_bind_int(statement, 2, fileExists ? 1 : 0)
+        sqlite3_bind_int64(statement, 3, orphanEntry.sizeBytes)
+        sqlite3_bind_int64(statement, 4, orphanEntry.modifiedAt)
+        sqlite3_bind_int64(statement, 5, now)
+        sqlite3_bind_int64(statement, 6, now)
+        sqlite3_bind_int64(statement, 7, rowID)
+
+        _ = sqlite3_step(statement)
+    }
+
     private func markRecordingMissing(rowID: Int64, alreadyMissing: Bool, database: OpaquePointer) {
         let sql = """
         UPDATE recordings
@@ -1829,6 +2319,83 @@ actor RecordingLedger {
             }
         }
         return results
+    }
+
+    private func listOrphanAudioSidecarFilesRecursively(at rootPath: String) -> [String] {
+        let rootURL = URL(fileURLWithPath: rootPath, isDirectory: true)
+        guard let enumerator = FileManager.default.enumerator(
+            at: rootURL,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles, .skipsPackageDescendants]
+        ) else {
+            return []
+        }
+
+        var results: [String] = []
+        while let fileURL = enumerator.nextObject() as? URL {
+            let fileName = fileURL.lastPathComponent.lowercased()
+            guard fileName.hasSuffix("_audio.m4a"),
+                  (fileName.hasPrefix(Self.legacyWorkingFilePrefix)
+                    || fileName.hasPrefix(Self.workingFilePrefix)
+                    || fileName.hasPrefix(Self.visibleWorkingFilePrefix)) else {
+                continue
+            }
+
+            if (try? fileURL.resourceValues(forKeys: [.isRegularFileKey]).isRegularFile) == true {
+                results.append(normalizePath(fileURL.path))
+            }
+        }
+
+        return results
+    }
+
+    private func protectedOrphanAudioSidecarPaths(database: OpaquePointer) -> Set<String> {
+        let sql = """
+        SELECT file_path, working_file_path
+        FROM recordings
+        WHERE status IN ('active', 'finalizing')
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else {
+            return []
+        }
+        defer { sqlite3_finalize(statement) }
+
+        var protected: Set<String> = []
+
+        while sqlite3_step(statement) == SQLITE_ROW {
+            let filePath = columnText(statement: statement, index: 0)
+            let workingPath = columnText(statement: statement, index: 1)
+
+            for sourcePath in [filePath, workingPath].compactMap({ $0 }) {
+                protected.formUnion(orphanAudioSidecarCandidates(forVideoPath: sourcePath))
+            }
+        }
+
+        return protected
+    }
+
+    private func orphanAudioSidecarCandidates(forVideoPath videoPath: String) -> Set<String> {
+        let normalizedVideoPath = normalizePath(videoPath)
+        let videoURL = URL(fileURLWithPath: normalizedVideoPath)
+        let directoryPath = videoURL.deletingLastPathComponent().path
+        var fileName = videoURL.lastPathComponent
+
+        for prefix in [Self.legacyWorkingFilePrefix, Self.workingFilePrefix, Self.visibleWorkingFilePrefix] {
+            if fileName.lowercased().hasPrefix(prefix) {
+                fileName = String(fileName.dropFirst(prefix.count))
+                break
+            }
+        }
+
+        let baseName = (fileName as NSString).deletingPathExtension
+        let audioNames = [
+            "\(Self.legacyWorkingFilePrefix)\(baseName)_audio.m4a",
+            "\(Self.workingFilePrefix)\(baseName)_audio.m4a",
+            "\(Self.visibleWorkingFilePrefix)\(baseName)_audio.m4a"
+        ]
+
+        return Set(audioNames.map { normalizePath((directoryPath as NSString).appendingPathComponent($0)) })
     }
 
     private func durationFromMediaFile(path: String) async -> Double? {

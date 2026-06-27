@@ -13,6 +13,7 @@ struct SettingsView: View {
     @State private var bioBackfillTotal = 0
     @State private var bioBackfillTask: Task<Void, Never>?
     @State private var webServerPortString: String = ""
+    @State private var sleepTimerLabel: String = ""
     @State private var showingLoginSheet = false
     
     var body: some View {
@@ -525,6 +526,7 @@ struct SettingsView: View {
         .onAppear {
             outputDirectory = manager.appConfig.outputDirectory
             webServerPortString = String(manager.appConfig.webServerPort)
+            updateSleepTimerLabel()
             startDiagnosticsRefresh()
         }
         .onDisappear {
@@ -587,7 +589,21 @@ struct SettingsView: View {
         diagnosticsTimer?.invalidate()
         diagnosticsTimer = Timer.scheduledTimer(withTimeInterval: 2.0, repeats: true) { _ in
             refreshDiagnostics()
+            updateSleepTimerLabel()
         }
+    }
+
+    private func updateSleepTimerLabel() {
+        guard manager.appConfig.sleepMode == .timer,
+              let endsAt = manager.appConfig.sleepTimerEndsAt else {
+            sleepTimerLabel = ""
+            return
+        }
+
+        let remaining = max(0, Int(endsAt - Int64(Date().timeIntervalSince1970)))
+        let minutes = remaining / 60
+        let seconds = remaining % 60
+        sleepTimerLabel = "Sleep timer ends in \(minutes)m \(seconds)s."
     }
 
     private func refreshDiagnostics() {

@@ -22,8 +22,8 @@ struct RootView: View {
             appDelegate.gracefulShutdownHandler = { [manager] in
                 await manager.shutdownForTermination()
             }
-            appDelegate.terminationBlockReasonProvider = { [manager] in
-                manager.terminationBlockReason()
+            appDelegate.terminationStatusProvider = { [manager] in
+                await manager.terminationProgressStatus()
             }
         }
         .sheet(isPresented: $showingLoginSheet) {

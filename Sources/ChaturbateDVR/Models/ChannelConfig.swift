@@ -156,6 +156,7 @@ struct ChannelInfo: Identifiable {
     var lastTimelineMismatchAt: String?
     var bioMetadata: BioMetadata?
     var globalRecordingEnabled: Bool
+    var isManualBreakOverrideActive: Bool
 }
 
 struct RuntimeDiagnostics {
@@ -195,6 +196,14 @@ enum AuthMode: String, Codable, CaseIterable, Identifiable {
     var id: String { rawValue }
 }
 
+enum SleepMode: String, Codable, CaseIterable, Identifiable {
+    case off = "Off"
+    case timer = "Sleep timer"
+    case auto = "Auto sleep"
+
+    var id: String { rawValue }
+}
+
 struct AppConfig: Codable {
     var framerate: Int = 30
     var resolution: Int = 1080
@@ -210,7 +219,7 @@ struct AppConfig: Codable {
     var loggedInUsername: String = ""
     var hasCompletedOnboarding: Bool = false
     var domain: String = "https://chaturbate.com/"
-    var maxConcurrentRequests: Int = 6 // max concurrent API requests across all channels
+    var maxConcurrentRequests: Int = 4 // max concurrent API requests across all channels
     var maxConcurrentRecordings: Int = 0 // 0 means unlimited concurrent recordings
     var maxConcurrentFinalizations: Int = 1
     var breakStaticThresholdMinutes: Int = 10
@@ -219,6 +228,9 @@ struct AppConfig: Codable {
     var webServerEnabled: Bool = false
     var webServerPort: Int = 8888
     var recordingEnabled: Bool = true
+    var sleepMode: SleepMode = .off
+    var sleepTimerMinutes: Int = 60
+    var sleepTimerEndsAt: Int64? = nil
     var logRetentionDays: Int = 30
     
     // Custom decoding to handle missing selectedBrowser from old configs
@@ -239,7 +251,7 @@ struct AppConfig: Codable {
         loggedInUsername = try container.decodeIfPresent(String.self, forKey: .loggedInUsername) ?? ""
         hasCompletedOnboarding = try container.decodeIfPresent(Bool.self, forKey: .hasCompletedOnboarding) ?? true
         domain = try container.decodeIfPresent(String.self, forKey: .domain) ?? "https://chaturbate.com/"
-        maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 6
+        maxConcurrentRequests = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRequests) ?? 4
         maxConcurrentRecordings = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentRecordings) ?? 0
         maxConcurrentFinalizations = try container.decodeIfPresent(Int.self, forKey: .maxConcurrentFinalizations) ?? 1
         breakStaticThresholdMinutes = try container.decodeIfPresent(Int.self, forKey: .breakStaticThresholdMinutes) ?? 10
@@ -248,6 +260,9 @@ struct AppConfig: Codable {
         webServerEnabled = try container.decodeIfPresent(Bool.self, forKey: .webServerEnabled) ?? false
         webServerPort = try container.decodeIfPresent(Int.self, forKey: .webServerPort) ?? 8888
         recordingEnabled = try container.decodeIfPresent(Bool.self, forKey: .recordingEnabled) ?? true
+        sleepMode = try container.decodeIfPresent(SleepMode.self, forKey: .sleepMode) ?? .off
+        sleepTimerMinutes = try container.decodeIfPresent(Int.self, forKey: .sleepTimerMinutes) ?? 60
+        sleepTimerEndsAt = try container.decodeIfPresent(Int64.self, forKey: .sleepTimerEndsAt)
         logRetentionDays = try container.decodeIfPresent(Int.self, forKey: .logRetentionDays) ?? 30
     }
     
@@ -269,6 +284,9 @@ struct AppConfig: Codable {
         case webServerEnabled
         case webServerPort
         case recordingEnabled
+        case sleepMode
+        case sleepTimerMinutes
+        case sleepTimerEndsAt
         case logRetentionDays
     }
     

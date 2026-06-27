@@ -348,6 +348,13 @@ get_video_duration() {
   ffprobe -v error -select_streams v:0 -show_entries stream=duration -of default=nokey=1:noprint_wrappers=1 -- "$f" 2>/dev/null | head -n 1
 }
 
+has_audio_stream() {
+  local f="$1"
+  local out
+  out=$(ffprobe -v error -select_streams a:0 -show_entries stream=index -of default=nokey=1:noprint_wrappers=1 -- "$f" 2>/dev/null | head -n 1 || true)
+  [[ -n "${out//[[:space:]]/}" ]]
+}
+
 get_max_gap() {
   local f="$1"
   ffprobe -v error -select_streams v:0 -show_entries packet=pts_time -of csv=p=0 -- "$f" 2>/dev/null \
@@ -440,18 +447,37 @@ run_repair() {
     -loglevel error
     -y
     -i "$source"
-    -map 0:v:0
-    -map "0:a?"
     -analyzeduration 100M
     -probesize 100M
-    -vf "setpts=N/(${fps}*TB),fps=${fps},format=yuv420p"
-    -c:v libx264
-    -preset "$PRESET"
-    -crf "$CRF"
-    -c:a copy
-    -movflags +faststart
-    "$out"
   )
+
+  if has_audio_stream "$source"; then
+    ff_args+=(
+      -filter_complex "[0:v:0]setpts=N/(${fps}*TB),fps=${fps},format=yuv420p[v];[0:a:0]aresample=async=1:first_pts=0[a]"
+      -map "[v]"
+      -map "[a]"
+      -c:v libx264
+      -preset "$PRESET"
+      -crf "$CRF"
+      -c:a aac
+      -b:a 192k
+      -ar 48000
+      -ac 2
+      -shortest
+      -movflags +faststart
+      "$out"
+    )
+  else
+    ff_args+=(
+      -vf "setpts=N/(${fps}*TB),fps=${fps},format=yuv420p"
+      -map 0:v:0
+      -c:v libx264
+      -preset "$PRESET"
+      -crf "$CRF"
+      -movflags +faststart
+      "$out"
+    )
+  fi
 
   if ! ffmpeg "${ff_args[@]}"; then
     printf 'failed_encode\t%s\t%s\t%s\t%s\t\t\tffmpeg_failed\n' "$source" "$out" "$fps" "$in_duration" >> "$STATUS_FILE"

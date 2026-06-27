@@ -21,5 +21,9 @@ let package = Package(
                 .copy("WebServer/dashboard.html")
             ]
         ),
+        .testTarget(
+            name: "ChaturbateDVRTests",
+            dependencies: ["ChaturbateDVR"]
+        ),
     ]
 )
