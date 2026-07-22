@@ -162,7 +162,7 @@ struct SettingsView: View {
                                             .foregroundColor(.secondary)
                                     }
                                 }
-                                Text("Cap active recordings separately from request slots. Set to 0 for unlimited.")
+                                Text("Cap active recordings (segment downloads scale automatically). Set to 0 for unlimited.")
                                     .font(.caption)
                                     .foregroundColor(.secondary)
                                 Text("Recommended now: \(recommendedRecordingRange)")

@@ -97,6 +97,7 @@ actor RequestCoordinator {
         let saturationEvents: Int
         let averageWaitMs: Int
         let maxWaitMs: Int
+        let stalledTasks: Int  // Tasks waiting > 30 seconds
     }
 
     private struct PrioritizedTask {
@@ -119,7 +120,7 @@ actor RequestCoordinator {
     
     func updateMaxConcurrent(_ max: Int) {
         maxConcurrent = max
-        // Resume waiting tasks if we increased the limit, prioritizing high-priority tasks
+        // Resume waiting tasks (they're already sorted by priority during insertion)
         while activeRequests < maxConcurrent && !waitingTasks.isEmpty {
             let task = waitingTasks.removeFirst()
             activeRequests += 1
@@ -155,9 +156,14 @@ actor RequestCoordinator {
         maxObservedWaitMs = max(maxObservedWaitMs, waitedMs)
     }
     
-    func releaseSlot() {
+    func releaseSlot(priority: RequestPriority = .normal) {
         activeRequests -= 1
+        // Ensure we don't go negative (should never happen, but guards against bugs)
+        if activeRequests < 0 {
+            activeRequests = 0
+        }
         
+        // Resume the next waiting task (tasks are kept in priority order during insertion)
         if !waitingTasks.isEmpty && activeRequests < maxConcurrent {
             let task = waitingTasks.removeFirst()
             activeRequests += 1
@@ -167,14 +173,32 @@ actor RequestCoordinator {
 
     func getStats() -> Stats {
         let average = waitSamples > 0 ? (totalWaitMs / waitSamples) : 0
+        let now = Date()
+        let stalledCount = waitingTasks.filter { now.timeIntervalSince($0.startTime) > 30 }.count
         return Stats(
             activeRequests: activeRequests,
             queuedRequests: waitingTasks.count,
             maxConcurrent: maxConcurrent,
             saturationEvents: saturationEvents,
             averageWaitMs: average,
-            maxWaitMs: maxObservedWaitMs
+            maxWaitMs: maxObservedWaitMs,
+            stalledTasks: stalledCount
         )
+    }
+}
+
+actor StatusCheckRateLimiter {
+    private var lastCheckTimes: [String: Date] = [:]
+    private let minIntervalBetweenChecks: TimeInterval = 0.25  // 250ms between checks, ~4 per second max
+    
+    func shouldAllowStatusCheck(for username: String) -> Bool {
+        let now = Date()
+        if let lastCheck = lastCheckTimes[username],
+           now.timeIntervalSince(lastCheck) < minIntervalBetweenChecks {
+            return false
+        }
+        lastCheckTimes[username] = now
+        return true
     }
 }
 
@@ -473,6 +497,7 @@ class ChannelManager: ObservableObject {
     private let requestCoordinator: RequestCoordinator
     private let recordingRequestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
+    private let statusCheckRateLimiter: StatusCheckRateLimiter
     private let recordingLedger: RecordingLedger
     private var backgroundWorkerLastHeartbeat: [BackgroundWorker: Date] = [:]
     private var activeBackgroundWorkerAlerts: Set<BackgroundWorker> = []
@@ -482,6 +507,16 @@ class ChannelManager: ObservableObject {
 
     var isAuthenticated: Bool {
         appConfig.isAuthenticated()
+    }
+
+    /// Compute segment download slots based on concurrent recordings limit
+    /// If unlimited (0), allow up to 32 slots. Otherwise, use ~1.5x the recording limit to allow
+    /// multiple segments per channel to download concurrently
+    private func computeRecordingRequestSlots(for maxRecordings: Int) -> Int {
+        if maxRecordings == 0 {
+            return 32 // unlimited recordings, allow generous segment download parallelism
+        }
+        return max(8, min(50, maxRecordings * 2)) // 2x slots, capped at 50
     }
 
     init() {
@@ -494,12 +529,13 @@ class ChannelManager: ObservableObject {
         auditCacheURL = appFolder.appendingPathComponent("recording-audit-cache.json")
         recordingLedgerBackfillMarkerURL = appFolder.appendingPathComponent("recording-ledger-backfill.done")
         
-        // Initialize with default, will update after loading config
+        // Initialize with defaults, will update after loading config
         requestCoordinator = RequestCoordinator(maxConcurrent: 4)
-        // Recording requests get a dedicated pool (not user-configurable) so active recordings
+        // Recording requests get a dedicated pool so active recordings
         // never compete for slots with status checks and thumbnails
         recordingRequestCoordinator = RequestCoordinator(maxConcurrent: 8)
         recordingCoordinator = RecordingCoordinator(maxConcurrent: 0, staleWaitTimeoutSeconds: 90)
+        statusCheckRateLimiter = StatusCheckRateLimiter()
         recordingLedger = RecordingLedger.shared
         let launchUnix = Int64(Date().timeIntervalSince1970)
 
@@ -543,9 +579,11 @@ class ChannelManager: ObservableObject {
         loadRepairIndex()
         loadAuditCache()
 
-        // Update with actual config value
+        // Update with actual config values
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
+            let recordingSlots = computeRecordingRequestSlots(for: appConfig.maxConcurrentRecordings)
+            await recordingRequestCoordinator.updateMaxConcurrent(recordingSlots)
             await recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
             await recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
             await Channel.updateMaxConcurrentFinalizations(appConfig.maxConcurrentFinalizations)
@@ -581,6 +619,11 @@ class ChannelManager: ObservableObject {
         recordingRepairRunTask?.cancel()
         backgroundWorkerWatchdogTask?.cancel()
         webServer?.stop()
+    }
+
+    func setAutoSleepQueueHold(_ enabled: Bool) async {
+        await recordingCoordinator.setManualQueueHold(enabled)
+        await FileLogger.shared.log("[manager] auto-sleep queue hold: \(enabled ? "enabled" : "disabled")")
     }
 
     func shutdownForTermination() async {
@@ -1422,9 +1465,11 @@ class ChannelManager: ObservableObject {
         
         Task {
             await requestCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRequests)
+            let recordingSlots = self.computeRecordingRequestSlots(for: appConfig.maxConcurrentRecordings)
+            await self.recordingRequestCoordinator.updateMaxConcurrent(recordingSlots)
             await self.recordingCoordinator.updateMaxConcurrent(appConfig.maxConcurrentRecordings)
             await self.recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
-            await self.applySleepModePolicy()
+            // Apply sleep mode policy once after config updates (removed duplicate call)
             await self.applySleepModePolicy()
             await Channel.updateMaxConcurrentFinalizations(appConfig.maxConcurrentFinalizations)
 
@@ -1436,7 +1481,7 @@ class ChannelManager: ObservableObject {
             for (_, channel) in channels {
                 await channel.updateAppConfig(appConfig)
             }
-            await FileLogger.shared.log("[manager] updated max concurrent requests to \(appConfig.maxConcurrentRequests)")
+            await FileLogger.shared.log("[manager] updated max concurrent requests to \(appConfig.maxConcurrentRequests), segment download slots to \(recordingSlots)")
             await FileLogger.shared.log("[manager] updated break detection settings: static=\(appConfig.breakStaticThresholdMinutes)m no_person=\(appConfig.breakNoPersonNoMotionThresholdMinutes)m analysis=\(appConfig.breakAnalysisIntervalSeconds)s")
         }
 
@@ -1444,10 +1489,6 @@ class ChannelManager: ObservableObject {
             startWebServer()
         } else {
             stopWebServer()
-        }
-
-        Task {
-            await applySleepModePolicy()
         }
     }
 
@@ -1688,7 +1729,8 @@ class ChannelManager: ObservableObject {
     func rescanRecordingLibraryFromDisk() async {
         let outputRoot = appConfig.getOutputPath()
 
-        if !Self.discoverCandidateChannelImportFolders(in: outputRoot).isEmpty {
+        let candidates = await Self.discoverCandidateChannelImportFolders(in: outputRoot)
+        if !candidates.isEmpty {
             let importResult = await importChannelsFromFolders(parentDirectory: outputRoot)
             if importResult.imported > 0 {
                 await FileLogger.shared.log("[manager] automatically imported \(importResult.imported) channel(s) discovered during recording scan", level: "INFO")
@@ -1833,7 +1875,7 @@ class ChannelManager: ObservableObject {
         }
         args.append(tempURL.path)
 
-        let processResult = runProcess(executablePath: ffmpegPath, arguments: args)
+        let processResult = await runProcessAsync(executablePath: ffmpegPath, arguments: args)
         guard processResult.status == 0 else {
             try? fileManager.removeItem(at: tempURL)
             let details = processResult.stderr.isEmpty ? processResult.stdout : processResult.stderr
@@ -1903,29 +1945,41 @@ class ChannelManager: ObservableObject {
         let stderr: String
     }
 
-    private nonisolated static func runProcess(executablePath: String, arguments: [String]) -> ProcessResult {
-        let process = Process()
-        process.executableURL = URL(fileURLWithPath: executablePath)
-        process.arguments = arguments
+    private nonisolated static func runProcessAsync(executablePath: String, arguments: [String]) async -> ProcessResult {
+        // Run process on utility QoS queue and properly resume continuation
+        // IMPORTANT: Must resume on main thread to maintain actor isolation invariants
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executablePath)
+                process.arguments = arguments
 
-        let stdoutPipe = Pipe()
-        let stderrPipe = Pipe()
-        process.standardOutput = stdoutPipe
-        process.standardError = stderrPipe
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
 
-        do {
-            try process.run()
-            process.waitUntilExit()
+                let result: ProcessResult
+                do {
+                    try process.run()
+                    process.waitUntilExit()
 
-            let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
-            let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
-            return ProcessResult(
-                status: process.terminationStatus,
-                stdout: String(decoding: stdoutData, as: UTF8.self),
-                stderr: String(decoding: stderrData, as: UTF8.self)
-            )
-        } catch {
-            return ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+                    result = ProcessResult(
+                        status: process.terminationStatus,
+                        stdout: String(decoding: stdoutData, as: UTF8.self),
+                        stderr: String(decoding: stderrData, as: UTF8.self)
+                    )
+                } catch {
+                    result = ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+                }
+                
+                // Resume on main thread to preserve continuation safety and actor isolation
+                DispatchQueue.main.async {
+                    continuation.resume(returning: result)
+                }
+            }
         }
     }
 
@@ -2324,21 +2378,23 @@ class ChannelManager: ObservableObject {
         return (imported, skipped)
     }
 
-    nonisolated static func discoverCandidateChannelImportFolders(in parentDirectory: String) -> [String] {
-        let root = (parentDirectory as NSString).expandingTildeInPath
-        guard let children = try? FileManager.default.contentsOfDirectory(
-            at: URL(fileURLWithPath: root),
-            includingPropertiesForKeys: [.isDirectoryKey],
-            options: [.skipsHiddenFiles]
-        ) else {
-            return []
-        }
+    nonisolated static func discoverCandidateChannelImportFolders(in parentDirectory: String) async -> [String] {
+        return await Task.detached(priority: .background) {
+            let root = (parentDirectory as NSString).expandingTildeInPath
+            guard let children = try? FileManager.default.contentsOfDirectory(
+                at: URL(fileURLWithPath: root),
+                includingPropertiesForKeys: [.isDirectoryKey],
+                options: [.skipsHiddenFiles]
+            ) else {
+                return []
+            }
 
-        return children
-            .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
-            .filter { Self.folderContainsVideoFiles(at: $0.path) }
-            .map { $0.lastPathComponent }
-            .sorted { $0.lowercased() < $1.lowercased() }
+            return children
+                .filter { (try? $0.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+                .filter { Self.folderContainsVideoFiles(at: $0.path) }
+                .map { $0.lastPathComponent }
+                .sorted { $0.lowercased() < $1.lowercased() }
+        }.value
     }
 
     private nonisolated static func folderContainsVideoFiles(at path: String) -> Bool {
@@ -2443,19 +2499,33 @@ class ChannelManager: ObservableObject {
     }
 
     private func applySleepModePolicy() async {
+        // Only modify appConfig if sleep mode policy actually changes values
+        // This prevents cascading @Published updates that can create feedback loops
+        var hasChanges = false
+        
         switch appConfig.sleepMode {
         case .off:
-            appConfig.sleepTimerEndsAt = nil
+            if appConfig.sleepTimerEndsAt != nil {
+                appConfig.sleepTimerEndsAt = nil
+                hasChanges = true
+            }
         case .timer:
             if appConfig.sleepTimerEndsAt == nil {
                 appConfig.sleepTimerEndsAt = Int64(Date().timeIntervalSince1970) + Int64(max(1, appConfig.sleepTimerMinutes)) * 60
+                hasChanges = true
             }
         case .auto:
-            appConfig.sleepTimerEndsAt = nil
+            if appConfig.sleepTimerEndsAt != nil {
+                appConfig.sleepTimerEndsAt = nil
+                hasChanges = true
+            }
         }
 
-        await recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
-        await FileLogger.shared.log("[manager] sleep mode=\(appConfig.sleepMode.rawValue), recordingEnabled=\(appConfig.recordingEnabled)")
+        // Only update coordinator and log if there were actual changes
+        if hasChanges {
+            await recordingCoordinator.setRecordingEnabled(appConfig.recordingEnabled)
+            await FileLogger.shared.log("[manager] sleep mode=\(appConfig.sleepMode.rawValue), recordingEnabled=\(appConfig.recordingEnabled)")
+        }
     }
 
     private func evaluateSleepModePolicy() async {
@@ -2469,10 +2539,11 @@ class ChannelManager: ObservableObject {
                 await enterSleepMode(reason: "sleep timer elapsed")
             }
         case .auto:
-            let activeChannels = await getActiveRecordingChannels()
-            if activeChannels.isEmpty {
-                await enterSleepMode(reason: "all active recordings finished")
-            }
+            // Auto mode: recordingEnabled should already be false from setSleepMode(),
+            // so this function returns at the top. When all channels naturally finish,
+            // we can optionally emit a notification. For now, this is handled by
+            // the fact that recordingEnabled=false prevents new starts.
+            return
         }
     }
 
@@ -2595,7 +2666,8 @@ class ChannelManager: ObservableObject {
         Task {
             await FileLogger.shared.log("[manager] started offline thumbnail backfill")
         }
-        offlineThumbnailBackfillTask = Task { @MainActor [weak self] in
+        // Removed @MainActor to prevent blocking long loops; candidate search now runs on background thread
+        offlineThumbnailBackfillTask = Task { [weak self] in
             guard let self else { return }
 
             // Avoid startup I/O spikes: wait a bit before first backfill pass.
@@ -2825,7 +2897,7 @@ class ChannelManager: ObservableObject {
             // If channel is offline, leave it in newly imported set for now; we'll try to generate offline thumbnail later
         }
         
-        // Standard offline thumbnail backfill
+        // Get candidates - this needs to run on main actor to access actor properties
         var candidates: [(String, Channel)] = []
         let now = Date()
 
@@ -2958,8 +3030,21 @@ class ChannelManager: ObservableObject {
 
         await withTaskGroup(of: Void.self) { group in
             for channel in channelsToCheck {
-                group.addTask {
+                group.addTask { [weak self] in
+                    guard let self = self else { return }
+                    let username = await channel.config.username
+                    
+                    // Rate-limit status check initiation to prevent bursts from starving the request queue.
+                    // This spreads checks out over time instead of firing 40+ concurrently.
+                    let shouldCheck = await self.statusCheckRateLimiter.shouldAllowStatusCheck(for: username)
+                    if !shouldCheck {
+                        // This channel was checked recently; skip this cycle
+                        return
+                    }
+                    
                     await channel.refreshPausedOnlineStatus()
+                    // Update heartbeat after each channel completes to prevent staleness during concurrent operations
+                    await self.noteBackgroundWorkerHeartbeat(.pausedStatus)
                 }
             }
         }

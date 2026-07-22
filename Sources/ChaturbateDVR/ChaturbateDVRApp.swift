@@ -17,6 +17,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var terminationProgressPollingTask: Task<Void, Never>?
     private var terminationTimeoutTask: Task<Void, Never>?
     private var terminationDetailLabel: NSTextField?
+    private var sleepWakeMonitor: Task<Void, Never>?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         cleanupTemporaryPreviewFiles()
@@ -27,6 +28,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             window.minSize = minimumMainWindowSize
             window.makeKeyAndOrderFront(nil)
         }
+
+        // Register for macOS sleep/wake notifications to handle UI consistency
+        registerSleepWakeNotifications()
     }
 
     func applicationWillTerminate(_ notification: Notification) {
@@ -34,6 +38,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         terminationProgressPollingTask = nil
         terminationTimeoutTask?.cancel()
         terminationTimeoutTask = nil
+        sleepWakeMonitor?.cancel()
+        sleepWakeMonitor = nil
         dismissTerminationProgressWindow()
         cleanupTemporaryPreviewFiles()
     }
@@ -228,6 +234,28 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         if let remaining = try? fileManager.contentsOfDirectory(atPath: appTempDir.path),
            remaining.isEmpty {
             try? fileManager.removeItem(at: appTempDir)
+        }
+    }
+
+    private func registerSleepWakeNotifications() {
+        // Monitor macOS sleep/wake events to handle UI consistency
+        // When Mac sleeps, UI thread can be paused; on wake, ensure UI is responsive
+        sleepWakeMonitor?.cancel()
+        sleepWakeMonitor = Task { [weak self] in
+            guard self != nil else { return }
+            
+            for await _ in NotificationCenter.default
+                .notifications(named: NSWorkspace.didWakeNotification) {
+                Task { @MainActor in
+                    // After wake from sleep, force UI refresh by invalidating display
+                    // This ensures SwiftUI view state is consistent with backend state
+                    NSApp.windows.forEach { window in
+                        if let contentView = window.contentView {
+                            contentView.needsDisplay = true
+                        }
+                    }
+                }
+            }
         }
     }
 }

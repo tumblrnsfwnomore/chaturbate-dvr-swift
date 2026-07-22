@@ -1170,6 +1170,14 @@ private struct RecordingThumbnailView: View {
                         .font(.caption2)
                         .foregroundColor(.secondary)
                 }
+            } else if item.isActivelyFinalizing {
+                VStack(spacing: 8) {
+                    ProgressView()
+                        .controlSize(.small)
+                    Text("Finalizing...")
+                        .font(.caption2)
+                        .foregroundColor(.secondary)
+                }
             } else {
                 Image(systemName: "film")
                     .font(.system(size: 34, weight: .medium))
@@ -1202,6 +1210,11 @@ private struct RecordingThumbnailView: View {
 
             if item.isInProgress {
                 thumbnailImage = await loadImage(atPath: item.channelThumbnailPath)
+            } else if item.isActivelyFinalizing {
+                // Skip thumbnail generation for actively finalizing recordings to avoid blocking the UI
+                // Show placeholder instead until finalization completes
+                isLoading = false
+                return
             } else {
                 let generatedPath = await RecordingThumbnailStore.shared.thumbnailPath(for: item)
                 thumbnailImage = await RecordingThumbnailStore.shared.getDecodedImage(fromPath: generatedPath)
@@ -2034,12 +2047,14 @@ struct RecordingsLibraryView: View {
             let isActivelyFinalizing = entry.isFinalizing && activelyFinalizingPaths.contains(finalPath)
             let isMissing = !entry.isActive && !entry.isFinalizing && !finalExists && !workingExists
             // Active recordings use channel thumbnails; their working file is still open.
-            // Finalizing recordings have a complete source file — thumbnail from it.
+            // Finalizing recordings don't generate thumbnails to avoid blocking the UI during remux.
+            // Once finalization completes, thumbnails will be generated normally.
             let thumbnailSourcePath: String?
             if entry.isActive {
                 thumbnailSourcePath = nil
             } else if entry.isFinalizing {
-                thumbnailSourcePath = workingExists ? workingPath : (finalExists ? finalPath : nil)
+                // Skip thumbnail for finalizing recordings — will be generated after completion
+                thumbnailSourcePath = nil
             } else {
                 thumbnailSourcePath = finalExists ? finalPath : (workingExists ? workingPath : nil)
             }
@@ -3205,10 +3220,25 @@ struct ActivitySidebarView: View {
 
     private func setSleepMode(_ mode: SleepMode) {
         manager.appConfig.sleepMode = mode
-        if mode == .timer {
-            manager.appConfig.sleepTimerEndsAt = Int64(Date().timeIntervalSince1970) + Int64(max(1, manager.appConfig.sleepTimerMinutes)) * 60
-        } else {
+        switch mode {
+        case .off:
+            // Re-enable new recording starts
             manager.appConfig.sleepTimerEndsAt = nil
+            Task {
+                await manager.setAutoSleepQueueHold(false)
+            }
+        case .timer:
+            // Timer mode: set expiration and re-enable new recording starts
+            manager.appConfig.sleepTimerEndsAt = Int64(Date().timeIntervalSince1970) + Int64(max(1, manager.appConfig.sleepTimerMinutes)) * 60
+            Task {
+                await manager.setAutoSleepQueueHold(false)
+            }
+        case .auto:
+            // Auto mode: block new recording starts but allow existing to continue
+            manager.appConfig.sleepTimerEndsAt = nil
+            Task {
+                await manager.setAutoSleepQueueHold(true)
+            }
         }
         manager.saveAppConfig()
     }

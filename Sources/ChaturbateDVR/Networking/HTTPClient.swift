@@ -106,6 +106,15 @@ actor HTTPClient {
     private func buildRequest(url: URL) async -> URLRequest {
         var request = URLRequest(url: url)
         request.setValue("XMLHttpRequest", forHTTPHeaderField: "X-Requested-With")
+        
+        // Accept typical HLS media types (segments, playlists, init segments)
+        request.setValue("application/vnd.apple.mpegurl, application/x-mpegURL, video/mp2t, video/mp4, */*", forHTTPHeaderField: "Accept")
+        
+        // Force cache revalidation for media segment downloads to prevent CDN from serving
+        // stale error responses (e.g., "cache_expired" errors). Segment URLs have time-sensitive
+        // session tokens that may expire, and we need fresh validation on each request.
+        request.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        request.setValue("no-cache", forHTTPHeaderField: "Pragma")
 
         let userAgent = config.getUserAgent()
         if !userAgent.isEmpty {

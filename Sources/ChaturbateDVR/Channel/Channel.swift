@@ -407,11 +407,27 @@ private actor MP4Finalizer {
             return exportedDuration / sourceDuration
         }()
 
+        // For short videos (<120s), allow more lenient duration ratio check to avoid
+        // rejecting repairs of legitimately short clips that may suffer minor rounding
+        // losses during timestamp regeneration. Allow either 85% ratio OR within 2.5s loss.
+        let isShort = source.durationSeconds.map { $0 < 120 } ?? false
+        let effectiveDurationThreshold = isShort ? 0.85 : Self.minDurationRetentionRatio
+
         // If the finalized file preserves the playable duration, prefer it even
         // when the container shrinks dramatically. Some fragmented originals are
         // heavily bloated yet still export cleanly to a much smaller MP4.
-        if let durationRatio, durationRatio >= Self.minDurationRetentionRatio {
+        if let durationRatio, durationRatio >= effectiveDurationThreshold {
             return
+        }
+
+        // For short videos, also allow if absolute duration loss is small (< 2.5s)
+        if isShort, let sourceDuration = source.durationSeconds,
+           let exportedDuration = exported.durationSeconds,
+           sourceDuration > 0 {
+            let durationLoss = sourceDuration - exportedDuration
+            if durationLoss >= 0 && durationLoss < 2.5 {
+                return
+            }
         }
 
         if source.sizeBytes > 0 {
@@ -422,7 +438,7 @@ private actor MP4Finalizer {
         }
 
         if let durationRatio {
-            if durationRatio < Self.minDurationRetentionRatio {
+            if durationRatio < effectiveDurationThreshold {
                 throw ChaturbateError.fileError("Finalized duration too short (\(formatRatio(durationRatio)); keeping original)")
             }
         }
@@ -510,7 +526,9 @@ private actor MP4Finalizer {
     }
 
     private func runProcess(executablePath: String, arguments: [String]) async -> ProcessResult {
-        await withCheckedContinuation { continuation in
+        // Run process on utility queue with proper continuation resume on main thread
+        // IMPORTANT: Must resume on main thread to maintain actor isolation invariants
+        return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let process = Process()
                 process.executableURL = URL(fileURLWithPath: executablePath)
@@ -521,6 +539,7 @@ private actor MP4Finalizer {
                 process.standardOutput = stdoutPipe
                 process.standardError = stderrPipe
 
+                let result: ProcessResult
                 do {
                     try process.run()
                     process.waitUntilExit()
@@ -528,13 +547,18 @@ private actor MP4Finalizer {
                     let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
                     let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
 
-                    continuation.resume(returning: ProcessResult(
+                    result = ProcessResult(
                         status: process.terminationStatus,
                         stdout: String(decoding: stdoutData, as: UTF8.self),
                         stderr: String(decoding: stderrData, as: UTF8.self)
-                    ))
+                    )
                 } catch {
-                    continuation.resume(returning: ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription))
+                    result = ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+                }
+                
+                // Resume on main thread to preserve continuation safety and actor isolation
+                DispatchQueue.main.async {
+                    continuation.resume(returning: result)
                 }
             }
         }
@@ -618,6 +642,7 @@ actor Channel {
     private static let waitingStatusCheckIntervalSeconds: TimeInterval = 30
     private static let waitingPreviewMinInterval: TimeInterval = 120
     private static let waitingOfflineConfirmAttempts: Int = 3
+    private static let waitingTransientErrorThreshold: Int = 5  // Abort wait after too many transient errors
     private static let breakStaticMotionThreshold: Double = 0.003
     private static let breakLowMotionThreshold: Double = 0.015
     private static let breakAnalysisImageSize: Int = 64
@@ -629,7 +654,7 @@ actor Channel {
     private static let segmentTimelineMismatchMinClaimedSeconds: Double = 120
     private static let segmentTimelineMismatchMaxRatio: Double = 2.0
     private static let segmentTimelineMismatchRequiredEvents: Int = 3
-    private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 20
+    private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 45
     private static let minRolloverFragmentDurationSeconds: Double = 8.0
     private static let minRolloverFragmentSizeBytes = 256 * 1024
     private static let maxAudioLeadSeconds: Double = 0.75
@@ -677,6 +702,7 @@ actor Channel {
     private var isRefreshingPausedPreview: Bool = false
     private var isRefreshingWaitingPreview: Bool = false
     private var waitingOfflineProbeFailures: Int = 0
+    private var waitingTransientErrorCount: Int = 0  // Track non-offline errors while waiting for slot
     private var playbackOfflineProbeFailures: Int = 0
     private var pausedOnlineStickyUntil: Date?
     private var recentPreviewSegments: [PreviewSegmentChunk] = []
@@ -740,6 +766,12 @@ actor Channel {
     private var lastRecordingProgressPersistAt: Date = .distantPast
     private var isFirstCheck: Bool = true
     private var isInGlobalRecordingPauseMode: Bool = false
+    
+    // Audio/video sync diagnostics
+    private var audioVideoSyncDriftDetections: Int = 0 // Count of times audio lead exceeded threshold
+    private var audioVideoSyncSkippedSegments: Int = 0 // Audio segments skipped due to lead
+    private var maxAudioLeadObserved: Double = 0 // Maximum audio lead observed during session
+    private var lastSyncDiagnosticLogAt: Date = .distantPast
     
     init(
         config: ChannelConfig,
@@ -1391,8 +1423,12 @@ actor Channel {
                         waitTime = calculateExponentialBackoff(baseInterval: waitTime, blockCount: cloudflareBlockCount)
                         addLog("Blocked by Cloudflare (block #\(cloudflareBlockCount)). Using exponential backoff, trying again in \(formatWaitTime(waitTime))")
                     case .paused:
+                        // .paused can mean: (1) manual pause, (2) slot request timeout, or (3) recording globally paused.
+                        // All should add backoff to avoid rapid retry cycles.
                         isChecking = false
-                        break
+                        waitTime = max(waitTime, 30)  // Add minimum backoff on slot failure
+                        addLog("Slot request failed (timeout or unavailable). Retrying in \(formatWaitTime(waitTime))")
+                        cloudflareBlockCount = 0
                     default:
                         addLog("Error: \(cbError.localizedDescription). Retrying in \(formatWaitTime(waitTime))")
                         cloudflareBlockCount = 0
@@ -1624,6 +1660,7 @@ actor Channel {
         waitingForSlotStatusTask?.cancel()
         isWaitingForRecordingSlot = true
         waitingOfflineProbeFailures = 0
+        waitingTransientErrorCount = 0
         // We already confirmed stream availability before queueing for a slot.
         isOnline = true
         markLastOnlineNow()
@@ -1652,6 +1689,7 @@ actor Channel {
         waitingForSlotStatusTask = nil
         isWaitingForRecordingSlot = false
         waitingOfflineProbeFailures = 0
+        waitingTransientErrorCount = 0
         Task { [recordingCoordinator, username = config.username] in
             await recordingCoordinator.cancelPendingSlotRequest(for: username)
         }
@@ -1687,6 +1725,7 @@ actor Channel {
                     addLog("Waiting for slot: channel returned 404 (marked invalid)")
                 case .channelOffline, .privateStream, .authenticationRequired:
                     waitingOfflineProbeFailures += 1
+                    waitingTransientErrorCount = 0  // Reset transient counter on offline signals
                     if Self.shouldTreatWaitingProbeFailureAsOffline(
                         failureCount: waitingOfflineProbeFailures,
                         wasOnlineBeforeFailure: wasOnlineBeforeFailure
@@ -1694,10 +1733,49 @@ actor Channel {
                         endWaitingForSlotMonitoring()
                         markOfflineAndClearDegradedState()
                     }
-                default:
-                    // Keep previous online state for transient failures.
-                    waitingOfflineProbeFailures = 0
+                case .cloudflareBlocked, .networkError, .ageVerification, .parsingError:
+                    // Transient errors during waiting should be tracked separately.
+                    // If too many accumulate, abort the wait to prevent channel from being stuck.
+                    waitingTransientErrorCount += 1
+                    let logMessage: String
+                    switch cbError {
+                    case .cloudflareBlocked:
+                        logMessage = "Waiting for slot: Cloudflare block detected"
+                    case .networkError(let msg):
+                        logMessage = "Waiting for slot: Network error - \(msg)"
+                    case .ageVerification:
+                        logMessage = "Waiting for slot: Age verification required"
+                    case .parsingError(let msg):
+                        logMessage = "Waiting for slot: Parsing error - \(msg)"
+                    default:
+                        logMessage = "Waiting for slot: Transient error"
+                    }
+                    
+                    if waitingTransientErrorCount >= Self.waitingTransientErrorThreshold {
+                        addLog("\(logMessage) (attempt #\(waitingTransientErrorCount)) - aborting wait after too many transient failures")
+                        endWaitingForSlotMonitoring()
+                        markOfflineAndClearDegradedState()
+                    } else {
+                        addLog("\(logMessage) (attempt #\(waitingTransientErrorCount))")
+                    }
+                case .paused:
+                    // Channel was manually paused; let normal flow handle cleanup
                     break
+                default:
+                    // Other errors: reset both offline and transient counters, keep waiting
+                    waitingOfflineProbeFailures = 0
+                    waitingTransientErrorCount = 0
+                    break
+                }
+            } else {
+                // Non-ChaturbateError: treat as transient
+                waitingTransientErrorCount += 1
+                if waitingTransientErrorCount >= Self.waitingTransientErrorThreshold {
+                    addLog("Waiting for slot: Unknown error (attempt #\(waitingTransientErrorCount)) - aborting wait after too many transient failures")
+                    endWaitingForSlotMonitoring()
+                    markOfflineAndClearDegradedState()
+                } else {
+                    addLog("Waiting for slot: Unknown error (attempt #\(waitingTransientErrorCount)): \(error.localizedDescription)")
                 }
             }
 
@@ -1893,6 +1971,11 @@ actor Channel {
         var emptySegmentCount = 0
         
         while !Task.isCancelled && !config.isPaused && appConfig.recordingEnabled {
+            // Exit recording if break detection has been triggered (still frame, no person, etc)
+            if breakEnforced {
+                throw ChaturbateError.channelOffline
+            }
+            
             let content = try await withRequestSlot(priority: .high) {
                 try await httpClient.get(playlist.playlistURL)
             }
@@ -1929,14 +2012,25 @@ actor Channel {
                 let segmentURL = resolveSegmentURL(segment.uri, playlistURL: playlist.playlistURL)
                 
                 // Download segment with retry
-                let segmentData = try await downloadSegmentWithRetry(
-                    httpClient: httpClient,
-                    url: segmentURL,
-                    maxRetries: 3,
-                    priority: .high
-                )
-
-                try await handleSegment(data: segmentData, duration: segment.duration)
+                do {
+                    let segmentData = try await downloadSegmentWithRetry(
+                        httpClient: httpClient,
+                        url: segmentURL,
+                        maxRetries: 3,
+                        priority: .high
+                    )
+                    try await handleSegment(data: segmentData, duration: segment.duration)
+                } catch {
+                    // Check if this is a cache expiration error
+                    let errorDesc = error.localizedDescription.lowercased()
+                    if errorDesc.contains("cache_expired") || errorDesc.contains("w3:") {
+                        // Segment has expired from CDN cache; skip it and continue with next segment
+                        addLog("⚠️ Segment #\(seq) expired from CDN cache; skipping to maintain recording continuity")
+                        continue
+                    }
+                    // Other network errors should fail the recording
+                    throw error
+                }
             }
 
             if let audioPlaylistURL = activeAudioPlaylistURL {
@@ -1970,20 +2064,33 @@ actor Channel {
                     }
 
                     let segmentURL = resolveSegmentURL(segment.uri, playlistURL: audioPlaylistURL)
-                    let audioData = try await downloadSegmentWithRetry(
-                        httpClient: httpClient,
-                        url: segmentURL,
-                        maxRetries: 2,
-                        updateStreamHealth: false,
-                        priority: .high
-                    )
+                    
+                    do {
+                        let audioData = try await downloadSegmentWithRetry(
+                            httpClient: httpClient,
+                            url: segmentURL,
+                            maxRetries: 2,
+                            updateStreamHealth: false,
+                            priority: .high
+                        )
 
-                    let appended = try await handleAudioSegment(data: audioData, duration: segment.duration)
-                    if appended {
-                        lastAudioSeq = seq
-                    } else {
-                        // Keep this segment for the next polling cycle so audio stays aligned with video.
-                        break
+                        let appended = try await handleAudioSegment(data: audioData, duration: segment.duration)
+                        if appended {
+                            lastAudioSeq = seq
+                        } else {
+                            // Keep this segment for the next polling cycle so audio stays aligned with video.
+                            break
+                        }
+                    } catch {
+                        // Check if this is a cache expiration error
+                        let errorDesc = error.localizedDescription.lowercased()
+                        if errorDesc.contains("cache_expired") || errorDesc.contains("w3:") {
+                            // Audio segment has expired from CDN cache; skip it and continue with next segment
+                            addLog("⚠️ Audio segment #\(seq) expired from CDN cache; skipping")
+                            continue
+                        }
+                        // Other audio errors should fail the recording
+                        throw error
                     }
                 }
             }
@@ -1998,6 +2105,17 @@ actor Channel {
                 }
             } else {
                 emptySegmentCount = 0
+            }
+            
+            // Periodic audio/video sync diagnostics (every 30 seconds)
+            let now = Date()
+            if now.timeIntervalSince(lastSyncDiagnosticLogAt) >= 30 {
+                lastSyncDiagnosticLogAt = now
+                if activeAudioPlaylistURL != nil {
+                    let audioLead = currentAudioDuration - duration
+                    let syncStatus = audioLead > Self.maxAudioLeadSeconds ? "⚠️ DRIFT" : "✓"
+                    addLog("[sync-diag] \(syncStatus) Video: \(String(format: "%.1f", duration))s, Audio: \(String(format: "%.1f", currentAudioDuration))s, Lead: \(String(format: "%.2f", audioLead))s, Max: \(String(format: "%.2f", maxAudioLeadObserved))s, Drifts: \(audioVideoSyncDriftDetections)")
+                }
             }
             
             try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
@@ -2030,6 +2148,7 @@ actor Channel {
         priority: RequestPriority = .normal
     ) async throws -> Data {
         var lastError: Error?
+        var cacheExpiredDetected = false
         
         for attempt in 1...maxRetries {
             if Task.isCancelled || (!allowPaused && config.isPaused) {
@@ -2047,19 +2166,36 @@ actor Channel {
                 if updateStreamHealth {
                     noteSuccessfulSegmentDownload(attempt: attempt)
                 }
+                if cacheExpiredDetected && attempt > 1 {
+                    addLog("Segment recovered after cache expiration")
+                }
                 return data
             } catch {
                 if Task.isCancelled || (!allowPaused && config.isPaused) {
                     throw ChaturbateError.paused
                 }
+                
+                // Detect cache_expired errors and use longer backoff
+                let errorDesc = error.localizedDescription.lowercased()
+                if errorDesc.contains("cache_expired") || errorDesc.contains("w3:") {
+                    cacheExpiredDetected = true
+                }
+                
                 lastError = error
                 if updateStreamHealth {
                     degradedRecoveryStartedAt = nil
                 }
                 if updateStreamHealth, attempt < maxRetries {
-                    addLog("Segment download failed (attempt \(attempt)/\(maxRetries)); retrying")
+                    if cacheExpiredDetected {
+                        addLog("Segment download failed with cache expiration (attempt \(attempt)/\(maxRetries)); waiting 2s before retry")
+                    } else {
+                        addLog("Segment download failed (attempt \(attempt)/\(maxRetries)); retrying")
+                    }
                 }
-                try? await Task.sleep(nanoseconds: 600_000_000) // 600ms delay
+                
+                // Use longer delay for cache_expired errors to allow CDN/session revalidation
+                let delayNanoseconds: UInt64 = cacheExpiredDetected ? 2_000_000_000 : 600_000_000
+                try? await Task.sleep(nanoseconds: delayNanoseconds)
             }
         }
 
@@ -2155,17 +2291,22 @@ actor Channel {
     }
 
     private func suspiciousPayloadHint(_ data: Data) -> String? {
-        let preview = String(decoding: data.suffix(128), as: UTF8.self)
+        let preview = String(decoding: data.suffix(256), as: UTF8.self)
             .trimmingCharacters(in: .controlCharacters.union(.whitespacesAndNewlines))
 
         guard !preview.isEmpty else {
             return nil
         }
 
+        // Extract specific error codes (e.g., "w3: cache_expired", "1020", etc.)
+        if let errorMatch = preview.range(of: "w3:\\s*\\w+", options: .regularExpression) {
+            return String(preview[errorMatch])
+        }
+        
         if preview.localizedCaseInsensitiveContains("cache")
             || preview.localizedCaseInsensitiveContains("error")
             || preview.localizedCaseInsensitiveContains("html") {
-            return preview
+            return preview.prefix(100).trimmingCharacters(in: .whitespaces)
         }
 
         return nil
@@ -2374,8 +2515,29 @@ actor Channel {
 
         // Avoid muxing audio that runs ahead of the currently written video.
         // If audio is too far ahead, defer this segment and retry next cycle.
-        if (currentAudioDuration + duration) > (self.duration + Self.maxAudioLeadSeconds) {
+        let projectedAudioDuration = currentAudioDuration + duration
+        let videoWithLeadThreshold = self.duration + Self.maxAudioLeadSeconds
+        let audioLead = projectedAudioDuration - self.duration
+        
+        if audioLead > maxAudioLeadObserved {
+            maxAudioLeadObserved = audioLead
+        }
+        
+        if projectedAudioDuration > videoWithLeadThreshold {
+            audioVideoSyncSkippedSegments += 1
+            if audioVideoSyncSkippedSegments == 1 {
+                audioVideoSyncDriftDetections += 1
+                addLog("⚠️ Audio lead \(String(format: "%.2f", audioLead))s exceeds threshold (\(Self.maxAudioLeadSeconds)s); deferring audio segment #\(Int(currentAudioDuration)) for sync")
+            }
             return false
+        }
+        
+        // Reset drift counter when audio is back in sync
+        if audioVideoSyncSkippedSegments > 0 && audioLead <= (Self.maxAudioLeadSeconds * 0.5) {
+            if audioVideoSyncSkippedSegments > 1 {
+                addLog("✓ Audio sync recovered after deferring \(audioVideoSyncSkippedSegments) segments")
+            }
+            audioVideoSyncSkippedSegments = 0
         }
 
         if currentAudioFilesize == 0, let initData = activeAudioInitSegmentData {
@@ -2522,6 +2684,13 @@ actor Channel {
         activeRecordingFirstPersonDetectedAt = nil
         currentRecordingTimingSuspect = false
         currentRecordingTimingIssueReasons.removeAll(keepingCapacity: false)
+        
+        // Reset audio/video sync diagnostics for new file
+        audioVideoSyncDriftDetections = 0
+        audioVideoSyncSkippedSegments = 0
+        maxAudioLeadObserved = 0
+        lastSyncDiagnosticLogAt = .distantPast
+        
         lastRecordingProgressPersistAt = .distantPast
         activeRecordingID = await recordingLedger.startRecording(
             channelUsername: config.username,
@@ -2551,9 +2720,14 @@ actor Channel {
         let filesizeSnapshot = filesize
         let recordingTimingWasSuspect = currentRecordingTimingSuspect
         let recordingTimingIssueSummary = currentRecordingTimingIssueReasons.sorted().joined(separator: ",")
+        let audioVideoDriftDetectionsSnapshot = audioVideoSyncDriftDetections
+        let maxAudioLeadSnapshot = maxAudioLeadObserved
         let endedAt = Date()
         let recordingFinalizedCallback = self.onRecordingFinalized
         let terminationReason = currentRecordingTerminationReason()
+        
+        // Mark file for retiming if significant audio/video drift was detected
+        let shouldRetimeForSyncIssues = audioVideoSyncDriftDetections > 0 && activeAudioPlaylistURL != nil
 
         if let file = currentFile {
             do {
@@ -2613,6 +2787,16 @@ actor Channel {
         } else if shouldFinalizeMP4, let workingPath, let finalPath {
             let channelName = config.username
             let recordingLedger = self.recordingLedger
+            
+            // Log sync diagnostics before starting async work
+            if audioVideoDriftDetectionsSnapshot > 0 {
+                if shouldRetimeForSyncIssues {
+                    addLog("⚠️ Recording flagged for retime due to audio/video sync drift (sync_drifts=\(audioVideoDriftDetectionsSnapshot),max_audio_lead=\(String(format: "%.2f", maxAudioLeadSnapshot))s)")
+                } else {
+                    addLog("ℹ️ Audio/video sync diagnostics: sync_drifts=\(audioVideoDriftDetectionsSnapshot),max_audio_lead=\(String(format: "%.2f", maxAudioLeadSnapshot))s")
+                }
+            }
+            
             Task {
                 if let recordingID {
                     await recordingLedger.markFinalizing(recordingID: recordingID)
@@ -2622,7 +2806,7 @@ actor Channel {
                     audioSourcePath: usableAudioWorkingPath,
                     destinationPath: finalPath,
                     channel: channelName,
-                    preferRetimingOnFailure: recordingTimingWasSuspect
+                    preferRetimingOnFailure: recordingTimingWasSuspect || shouldRetimeForSyncIssues
                 ) { outcome in
                     guard let recordingID else { return }
                     Task {
@@ -2678,6 +2862,18 @@ actor Channel {
                                 level: "WARN",
                                 eventType: "retime_repair_applied",
                                 message: "Applied retime fallback after timing issues [timing=\(recordingTimingIssueSummary)]"
+                            )
+                        }
+                        
+                        // Log audio/video sync diagnostics in ledger
+                        if audioVideoDriftDetectionsSnapshot > 0 {
+                            let syncSummary = "sync_drifts=\(audioVideoDriftDetectionsSnapshot),max_audio_lead=\(String(format: "%.2f", maxAudioLeadSnapshot))s"
+                            let level = audioVideoDriftDetectionsSnapshot > 2 ? "WARN" : "INFO"
+                            await recordingLedger.appendEvent(
+                                recordingID: recordingID,
+                                level: level,
+                                eventType: "audio_video_sync_diagnostics",
+                                message: "[\(syncSummary)]"
                             )
                         }
                         recordingFinalizedCallback?(resolvedPath)

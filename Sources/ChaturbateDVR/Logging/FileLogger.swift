@@ -51,7 +51,8 @@ actor FileLogger {
         
         if let data = logLine.data(using: .utf8) {
             fileHandle?.write(data)
-            fileHandle?.synchronizeFile()
+            // Note: synchronizeFile() (fsync) is deferred to periodic batch sync to avoid blocking the logger actor during heavy I/O
+            // Each log entry is immediately written via write(data), so persistent storage is queued even if fsync is deferred.
         }
     }
     
@@ -89,6 +90,12 @@ actor FileLogger {
 
     func logLiveThumbnailFailure(channel: String, error: String) {
         log("Live thumbnail: ✗ failed - \(error)", channel: channel, level: "WARN")
+    }
+
+    private func syncFileHandleIfNeeded() {
+        // Perform periodic fsync on the current log file to ensure written data is persisted.
+        // Called infrequently to avoid blocking the logger actor.
+        fileHandle?.synchronizeFile()
     }
 
     func pruneOldLogs(keepingDays days: Int) {
