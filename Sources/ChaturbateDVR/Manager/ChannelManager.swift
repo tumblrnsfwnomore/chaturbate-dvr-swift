@@ -202,6 +202,41 @@ actor StatusCheckRateLimiter {
     }
 }
 
+/// Manages recording slots exclusively for manual "Record Now" requests.
+/// Manual recordings ALWAYS get their own slot immediately with no waiting.
+/// The slot is automatically retired when the recording finishes.
+actor ManualRecordingSlotManager {
+    private struct ActiveSlot {
+        let username: String
+        let slotID: UUID
+    }
+
+    private var activeSlots: [ActiveSlot] = []
+
+    /// Request a new slot for a manual recording.
+    /// Always succeeds immediately and returns a slot ID.
+    func acquireSlot(for username: String) -> UUID {
+        let slotID = UUID()
+        activeSlots.append(ActiveSlot(username: username, slotID: slotID))
+        return slotID
+    }
+
+    /// Release a manual recording slot.
+    func releaseSlot(slotID: UUID) {
+        activeSlots.removeAll { $0.slotID == slotID }
+    }
+
+    /// Get count of active manual recording slots.
+    func getActiveSlotCount() -> Int {
+        activeSlots.count
+    }
+
+    /// Get usernames currently recording manually.
+    func getActiveUsernames() -> [String] {
+        activeSlots.map { $0.username }
+    }
+}
+
 actor RecordingCoordinator {
     struct Stats {
         let activeRecordings: Int
@@ -209,7 +244,7 @@ actor RecordingCoordinator {
         let maxConcurrent: Int
     }
 
-    struct QueueSnapshot {
+    struct QueueSnapshot: Encodable {
         let activeUsernames: [String]
         let waitingUsernames: [String]
         let maxConcurrent: Int
@@ -286,8 +321,8 @@ actor RecordingCoordinator {
         resumeWaitingTasksIfPossible()
     }
 
-    func acquireSlot(for username: String) async -> Bool {
-        if recordingEnabled && !isManualHoldEnabled && (isUnlimited || activeRecordings < maxConcurrent) {
+    func acquireSlot(for username: String, forManualRecording: Bool = false) async -> Bool {
+        if (recordingEnabled || forManualRecording) && !isManualHoldEnabled && (isUnlimited || activeRecordings < maxConcurrent) {
             activeRecordings += 1
             activeCountsByUsername[username, default: 0] += 1
             return true
@@ -493,12 +528,16 @@ class ChannelManager: ObservableObject {
     private var lastPausedProbeDeferralLogAt: Date = .distantPast
     private var thumbnailBackfillIndex: Int = 0
     private var thumbnailBackfillCooldownUntil: [String: Date] = [:]
+    private var lastFilesystemReconciliationAt: Date = .distantPast
+    private let filesystemReconciliationInterval: TimeInterval = 5 * 60  // Reconcile every 5 minutes minimum
     private var newlyImportedChannels: Set<String> = []
     private let requestCoordinator: RequestCoordinator
     private let recordingRequestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
+    private let manualRecordingSlotManager: ManualRecordingSlotManager
     private let statusCheckRateLimiter: StatusCheckRateLimiter
     private let recordingLedger: RecordingLedger
+    
     private var backgroundWorkerLastHeartbeat: [BackgroundWorker: Date] = [:]
     private var activeBackgroundWorkerAlerts: Set<BackgroundWorker> = []
     private var webServer: WebServer?
@@ -535,6 +574,7 @@ class ChannelManager: ObservableObject {
         // never compete for slots with status checks and thumbnails
         recordingRequestCoordinator = RequestCoordinator(maxConcurrent: 8)
         recordingCoordinator = RecordingCoordinator(maxConcurrent: 0, staleWaitTimeoutSeconds: 90)
+        manualRecordingSlotManager = ManualRecordingSlotManager()
         statusCheckRateLimiter = StatusCheckRateLimiter()
         recordingLedger = RecordingLedger.shared
         let launchUnix = Int64(Date().timeIntervalSince1970)
@@ -805,6 +845,13 @@ class ChannelManager: ObservableObject {
         recordingRepairRootPath = rootPath
         recordingRepairCurrentPath = nil
         recordingRepairStopAfterCurrentItem = false
+        
+        // Preserve .failed states so files that already failed repair don't get re-queued
+        let preservedFailedStates = recordingRepairStates.filter { _, state in
+            if case .failed = state { return true }
+            return false
+        }
+        
         recordingRepairStates.removeAll(keepingCapacity: false)
         recordingRepairSummary = .empty
         isRecordingRepairScanActive = true
@@ -814,7 +861,7 @@ class ChannelManager: ObservableObject {
             guard let self else { return }
 
             let candidates = await Self.findAllMP4RepairCandidates(rootPath: rootPath)
-            await self.prepareRecordingRepairState(candidates: candidates)
+            await self.prepareRecordingRepairState(candidates: candidates, preservedFailedStates: preservedFailedStates)
 
             guard !Task.isCancelled else {
                 await self.finishRecordingRepairMaintenance()
@@ -962,6 +1009,19 @@ class ChannelManager: ObservableObject {
             }
 
             await self.finishRecordingRepairRun()
+        }
+    }
+
+    /// Allows manual retry of a failed repair by resetting its state back to .needsRemux.
+    /// This is useful if a repair failed but the user believes it might succeed on retry
+    /// (e.g., after system resources became available).
+    func retryFailedRepair(path: String) {
+        let currentState = recordingRepairStateRaw(for: path)
+        if case .failed = currentState {
+            setRecordingRepairState(.needsRemux, for: path)
+            Task {
+                await FileLogger.shared.log("[manager] manually retrying failed repair for \(URL(fileURLWithPath: path).lastPathComponent)")
+            }
         }
     }
 
@@ -1241,13 +1301,16 @@ class ChannelManager: ObservableObject {
         }
     }
 
-    private func prepareRecordingRepairState(candidates: [MP4RepairCandidate]) async {
+    private func prepareRecordingRepairState(candidates: [MP4RepairCandidate], preservedFailedStates: [String: RecordingRepairState] = [:]) async {
         let ledgerStatuses = await recordingLedger.fetchStatusByPath(paths: candidates.map(\ .path))
 
         var nextStates: [String: RecordingRepairState] = [:]
         nextStates.reserveCapacity(candidates.count)
         for candidate in candidates {
-            if let stateFromLedger = recordingRepairState(forLedgerStatus: ledgerStatuses[candidate.path]) {
+            // Preserve .failed states so files that already failed repair don't get re-queued
+            if let failedState = preservedFailedStates[candidate.path] {
+                nextStates[candidate.path] = failedState
+            } else if let stateFromLedger = recordingRepairState(forLedgerStatus: ledgerStatuses[candidate.path]) {
                 nextStates[candidate.path] = stateFromLedger
             } else if isAlreadyRepaired(candidate: candidate) {
                 nextStates[candidate.path] = .good
@@ -1521,6 +1584,7 @@ class ChannelManager: ObservableObject {
             requestCoordinator: requestCoordinator,
             recordingRequestCoordinator: recordingRequestCoordinator,
             recordingCoordinator: recordingCoordinator,
+            manualRecordingSlotManager: manualRecordingSlotManager,
             recordingLedger: recordingLedger,
             onRecordingFinalized: { [weak self] path in
                 Task { await self?.recordingDidFinalize(path: path) }
@@ -1551,7 +1615,7 @@ class ChannelManager: ObservableObject {
         }
 
         let normalizedConfig = ChannelConfig(
-            isPaused: config.isPaused,
+            isAutoRecordEnabled: config.isAutoRecordEnabled,
             username: sanitizedUsername,
             outputDirectory: config.outputDirectory,
             framerate: config.framerate,
@@ -1586,7 +1650,7 @@ class ChannelManager: ObservableObject {
         // Save immediately
         await saveConfig()
         
-        if !normalizedConfig.isPaused {
+        if normalizedConfig.isAutoRecordEnabled {
             await channel.resume()
         }
 
@@ -1622,6 +1686,38 @@ class ChannelManager: ObservableObject {
         await FileLogger.shared.log("[manager] channel resumed", channel: username)
     }
     
+    func requestManualRecording(username: String) async {
+        guard let channel = channels[username] else { return }
+        await channel.requestManualRecording()
+        await FileLogger.shared.log("[manager] manual recording requested", channel: username)
+    }
+    
+    func toggleAutoRecord(username: String) async {
+        guard let channel = channels[username] else { return }
+        await channel.toggleAutoRecord()
+        await saveConfig()
+        await FileLogger.shared.log("[manager] auto-record toggled", channel: username)
+    }
+    
+    func refreshChannelStatus(username: String) async {
+        guard let channel = channels[username] else { return }
+        await channel.refreshChannelStatus()
+    }
+    
+    func stopRecordingThisSession(username: String) async {
+        guard let channel = channels[username] else { return }
+        await channel.stopRecordingThisSession()
+        await FileLogger.shared.log("[manager] stop recording this session", channel: username)
+    }
+    
+    func remuxRecordingWithAudioSyncCorrection(username: String, fileURL: URL) async throws {
+        guard let channel = channels[username] else {
+            throw ChaturbateError.networkError("Channel \(username) not found")
+        }
+        try await channel.remuxWithAudioSyncCorrection(fileURL: fileURL)
+        await FileLogger.shared.log("[manager] remux with audio sync correction completed", channel: username)
+    }
+    
     func updateChannel(username: String, newConfig: ChannelConfig) async throws -> String {
         guard let channel = channels[username] else {
             await FileLogger.shared.log("[manager] update channel failed: not found", channel: username, level: "WARN")
@@ -1641,7 +1737,7 @@ class ChannelManager: ObservableObject {
             }
 
             let info = await channel.getInfo()
-            if info.isOnline && !info.isPaused {
+            if info.isOnline && info.isAutoRecordEnabled {
                 throw ChaturbateError.networkError("Cannot rename while recording. Pause the channel first")
             }
 
@@ -1656,7 +1752,7 @@ class ChannelManager: ObservableObject {
         }
 
         let updatedConfig = ChannelConfig(
-            isPaused: newConfig.isPaused,
+            isAutoRecordEnabled: newConfig.isAutoRecordEnabled,
             username: targetUsername,
             outputDirectory: newConfig.outputDirectory,
             framerate: newConfig.framerate,
@@ -1740,18 +1836,27 @@ class ChannelManager: ObservableObject {
         let channelConfigs = await getAllChannelConfigs()
         let repairedPaths = Set(repairedRecordingIndex.keys)
 
+        // Fast backfill from known channel directories (< 5 seconds typically)
         let backfill = await recordingLedger.backfillExistingRecordings(
             channelConfigs: channelConfigs,
             defaultOutputRoot: outputRoot,
             repairedPaths: repairedPaths
         )
-        let reconcile = await recordingLedger.reconcileFilesystem(rootPath: outputRoot)
 
-        if backfill.inserted > 0 || backfill.missingAdded > 0 || reconcile.moved > 0 || reconcile.recovered > 0 || reconcile.missing > 0 {
+        if backfill.inserted > 0 || backfill.missingAdded > 0 {
             await FileLogger.shared.log(
-                "[manager] recording library disk rescan: inserted=\(backfill.inserted), existing=\(backfill.skippedExisting), missingAdded=\(backfill.missingAdded), moved=\(reconcile.moved), missing=\(reconcile.missing), recovered=\(reconcile.recovered)"
+                "[manager] recording library backfill: inserted=\(backfill.inserted), existing=\(backfill.skippedExisting), missingAdded=\(backfill.missingAdded)"
             )
         }
+        
+        // Defer expensive filesystem reconciliation to background maintenance task
+        // to avoid blocking the UI on large libraries (reconciliation can take 30+ seconds)
+        scheduleBackgroundFilesystemReconciliation()
+    }
+    
+    private func scheduleBackgroundFilesystemReconciliation() {
+        // Ensure background maintenance is running, which will handle reconciliation
+        ensureRecordingRepairMaintenanceRunning()
     }
 
     func getRecordingDetail(path: String) async -> RecordingLedgerDetail? {
@@ -2039,7 +2144,15 @@ class ChannelManager: ObservableObject {
     func getAllChannelInfo() async -> [ChannelInfo] {
         var infos: [ChannelInfo] = []
         for (_, channel) in channels {
-            infos.append(await channel.getInfo())
+            let info = await channel.getInfo()
+            infos.append(info)
+            
+            // Check if channel just came online and refresh bio metadata
+            if await channel.checkAndResetOnlineTransition() {
+                Task.detached(priority: .utility) { [weak self] in
+                    await self?.refreshBioMetadata(username: info.username)
+                }
+            }
         }
 
         let queueSnapshot = await getRecordingQueueSnapshot()
@@ -2053,9 +2166,9 @@ class ChannelManager: ObservableObject {
             // 3: paused but online, 4: offline, 5: paused (offline)
             if info.isActivelyRecording { return 0 }
             if info.isWaitingForRecordingSlot { return 1 }
-            if info.isOnline && !info.isPaused { return 2 }
-            if info.isOnline && info.isPaused { return 3 }
-            if !info.isOnline && !info.isPaused { return 4 }
+            if info.isOnline && info.isAutoRecordEnabled { return 2 }
+            if info.isOnline && !info.isAutoRecordEnabled { return 3 }
+            if !info.isOnline && info.isAutoRecordEnabled { return 4 }
             return 5
         }
 
@@ -2089,6 +2202,9 @@ class ChannelManager: ObservableObject {
 
         let coordinatorStats = await requestCoordinator.getStats()
         let recordingStats = await recordingCoordinator.getStats()
+        let activeManualRecordings = sortedInfos.filter { $0.isActivelyRecording && $0.isManualRecording }.count
+        let activeAutomaticRecordings = sortedInfos.filter { $0.isActivelyRecording && !$0.isManualRecording }.count
+
         runtimeDiagnostics = RuntimeDiagnostics(
             activeRequests: coordinatorStats.activeRequests,
             queuedRequests: coordinatorStats.queuedRequests,
@@ -2101,7 +2217,9 @@ class ChannelManager: ObservableObject {
             cloudflareBlockedChannels: sortedInfos.filter { $0.cloudflareBlockCount > 0 }.count,
             activeRecordings: recordingStats.activeRecordings,
             queuedRecordings: recordingStats.queuedRecordings,
-            maxConcurrentRecordings: recordingStats.maxConcurrent
+            maxConcurrentRecordings: recordingStats.maxConcurrent,
+            activeManualRecordings: activeManualRecordings,
+            activeAutomaticRecordings: activeAutomaticRecordings
         )
 
         return sortedInfos
@@ -2121,7 +2239,7 @@ class ChannelManager: ObservableObject {
             let info = await channel.getInfo()
             guard info.isOnline,
                   info.isWaitingForRecordingSlot,
-                  !info.isPaused,
+                  info.isAutoRecordEnabled,
                   !info.isInvalid else {
                 continue
             }
@@ -2232,7 +2350,7 @@ class ChannelManager: ObservableObject {
             }
 
             let config = ChannelConfig(
-                isPaused: true,
+                isAutoRecordEnabled: false,
                 username: username,
                 outputDirectory: appConfig.outputDirectory,
                 framerate: appConfig.framerate,
@@ -2339,7 +2457,7 @@ class ChannelManager: ObservableObject {
             }
 
             let config = ChannelConfig(
-                isPaused: true,
+                isAutoRecordEnabled: false,
                 username: username,
                 outputDirectory: root,
                 framerate: appConfig.framerate,
@@ -2436,7 +2554,7 @@ class ChannelManager: ObservableObject {
                 let channel = makeChannel(config: config)
                 channels[config.username] = channel
                 
-                if !config.isPaused {
+                if config.isAutoRecordEnabled {
                     unpausedChannels.append(channel)
                 } else {
                     pausedChannels.append(channel)
@@ -2730,16 +2848,23 @@ class ChannelManager: ObservableObject {
 
             while !Task.isCancelled {
                 self.noteBackgroundWorkerHeartbeat(.ledgerMaintenance)
-                let reconcile = await self.recordingLedger.reconcileFilesystem(rootPath: self.appConfig.getOutputPath())
-                if reconcile.missing > 0 || reconcile.moved > 0 || reconcile.recovered > 0 {
-                    await FileLogger.shared.log(
-                        "[manager] recording ledger reconcile: checked=\(reconcile.checked), moved=\(reconcile.moved), missing=\(reconcile.missing), recovered=\(reconcile.recovered)",
-                        level: "WARN"
-                    )
+                
+                // Only reconcile if enough time has passed to avoid hammering the filesystem
+                let timeSinceLastReconciliation = Date().timeIntervalSince(self.lastFilesystemReconciliationAt)
+                if timeSinceLastReconciliation >= self.filesystemReconciliationInterval {
+                    let reconcile = await self.recordingLedger.reconcileFilesystem(rootPath: self.appConfig.getOutputPath())
+                    self.lastFilesystemReconciliationAt = Date()
+                    
+                    if reconcile.missing > 0 || reconcile.moved > 0 || reconcile.recovered > 0 {
+                        await FileLogger.shared.log(
+                            "[manager] recording ledger reconcile: checked=\(reconcile.checked), moved=\(reconcile.moved), missing=\(reconcile.missing), recovered=\(reconcile.recovered)",
+                            level: "WARN"
+                        )
+                    }
                 }
                 self.noteBackgroundWorkerHeartbeat(.ledgerMaintenance)
 
-                try? await Task.sleep(nanoseconds: 3 * 60 * 1_000_000_000)
+                try? await Task.sleep(nanoseconds: 30 * 1_000_000_000)  // Check every 30 seconds
             }
         }
     }
@@ -3003,7 +3128,8 @@ class ChannelManager: ObservableObject {
         var pausedChannels: [(String, Channel)] = []
 
         for (username, channel) in channels {
-            if await channel.config.isPaused {
+            let isAutoRecordEnabled = await channel.config.isAutoRecordEnabled
+            if !isAutoRecordEnabled {
                 pausedChannels.append((username, channel))
             }
         }
@@ -3088,6 +3214,37 @@ class ChannelManager: ObservableObject {
             self.appConfig.recordingEnabled = enabled
             self.saveAppConfig()
             await FileLogger.shared.log("[manager] recording globally \(enabled ? "enabled" : "disabled") via web interface")
+        }
+        server.requestManualRecordingAction = { [weak self] username in
+            guard let self else { return }
+            await self.requestManualRecording(username: username)
+        }
+        server.stopRecordingAction = { [weak self] username in
+            guard let self else { return }
+            await self.stopRecordingThisSession(username: username)
+        }
+        server.toggleAutoRecordAction = { [weak self] username in
+            guard let self else { return }
+            await self.toggleAutoRecord(username: username)
+        }
+        server.getRecordingQueueSnapshot = { [weak self] in
+            guard let self else { return RecordingCoordinator.QueueSnapshot(activeUsernames: [], waitingUsernames: [], maxConcurrent: 1, recordingEnabled: true, isManualHoldEnabled: false) }
+            return await self.getRecordingQueueSnapshot()
+        }
+        server.applyManualRecordingQueueAction = { [weak self] plan in
+            guard let self else { return }
+            await self.applyManualRecordingQueue(
+                waitingOrder: plan.waitingOrder,
+                rotateOutRecordings: plan.rotateOutRecordings,
+                releaseHoldAfterApply: plan.releaseHoldAfterApply
+            )
+        }
+        server.updateMaxConcurrentRecordingsAction = { [weak self] max in
+            guard let self else { return }
+            self.appConfig.maxConcurrentRecordings = max
+            self.saveAppConfig()
+            await self.recordingCoordinator.updateMaxConcurrent(max)
+            await FileLogger.shared.log("[manager] updated max concurrent recordings to \(max) via web interface")
         }
 
         do {

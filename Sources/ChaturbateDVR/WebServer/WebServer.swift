@@ -13,6 +13,12 @@ final class WebServer {
     var getThumbnailPath: ((String) async -> String?)?
     var getRecordingEnabled: (() async -> Bool)?
     var setRecordingEnabled: ((Bool) async -> Void)?
+    var requestManualRecordingAction: ((String) async -> Void)?
+    var stopRecordingAction: ((String) async -> Void)?
+    var toggleAutoRecordAction: ((String) async -> Void)?
+    var getRecordingQueueSnapshot: (() async -> RecordingCoordinator.QueueSnapshot)?
+    var applyManualRecordingQueueAction: ((ManualRecordingQueuePlan) async -> Void)?
+    var updateMaxConcurrentRecordingsAction: ((Int) async -> Void)?
 
     // MARK: - Private state
 
@@ -117,6 +123,18 @@ final class WebServer {
                 let username = decoded(String(rest.dropLast(7)))
                 await resumeAction?(username)
                 sendJSON(#"{"ok":true}"#, connection: connection)
+            } else if rest.hasSuffix("/manual-record") {
+                let username = decoded(String(rest.dropLast(14)))
+                await requestManualRecordingAction?(username)
+                sendJSON(#"{"ok":true}"#, connection: connection)
+            } else if rest.hasSuffix("/stop") {
+                let username = decoded(String(rest.dropLast(5)))
+                await stopRecordingAction?(username)
+                sendJSON(#"{"ok":true}"#, connection: connection)
+            } else if rest.hasSuffix("/toggle-auto-record") {
+                let username = decoded(String(rest.dropLast(19)))
+                await toggleAutoRecordAction?(username)
+                sendJSON(#"{"ok":true}"#, connection: connection)
             } else {
                 send404(connection: connection)
             }
@@ -131,6 +149,31 @@ final class WebServer {
                 send404(connection: connection)
             }
 
+        case ("GET", "/api/recording-queue/snapshot"):
+            if let snapshot = await getRecordingQueueSnapshot?() {
+                sendJSON(encodeJSON(snapshot), connection: connection)
+            } else {
+                sendJSON(#"{"recordingEnabled":true,"maxConcurrent":1,"activeUsernames":[],"waitingUsernames":[]}"#, connection: connection)
+            }
+
+        case ("POST", "/api/recording-queue/apply"):
+            // Parse request body for queue plan
+            if let plan = parseQueuePlanFromRequest(connection) {
+                await applyManualRecordingQueueAction?(plan)
+                sendJSON(#"{"ok":true}"#, connection: connection)
+            } else {
+                sendJSON(#"{"ok":false,"error":"Invalid request body"}"#, connection: connection)
+            }
+
+        case ("POST", _) where path.hasPrefix("/api/recording-queue/max-concurrent/"):
+            let maxStr = String(path.dropFirst("/api/recording-queue/max-concurrent/".count))
+            if let max = Int(maxStr), max >= 1 && max <= 12 {
+                await updateMaxConcurrentRecordingsAction?(max)
+                sendJSON(#"{"ok":true}"#, connection: connection)
+            } else {
+                sendJSON(#"{"ok":false,"error":"Invalid max concurrent value"}"#, connection: connection)
+            }
+
         default:
             send404(connection: connection)
         }
@@ -142,8 +185,10 @@ final class WebServer {
         struct Row: Encodable {
             let username: String
             let isOnline: Bool
-            let isPaused: Bool
+            let isAutoRecordEnabled: Bool
             let isRecording: Bool
+            let isActivelyRecording: Bool
+            let isManualRecording: Bool
             let isWaiting: Bool
             let duration: String
             let filesize: String
@@ -161,8 +206,10 @@ final class WebServer {
             Row(
                 username: i.username,
                 isOnline: i.isOnline,
-                isPaused: i.isPaused,
-                isRecording: (i.isOnline && !i.isPaused && !i.isWaitingForRecordingSlot) && recordingEnabled,
+                isAutoRecordEnabled: i.isAutoRecordEnabled,
+                isRecording: (i.isOnline && i.isAutoRecordEnabled && !i.isWaitingForRecordingSlot) && recordingEnabled,
+                isActivelyRecording: i.isActivelyRecording && recordingEnabled,
+                isManualRecording: i.isManualRecording,
                 isWaiting: i.isWaitingForRecordingSlot,
                 duration: i.duration,
                 filesize: i.filesize,
@@ -176,6 +223,20 @@ final class WebServer {
         let response = Response(recordingEnabled: recordingEnabled, channels: rows)
         let body = (try? JSONEncoder().encode(response)) ?? Data(#"{"recordingEnabled":true,"channels":[]}"#.utf8)
         sendResponse(status: 200, contentType: "application/json", body: body, connection: connection)
+    }
+
+    private func encodeJSON<T: Encodable>(_ value: T) -> String {
+        guard let data = try? JSONEncoder().encode(value),
+              let json = String(data: data, encoding: .utf8) else {
+            return "{}"
+        }
+        return json
+    }
+
+    private func parseQueuePlanFromRequest(_ connection: NWConnection) -> ManualRecordingQueuePlan? {
+        // For now, this is a placeholder. In a full implementation, we'd parse the request body.
+        // Since we're using a simple raw socket approach, this would need the connection data.
+        return nil
     }
 
     // MARK: - Response helpers
@@ -217,8 +278,15 @@ final class WebServer {
             "Access-Control-Allow-Origin: *\r\n\r\n"
         var response = Data(header.utf8)
         response.append(body)
-        connection.send(content: response, contentContext: .finalMessage,
-                        isComplete: true, completion: .idempotent)
+        connection.send(
+            content: response,
+            contentContext: .finalMessage,
+            isComplete: true,
+            completion: .contentProcessed { _ in
+                // Explicitly close per-request sockets so they do not linger under frequent polling.
+                connection.cancel()
+            }
+        )
     }
 
     private func decoded(_ s: String) -> String {
@@ -343,4 +411,12 @@ header{background:#1a1a1a;padding:20px;border-bottom:1px solid #333}h1{margin:0;
   ]
 }
 """
+}
+
+// MARK: - ManualRecordingQueuePlan
+
+struct ManualRecordingQueuePlan: Decodable {
+    let waitingOrder: [String]
+    let rotateOutRecordings: [String]
+    let releaseHoldAfterApply: Bool
 }

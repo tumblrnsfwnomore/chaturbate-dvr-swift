@@ -74,6 +74,7 @@ final class RecordingCoordinatorTests: XCTestCase {
         let requestCoordinator = RequestCoordinator(maxConcurrent: 2)
         let recordingRequestCoordinator = RequestCoordinator(maxConcurrent: 8)
         let recordingCoordinator = RecordingCoordinator(maxConcurrent: 1)
+        let manualRecordingSlotManager = ManualRecordingSlotManager()
         let recordingLedger = RecordingLedger()
 
         let channel = Channel(
@@ -82,6 +83,7 @@ final class RecordingCoordinatorTests: XCTestCase {
             requestCoordinator: requestCoordinator,
             recordingRequestCoordinator: recordingRequestCoordinator,
             recordingCoordinator: recordingCoordinator,
+            manualRecordingSlotManager: manualRecordingSlotManager,
             recordingLedger: recordingLedger
         )
 
@@ -98,10 +100,24 @@ final class RecordingCoordinatorTests: XCTestCase {
             requestCoordinator: requestCoordinator,
             recordingRequestCoordinator: recordingRequestCoordinator,
             recordingCoordinator: recordingCoordinator,
+            manualRecordingSlotManager: manualRecordingSlotManager,
             recordingLedger: recordingLedger
         )
         let freshInfo = await freshChannel.getInfo()
         XCTAssertFalse(freshInfo.isManualBreakOverrideActive)
+    }
+
+    func testAudioSyncRepairAppliesObservedAudioDelayForRetime() {
+        let observedDelay = 0.875
+
+        let filter = Channel.buildRetimedAudioFilter(
+            audioInputIndex: 1,
+            tempoAdjustment: nil,
+            audioDelaySeconds: observedDelay
+        )
+
+        XCTAssertTrue(filter.contains("adelay=875|875"))
+        XCTAssertTrue(filter.contains("aresample=async=1:first_pts=0"))
     }
 
     func testRecordingsLibrarySkipsImmediateDiskRescanWhenCachedDataIsFresh() {

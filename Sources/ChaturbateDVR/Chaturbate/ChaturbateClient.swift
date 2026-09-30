@@ -1086,7 +1086,103 @@ actor ChaturbateClient {
             return nil
         }
 
-        return trimmed
+        // Decode HTML entities
+        let decoded = decodeHTMLEntities(trimmed)
+        return decoded
+    }
+
+    private func decodeHTMLEntities(_ string: String) -> String {
+        var result = string
+        
+        // Common HTML entities
+        let entities: [String: String] = [
+            "&lt;" : "<",
+            "&gt;" : ">",
+            "&amp;" : "&",
+            "&quot;" : "\"",
+            "&#34;" : "\"",
+            "&#39;" : "'",
+            "&#x27;" : "'",
+            "&apos;" : "'",
+            "&nbsp;" : " ",
+            "&iexcl;" : "¡",
+            "&iquest;" : "¿",
+            "&cent;" : "¢",
+            "&pound;" : "£",
+            "&yen;" : "¥",
+            "&euro;" : "€",
+            "&copy;" : "©",
+            "&reg;" : "®",
+            "&deg;" : "°",
+            "&times;" : "×",
+            "&divide;" : "÷",
+            "&plusmn;" : "±",
+            "&frac14;" : "¼",
+            "&frac12;" : "½",
+            "&frac34;" : "¾",
+            "&ldquo;" : "\u{201C}",
+            "&rdquo;" : "\u{201D}",
+            "&lsquo;" : "\u{2018}",
+            "&rsquo;" : "\u{2019}",
+            "&mdash;" : "—",
+            "&ndash;" : "–",
+            "&hellip;" : "…",
+            "&lsaquo;" : "‹",
+            "&rsaquo;" : "›",
+        ]
+        
+        for (entity, character) in entities {
+            result = result.replacingOccurrences(of: entity, with: character)
+        }
+        
+        // Handle numeric entities like &#123; and &#xAB;
+        result = decodeNumericEntities(result)
+        
+        return result
+    }
+
+    private func decodeNumericEntities(_ string: String) -> String {
+        var result = string
+        
+        // Handle decimal entities &#123;
+        let decimalPattern = "&#(\\d+);"
+        if let regex = try? NSRegularExpression(pattern: decimalPattern, options: []) {
+            let nsString = result as NSString
+            let matches = regex.matches(in: result, options: [], range: NSRange(location: 0, length: nsString.length))
+            
+            // Process matches in reverse to maintain correct ranges
+            for match in matches.reversed() {
+                if match.numberOfRanges >= 2,
+                   let range = Range(match.range(at: 1), in: result),
+                   let codePoint = Int(String(result[range])),
+                   let scalar = UnicodeScalar(codePoint) {
+                    let character = String(Character(scalar))
+                    let fullRange = Range(match.range, in: result)!
+                    result.replaceSubrange(fullRange, with: character)
+                }
+            }
+        }
+        
+        // Handle hexadecimal entities &#xAB;
+        let hexPattern = "&#x([0-9a-fA-F]+);"
+        if let regex = try? NSRegularExpression(pattern: hexPattern, options: []) {
+            let nsString = result as NSString
+            let matches = regex.matches(in: result, options: [], range: NSRange(location: 0, length: nsString.length))
+            
+            // Process matches in reverse to maintain correct ranges
+            for match in matches.reversed() {
+                if match.numberOfRanges >= 2,
+                   let range = Range(match.range(at: 1), in: result),
+                   let codePoint = Int(String(result[range]), radix: 16),
+                   let scalar = UnicodeScalar(codePoint) {
+                    let character = String(Character(scalar))
+                    let fullRange = Range(match.range, in: result)!
+                    result.replaceSubrange(fullRange, with: character)
+                }
+            }
+        }
+        
+        return result
     }
 
     private func extractLanguageFromInitialRoomDossier(_ html: String) -> String? {

@@ -2,6 +2,7 @@ import SwiftUI
 import AppKit
 import AVKit
 import AVFoundation
+import ImageIO
 
 private enum DetailTab: String {
     case allChannels
@@ -15,6 +16,7 @@ enum ChannelStatusFilter: String, CaseIterable, Identifiable {
     case online = "Online"
     case recording = "Recording"
     case paused = "Paused"
+    case autoRecordEnabled = "Auto Record"
     case limitReached = "Limit Reached"
     case offline = "Offline"
     case invalid = "Invalid"
@@ -97,6 +99,13 @@ struct ContentView: View {
     @State private var statusFilter: ChannelStatusFilter = .all
     @State private var genderFilter: String? = nil
     @State private var detailNavigationOrder: [String] = []
+    @State private var recordingsSearchText: String = ""
+    @State private var recordingsSelectedChannelFilter: String = "All Channels"
+    @State private var recordingsIsDateFilterEnabled: Bool = false
+    @State private var recordingsSelectedDateFilter: Date = Date()
+    @State private var recordingsRepairFilter: RecordingRepairFilter = .all
+    @State private var recordingsSortOption: RecordingSortOption = .newest
+    @State private var recordingsCurrentPage: Int = 0
     
     var body: some View {
         NavigationSplitView {
@@ -260,6 +269,13 @@ struct ContentView: View {
             RecordingsLibraryView(
                 manager: manager,
                 refreshGeneration: recordingsRefreshGeneration,
+                searchText: $recordingsSearchText,
+                selectedChannelFilter: $recordingsSelectedChannelFilter,
+                isDateFilterEnabled: $recordingsIsDateFilterEnabled,
+                selectedDateFilter: $recordingsSelectedDateFilter,
+                repairFilter: $recordingsRepairFilter,
+                sortOption: $recordingsSortOption,
+                currentPage: $recordingsCurrentPage,
                 onOpenRecording: { path, channelUsername, navigationPaths in
                     selectedChannel = channelUsername
                     selectedRecordingPath = path
@@ -336,6 +352,10 @@ struct ContentView: View {
                     recordingNavigationPaths = navigationPaths
                     lastNonRecordingDetailTab = .channel
                     selectedDetailTab = .recording
+                },
+                onViewAllRecordings: {
+                    recordingsSelectedChannelFilter = username
+                    selectedDetailTab = .recordings
                 }
             )
             .id(username)
@@ -417,6 +437,7 @@ struct AllChannelsGridView: View {
         let online: Int
         let recording: Int
         let paused: Int
+        let autoRecordEnabled: Int
         let limitReached: Int
         let offline: Int
         let invalid: Int
@@ -484,6 +505,9 @@ struct AllChannelsGridView: View {
                             }
                             countChip("Paused", count: statusCounts.paused, tint: .orange) {
                                 statusFilter = .paused
+                            }
+                            countChip("Auto Record", count: statusCounts.autoRecordEnabled, tint: .blue) {
+                                statusFilter = .autoRecordEnabled
                             }
                             countChip("Limit Reached", count: statusCounts.limitReached, tint: .yellow) {
                                 statusFilter = .limitReached
@@ -603,6 +627,7 @@ struct AllChannelsGridView: View {
             online: channelInfos.filter { matchesStatusFilter($0, filter: .online) }.count,
             recording: channelInfos.filter { matchesStatusFilter($0, filter: .recording) }.count,
             paused: channelInfos.filter { matchesStatusFilter($0, filter: .paused) }.count,
+            autoRecordEnabled: channelInfos.filter { matchesStatusFilter($0, filter: .autoRecordEnabled) }.count,
             limitReached: channelInfos.filter { matchesStatusFilter($0, filter: .limitReached) }.count,
             offline: channelInfos.filter { matchesStatusFilter($0, filter: .offline) }.count,
             invalid: channelInfos.filter { matchesStatusFilter($0, filter: .invalid) }.count
@@ -618,11 +643,13 @@ struct AllChannelsGridView: View {
         case .recording:
             return info.isActivelyRecording && !info.isInvalid
         case .paused:
-            return info.isPaused && !info.isPausedBySessionLimit && !info.isInvalid
+            return info.isOnline && !info.isAutoRecordEnabled && !info.isPausedBySessionLimit && !info.isInvalid
+        case .autoRecordEnabled:
+            return info.isAutoRecordEnabled && !info.isInvalid
         case .limitReached:
             return info.isPausedBySessionLimit && !info.isInvalid
         case .offline:
-            return !info.isOnline && !info.isPaused && !info.isPausedBySessionLimit && !info.isInvalid
+            return !info.isOnline && !info.isPausedBySessionLimit && !info.isInvalid
         case .invalid:
             return info.isInvalid
         }
@@ -922,7 +949,7 @@ private struct ManualQueuePlannerSheet: View {
     }
 }
 
-private enum RecordingSortOption: String, CaseIterable, Identifiable {
+enum RecordingSortOption: String, CaseIterable, Identifiable {
     case newest = "Newest"
     case oldest = "Oldest"
     case largest = "Largest"
@@ -965,19 +992,33 @@ private struct RecordingLibraryItem: Identifiable {
     }
 }
 
+@available(macOS 13.0, *)
 private actor RecordingThumbnailStore {
     static let shared = RecordingThumbnailStore()
+    private enum MemoryPressureLevel {
+        case warning
+        case critical
+    }
 
     private var inFlight: [String: Task<String?, Never>] = [:]
     private var lastFailureAt: [String: Date] = [:]
+    private let maxFailureEntries = 2000
     private let failureRetryInterval: TimeInterval = 300
     private let fileManager = FileManager.default
     private let cacheDirectory: URL
+    private let memoryPressureSource: DispatchSourceMemoryPressure
     
-    // In-memory LRU cache for decoded images (max 64 images)
+    // Keep decoded cache modest for 8 GB systems.
     private var imageCache: [String: NSImage] = [:]
     private var imageCacheOrder: [String] = []
-    private let maxCachedImages: Int = 64
+    private let maxCachedImages: Int = 96
+    private let warningCachedImages: Int = 48
+    private let criticalCachedImages: Int = 16
+    private let decodeThumbnailMaxPixelSize: Int = 640
+    
+    // Limit concurrent image decode operations to prevent main-thread blocking
+    private let concurrentDecodeLimit = 2
+    private var activeDecode: Int = 0
 
     init() {
         let cachesRoot = fileManager.urls(for: .cachesDirectory, in: .userDomainMask).first
@@ -986,13 +1027,30 @@ private actor RecordingThumbnailStore {
             .appendingPathComponent("ChaturbateDVR", isDirectory: true)
             .appendingPathComponent("recording-card-thumbnails", isDirectory: true)
 
+        memoryPressureSource = DispatchSource.makeMemoryPressureSource(
+            eventMask: [.warning, .critical],
+            queue: DispatchQueue.global(qos: .utility)
+        )
+
         try? fileManager.createDirectory(at: cacheDirectory, withIntermediateDirectories: true)
+
+        memoryPressureSource.setEventHandler { [weak self, weak memoryPressureSource] in
+            guard let source = memoryPressureSource else { return }
+            let events = source.data
+            let level: MemoryPressureLevel = events.contains(.critical) ? .critical : .warning
+            Task {
+                await self?.handleMemoryPressure(level: level)
+            }
+        }
+        memoryPressureSource.resume()
     }
 
     func thumbnailPath(for item: RecordingLibraryItem) async -> String? {
         guard let sourcePathRaw = item.thumbnailSourcePath else {
             return nil
         }
+
+        pruneFailureCacheIfNeeded()
 
         let cacheKey = item.thumbnailCacheKey
         let destinationURL = cacheDirectory.appendingPathComponent("\(Self.stableHash(cacheKey)).jpg")
@@ -1011,7 +1069,7 @@ private actor RecordingThumbnailStore {
         }
 
         let sourcePath = (sourcePathRaw as NSString).expandingTildeInPath
-        let task = Task.detached(priority: .utility) {
+        let task = Task.detached(priority: .userInitiated) {
             Self.generateThumbnail(sourcePath: sourcePath, destinationURL: destinationURL)
         }
         inFlight[cacheKey] = task
@@ -1048,12 +1106,25 @@ private actor RecordingThumbnailStore {
         let expandedPath = (path as NSString).expandingTildeInPath
         let fileURL = URL(fileURLWithPath: expandedPath)
 
+        // Respect decode concurrency limit to prevent main-thread blocking during scroll
+        while activeDecode >= concurrentDecodeLimit {
+            // Yield while waiting for a slot to open
+            await Task.yield()
+        }
+        
+        activeDecode += 1
+        defer { activeDecode -= 1 }
+
+        // Read file data on background thread
         let data = await Task.detached(priority: .utility) {
             try? Data(contentsOf: fileURL, options: [.mappedIfSafe])
         }.value
 
-        guard let data, let image = NSImage(data: data) else { return nil }
+        guard let data else { return nil }
 
+        let image = Self.decodeThumbnailImage(from: data, maxPixelSize: decodeThumbnailMaxPixelSize)
+
+        guard let image else { return nil }
         cacheDecodedImage(image, forPath: path)
         return image
     }
@@ -1070,7 +1141,8 @@ private actor RecordingThumbnailStore {
             }
         }
 
-        if imageCacheOrder.count > maxCachedImages {
+        // Maintain LRU cache with expanded size
+        while imageCacheOrder.count > maxCachedImages {
             if let lruPath = imageCacheOrder.first {
                 imageCacheOrder.removeFirst()
                 imageCache.removeValue(forKey: lruPath)
@@ -1083,6 +1155,48 @@ private actor RecordingThumbnailStore {
             imageCacheOrder.remove(at: index)
             imageCacheOrder.append(path)
         }
+    }
+
+    private func pruneFailureCacheIfNeeded() {
+        guard lastFailureAt.count > maxFailureEntries else { return }
+        let cutoff = Date().addingTimeInterval(-failureRetryInterval)
+        lastFailureAt = lastFailureAt.filter { _, date in
+            date >= cutoff
+        }
+    }
+
+    private func handleMemoryPressure(level: MemoryPressureLevel) {
+        switch level {
+        case .warning:
+            trimDecodedCache(to: warningCachedImages)
+        case .critical:
+            trimDecodedCache(to: criticalCachedImages)
+        }
+    }
+
+    private func trimDecodedCache(to keepCount: Int) {
+        let target = max(0, keepCount)
+        while imageCacheOrder.count > target {
+            let lruPath = imageCacheOrder.removeFirst()
+            imageCache.removeValue(forKey: lruPath)
+        }
+    }
+
+    private nonisolated static func decodeThumbnailImage(from data: Data, maxPixelSize: Int) -> NSImage? {
+        guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+            return nil
+        }
+
+        let options: [CFString: Any] = [
+            kCGImageSourceCreateThumbnailFromImageAlways: true,
+            kCGImageSourceCreateThumbnailWithTransform: true,
+            kCGImageSourceThumbnailMaxPixelSize: maxPixelSize
+        ]
+
+        guard let cgImage = CGImageSourceCreateThumbnailAtIndex(source, 0, options as CFDictionary) else {
+            return nil
+        }
+        return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 
     private nonisolated static func generateThumbnail(sourcePath: String, destinationURL: URL) -> String? {
@@ -1111,7 +1225,7 @@ private actor RecordingThumbnailStore {
             }
 
             let bitmap = NSBitmapImageRep(cgImage: cgImage)
-            guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.72]) else {
+            guard let data = bitmap.representation(using: .jpeg, properties: [.compressionFactor: 0.68]) else {
                 continue
             }
 
@@ -1141,6 +1255,7 @@ private struct RecordingThumbnailView: View {
 
     @State private var thumbnailImage: NSImage?
     @State private var isLoading = false
+    @State private var lastLoadedCacheKey: String?
 
     var body: some View {
         ZStack {
@@ -1205,16 +1320,24 @@ private struct RecordingThumbnailView: View {
             }
         }
         .task(id: item.thumbnailCacheKey) {
+            // Skip if cache key hasn't actually changed (e.g., only isActivelyFinalizing changed)
+            let currentKey = item.thumbnailCacheKey
+            if lastLoadedCacheKey == currentKey {
+                return
+            }
+            
+            lastLoadedCacheKey = currentKey
             isLoading = true
             thumbnailImage = nil
 
-            if item.isInProgress {
-                thumbnailImage = await loadImage(atPath: item.channelThumbnailPath)
-            } else if item.isActivelyFinalizing {
-                // Skip thumbnail generation for actively finalizing recordings to avoid blocking the UI
-                // Show placeholder instead until finalization completes
+            // Don't load thumbnails for actively finalizing recordings - show placeholder instead
+            if item.isActivelyFinalizing {
                 isLoading = false
                 return
+            }
+
+            if item.isInProgress {
+                thumbnailImage = await loadImage(atPath: item.channelThumbnailPath)
             } else {
                 let generatedPath = await RecordingThumbnailStore.shared.thumbnailPath(for: item)
                 thumbnailImage = await RecordingThumbnailStore.shared.getDecodedImage(fromPath: generatedPath)
@@ -1239,7 +1362,7 @@ private struct RecordingThumbnailView: View {
     }
 }
 
-private enum RecordingRepairFilter: Equatable {
+enum RecordingRepairFilter: Equatable {
     case all
     case missing
     case durationMismatch
@@ -1350,14 +1473,22 @@ struct RecordingsLibraryView: View {
 
     @ObservedObject var manager: ChannelManager
     let refreshGeneration: Int
+    @Binding var searchText: String
+    @Binding var selectedChannelFilter: String
+    @Binding var isDateFilterEnabled: Bool
+    @Binding var selectedDateFilter: Date
+    @Binding var repairFilter: RecordingRepairFilter
+    @Binding var sortOption: RecordingSortOption
+    @Binding var currentPage: Int
     var onOpenRecording: ((String, String, [String]) -> Void)? = nil
 
     private static let thumbnailCardMinimumWidth: CGFloat = 260
     private static let thumbnailCardSpacing: CGFloat = 14
     private static let thumbnailCardEstimatedHeight: CGFloat = 230
     private static let thumbnailPrewarmDebounceNanoseconds: UInt64 = 180_000_000
-    private static let pageSize = 60
+    private static let pageSize = 40
     private static let backgroundDiskRescanInterval: TimeInterval = 10 * 60
+    private static let recordingsCacheDuration: TimeInterval = 5 * 60  // 5 minutes
 
     @State private var allRecordings: [RecordingLibraryItem] = []
     @State private var sortedRecordings: [RecordingLibraryItem] = []
@@ -1367,23 +1498,17 @@ struct RecordingsLibraryView: View {
     @State private var cachedPageRecordings: [RecordingLibraryItem] = []
     @State private var cachedVisibleBytes: Int64 = 0
     @State private var lastDiskRescanAt: Date?
+    @State private var lastRecordingsRefreshAt: Date?
     @State private var cachedTotalPages: Int = 1
     @State private var pageCacheVersion: Int = 0
-    @State private var searchText: String = ""
-    @State private var selectedChannelFilter: String = "All Channels"
-    @State private var isDateFilterEnabled: Bool = false
-    @State private var selectedDateFilter: Date = Date()
-    @State private var repairFilter: RecordingRepairFilter = .all
-    @State private var sortOption: RecordingSortOption = .newest
-    @State private var isScanning = false
     @State private var scanError: String?
     @State private var refreshTimer: Timer?
-    @State private var currentPage: Int = 0
     @State private var thumbnailPrewarmTask: Task<Void, Never>?
     @State private var thumbnailViewportSize: CGSize = .zero
     @State private var observedMediaDurationByPath: [String: Double] = [:]
     @State private var durationProbeTask: Task<Void, Never>?
     @State private var refreshRecordingsTask: Task<Void, Never>?
+    @State private var isLoadingRecordings = true
 
     private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
 
@@ -1478,6 +1603,20 @@ struct RecordingsLibraryView: View {
                         .controlSize(.small)
                         .disabled(manager.isRepairingFlaggedRecordings || manager.recordingRepairSummary.needsRemux == 0)
 
+                        Button {
+                            searchText = ""
+                            selectedChannelFilter = "All Channels"
+                            isDateFilterEnabled = false
+                            selectedDateFilter = Date()
+                            repairFilter = .all
+                            sortOption = .newest
+                            currentPage = 0
+                        } label: {
+                            Label("Clear Filters", systemImage: "xmark.circle")
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+
                         Spacer(minLength: 0)
                     }
 
@@ -1526,11 +1665,11 @@ struct RecordingsLibraryView: View {
                             .multilineTextAlignment(.center)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
-                } else if isScanning && allRecordings.isEmpty {
-                    VStack(spacing: 10) {
+                } else if isLoadingRecordings && allRecordings.isEmpty {
+                    VStack(spacing: 12) {
                         ProgressView()
-                        Text("Scanning recordings...")
-                            .font(.caption)
+                        Text("Loading recordings...")
+                            .font(.headline)
                             .foregroundColor(.secondary)
                     }
                     .frame(maxWidth: .infinity, maxHeight: .infinity)
@@ -1615,7 +1754,7 @@ struct RecordingsLibraryView: View {
         }
         .onAppear {
             manager.ensureRecordingRepairMaintenanceRunning()
-            refreshRecordings(rescanFromDisk: false)
+            refreshRecordingsIfNeeded()
             startRefreshTimer()
         }
         .onDisappear {
@@ -1821,56 +1960,34 @@ struct RecordingsLibraryView: View {
     }
 
     private func refreshRecordings(rescanFromDisk: Bool = false) {
-        if isScanning && !rescanFromDisk {
-            return
-        }
+        // Public refresh method - used by manual refresh button and timer
+        // Rescan parameter is ignored; all disk scans now run purely in background
+        scheduleBackgroundRecordingsEnrichment()
+    }
 
-        let shouldShowSpinner = rescanFromDisk || allRecordings.isEmpty
-        let shouldBackgroundRescan = Self.shouldScheduleBackgroundDiskRescan(
-            hasCachedEntries: !allRecordings.isEmpty,
-            lastDiskRescanAt: lastDiskRescanAt,
-            now: Date(),
-            force: rescanFromDisk
-        )
+    private func refreshRecordingsIfNeeded() {
+        // Load all known recordings immediately without blocking on scans
+        loadAllRecordingsFromDatabase()
+        
+        // Schedule background work to enrich data and discover new recordings
+        scheduleBackgroundRecordingsEnrichment()
+    }
 
-        refreshRecordingsTask?.cancel()
-        if shouldShowSpinner {
-            isScanning = true
-        }
-        scanError = nil
-        manager.ensureRecordingRepairMaintenanceRunning()
-
-        refreshRecordingsTask = Task {
+    /// Loads all known recordings from database and displays them immediately.
+    /// This never blocks on disk scans.
+    private func loadAllRecordingsFromDatabase() {
+        Task {
             do {
-                if shouldBackgroundRescan || rescanFromDisk {
-                    try await withTimeout(seconds: 45, step: "rescanning recordings from disk") {
-                        await manager.rescanRecordingLibraryFromDisk()
-                    }
-                    await MainActor.run {
-                        lastDiskRescanAt = Date()
-                    }
-                }
-
-                let entries = try await withTimeout(seconds: 20, step: "loading recording entries") {
+                let entries = try await withTimeout(seconds: 5, step: "loading recording database entries") {
                     await manager.getRecordingLibraryEntries(includeMissing: true)
-                }
-                let activelyFinalizingPaths = try await withTimeout(seconds: 20, step: "loading finalization state") {
-                    await manager.getActivelyFinalizingPaths()
-                }
-                let activeChannelThumbnails = try await withTimeout(seconds: 20, step: "loading active thumbnails") {
-                    await loadActiveChannelThumbnails(entries: entries)
                 }
 
                 let recordings = await Task.detached(priority: .utility) {
-                    Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
+                    // Map all entries with empty thumbnails/finalization - they'll be populated in background
+                    Self.mapRecordingEntries(entries, activeChannelThumbnails: [:], activelyFinalizingPaths: [])
                 }.value
 
-                if Task.isCancelled {
-                    await MainActor.run {
-                        isScanning = false
-                    }
-                    return
-                }
+                if Task.isCancelled { return }
 
                 await MainActor.run {
                     allRecordings = recordings
@@ -1878,40 +1995,129 @@ struct RecordingsLibraryView: View {
                     availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
                         .sorted { $0.lowercased() < $1.lowercased() }
                     applySortOption()
-
-                    let validPaths = Set(recordings.map(\ .path))
-                    observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
-                    for item in recordings {
-                        if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
-                            observedMediaDurationByPath[item.path] = mediaDuration
-                        }
-                    }
-
-                    scheduleMediaDurationProbes(for: recordings)
-
-                    let hasImplicitPendingMP4 = recordings.contains { item in
-                        item.fileExtension.lowercased() == "mp4"
-                            && !manager.hasExplicitRecordingRepairState(for: item.path)
-                    }
-                    if hasImplicitPendingMP4 {
-                        manager.ensureRecordingRepairMaintenanceRunning()
-                    }
-
-                    if selectedChannelFilter != "All Channels",
-                       !availableChannelFilters.contains(selectedChannelFilter) {
-                        selectedChannelFilter = "All Channels"
-                    }
-                    isScanning = false
+                    scanError = nil
+                    lastRecordingsRefreshAt = Date()
+                    isLoadingRecordings = false
+                    
+                    // Immediately schedule thumbnail loading now that we have data
                     scheduleThumbnailPrewarm(debounceNanoseconds: 0)
                 }
-            } catch is CancellationError {
-                await MainActor.run {
-                    isScanning = false
-                }
             } catch {
+                // Log silently - we'll keep whatever was cached before
+                print("Failed to load recordings from database: \(error)")
                 await MainActor.run {
-                    scanError = error.localizedDescription
-                    isScanning = false
+                    isLoadingRecordings = false
+                }
+            }
+        }
+    }
+
+    /// Runs background tasks to enrich recording data and discover new files.
+    /// Does not block the UI - updates happen incrementally.
+    private func scheduleBackgroundRecordingsEnrichment() {
+        refreshRecordingsTask?.cancel()
+
+        refreshRecordingsTask = Task {
+            // Determine if a disk scan is needed (deferred to true background)
+            let shouldRescan = Self.shouldScheduleBackgroundDiskRescan(
+                hasCachedEntries: !allRecordings.isEmpty,
+                lastDiskRescanAt: lastDiskRescanAt,
+                now: Date(),
+                force: false
+            )
+
+            // Schedule recording repair maintenance (scans for new MP4s, etc.)
+            manager.ensureRecordingRepairMaintenanceRunning()
+
+            // Do disk rescan in background without blocking - results update counts
+            if shouldRescan {
+                await manager.rescanRecordingLibraryFromDisk()
+                await MainActor.run {
+                    lastDiskRescanAt = Date()
+                }
+                
+                // After scan completes, reload to show any newly discovered recordings
+                do {
+                    let entries = try await withTimeout(seconds: 20, step: "loading updated recording entries") {
+                        await manager.getRecordingLibraryEntries(includeMissing: true)
+                    }
+                    let activelyFinalizingPaths = try await withTimeout(seconds: 20, step: "loading finalization state") {
+                        await manager.getActivelyFinalizingPaths()
+                    }
+                    let activeChannelThumbnails = try await withTimeout(seconds: 20, step: "loading thumbnails") {
+                        await loadActiveChannelThumbnails(entries: entries)
+                    }
+
+                    let recordings = await Task.detached(priority: .utility) {
+                        Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
+                    }.value
+
+                    if !Task.isCancelled {
+                        await MainActor.run {
+                            allRecordings = recordings
+                            totalAllRecordingsBytes = recordings.reduce(0) { $0 + $1.sizeBytes }
+                            availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
+                                .sorted { $0.lowercased() < $1.lowercased() }
+                            applySortOption()
+
+                            let validPaths = Set(recordings.map(\ .path))
+                            observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
+                            for item in recordings {
+                                if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
+                                    observedMediaDurationByPath[item.path] = mediaDuration
+                                }
+                            }
+
+                            scheduleMediaDurationProbes(for: recordings)
+
+                            let hasImplicitPendingMP4 = recordings.contains { item in
+                                item.fileExtension.lowercased() == "mp4"
+                                    && !manager.hasExplicitRecordingRepairState(for: item.path)
+                            }
+                            if hasImplicitPendingMP4 {
+                                manager.ensureRecordingRepairMaintenanceRunning()
+                            }
+
+                            if selectedChannelFilter != "All Channels",
+                               !availableChannelFilters.contains(selectedChannelFilter) {
+                                selectedChannelFilter = "All Channels"
+                            }
+                            scheduleThumbnailPrewarm(debounceNanoseconds: 0)
+                        }
+                    }
+                } catch {
+                    // Log silently - the cached data is still valid
+                    print("Failed to load updated recordings: \(error)")
+                }
+            } else {
+                // No rescan needed, just load thumbnails and finalization for current entries
+                do {
+                    let entries = try await withTimeout(seconds: 20, step: "loading thumbnails") {
+                        await manager.getRecordingLibraryEntries(includeMissing: true)
+                    }
+                    let activelyFinalizingPaths = try await withTimeout(seconds: 20, step: "loading finalization state") {
+                        await manager.getActivelyFinalizingPaths()
+                    }
+                    let activeChannelThumbnails = try await withTimeout(seconds: 20, step: "loading thumbnails") {
+                        await loadActiveChannelThumbnails(entries: entries)
+                    }
+
+                    let recordings = await Task.detached(priority: .utility) {
+                        Self.mapRecordingEntries(entries, activeChannelThumbnails: activeChannelThumbnails, activelyFinalizingPaths: activelyFinalizingPaths)
+                    }.value
+
+                    if !Task.isCancelled {
+                        await MainActor.run {
+                            allRecordings = recordings
+                            availableChannelFilters = Array(Set(recordings.map { $0.channelName }))
+                                .sorted { $0.lowercased() < $1.lowercased() }
+                            applySortOption()
+                            scheduleThumbnailPrewarm(debounceNanoseconds: 0)
+                        }
+                    }
+                } catch {
+                    // Log silently
+                    print("Failed to load recording thumbnails: \(error)")
                 }
             }
         }
@@ -2535,9 +2741,10 @@ struct ChannelPreviewCard: View {
 
     private var isWaitingForRecordingSlot: Bool { info.isWaitingForRecordingSlot }
     private var isWaitingOnline: Bool { isWaitingForRecordingSlot && info.isOnline }
-    private var isLive: Bool { info.isOnline && !info.isPaused && !isWaitingForRecordingSlot }
+    private var isLive: Bool { info.isOnline && info.isAutoRecordEnabled && !isWaitingForRecordingSlot }
     private var isRecording: Bool { info.isActivelyRecording }
-    private var isPausedOnline: Bool { info.isOnline && info.isPaused }
+    private var isManualRecording: Bool { info.isManualRecording }
+    private var isPausedOnline: Bool { info.isOnline && !info.isAutoRecordEnabled && !info.isActivelyRecording }
     private var isOffline: Bool { !info.isOnline }
     private var isInvalid: Bool { info.isInvalid }
     private var isDegraded: Bool { info.consecutiveSegmentFailures > 0 }
@@ -2554,8 +2761,8 @@ struct ChannelPreviewCard: View {
                     Image(nsImage: image)
                         .resizable()
                         .aspectRatio(contentMode: .fit)
-                        .saturation((isLive || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
-                        .opacity((isLive || isWaitingOnline) ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
+                        .saturation((isLive || isWaitingOnline || isManualRecording) ? 1.0 : (isPausedOnline ? 0.65 : 0.0))
+                        .opacity((isLive || isWaitingOnline || isManualRecording) ? 1.0 : (isPausedOnline ? 0.82 : 0.45))
                         .frame(maxWidth: .infinity, maxHeight: .infinity)
                         .background(Color(NSColor.controlBackgroundColor).opacity(0.3))
                         .overlay(
@@ -2566,6 +2773,8 @@ struct ChannelPreviewCard: View {
                                     Color.orange.opacity(0.12)
                                 } else if isWaitingOnline {
                                     Color.blue.opacity(0.12)
+                                } else if isManualRecording {
+                                    Color.blue.opacity(0.08)
                                 }
                             }
                         )
@@ -2597,14 +2806,14 @@ struct ChannelPreviewCard: View {
             .overlay(
                 Button(action: {
                     Task {
-                        if info.isPaused {
-                            await manager.resumeChannel(username: info.username)
+                        if info.isActivelyRecording {
+                            await manager.stopRecordingThisSession(username: info.username)
                         } else {
-                            await manager.pauseChannel(username: info.username)
+                            await manager.requestManualRecording(username: info.username)
                         }
                     }
                 }) {
-                    Image(systemName: info.isPaused ? "play.circle.fill" : "pause.circle.fill")
+                    Image(systemName: info.isActivelyRecording ? "stop.circle.fill" : "record.circle.fill")
                         .font(.title2)
                         .foregroundColor(.white)
                         .shadow(color: .black.opacity(0.5), radius: 3, x: 0, y: 1)
@@ -2653,7 +2862,7 @@ struct ChannelPreviewCard: View {
             HStack(spacing: 8) {
                 ZStack {
                     Circle()
-                        .fill(info.isInvalid ? Color.red : (info.isPaused ? Color.orange : (info.isOnline ? Color.green : Color.gray)))
+                        .fill(info.isInvalid ? Color.red : (isManualRecording ? Color.green : (info.isOnline ? (info.isAutoRecordEnabled ? Color.green : Color.orange) : Color.gray)))
                         .frame(width: 10, height: 10)
                     
                     if info.isChecking {
@@ -2689,11 +2898,13 @@ struct ChannelPreviewCard: View {
                             Text(
                                 info.isInvalid
                                     ? "Invalid (404)"
-                                    : (info.isPaused
-                                        ? (info.isOnline ? "Paused (Online)" : "Paused")
-                                        : (isWaitingForRecordingSlot
-                                            ? (info.isOnline ? "Waiting (Online)" : "Waiting (Rechecking)")
-                                            : (isRecording ? "Recording" : (info.isOnline ? "Online" : "Offline"))))
+                                    : (isManualRecording
+                                        ? "Manual Recording"
+                                        : (!info.isAutoRecordEnabled
+                                            ? (info.isOnline ? "Paused (Online)" : "Paused")
+                                            : (isWaitingForRecordingSlot
+                                                ? (info.isOnline ? "Waiting (Online)" : "Waiting (Rechecking)")
+                                                : (isRecording ? "Recording" : (info.isOnline ? "Online" : "Offline")))))
                             )
                                 .font(.caption)
                                 .foregroundColor(info.isInvalid ? .red : .secondary)
@@ -2923,9 +3134,10 @@ struct ActivitySidebarView: View {
 
                         VStack(alignment: .leading, spacing: 6) {
                             HStack {
-                                Text("Recording Slots")
+                                Text("Automatic Recordings")
                                     .font(.subheadline)
-                                    .foregroundColor(.secondary)
+                                    .fontWeight(.semibold)
+                                    .foregroundColor(.primary)
                                 Spacer()
                                 Text(slotCountLabel)
                                     .font(.subheadline)
@@ -2943,7 +3155,7 @@ struct ActivitySidebarView: View {
                                 .controlSize(.small)
                                 .disabled(isUnlimitedSlots || finiteSlotCount <= 1)
 
-                                Text("Max concurrent recordings: \(finiteSlotCount)")
+                                Text("Max concurrent: \(finiteSlotCount)")
                                     .font(.callout)
 
                                 Button {
@@ -2978,17 +3190,17 @@ struct ActivitySidebarView: View {
 
                         LazyVGrid(columns: slotGridColumns, spacing: 6) {
                             ForEach(0..<visualizedSlotCount, id: \.self) { index in
-                                recordingSlotRow(for: index)
+                                automaticRecordingSlotRow(for: index)
                             }
                         }
 
                         VStack(spacing: 6) {
                             HStack {
-                                Text("In use: \(activeRecordingCount)")
+                                Text("Active: \(automaticRecordingCount)")
                                     .font(.footnote)
                                     .foregroundColor(.green)
                                 Spacer()
-                                Text("Idle: \(idleSlotCount)")
+                                Text("Idle: \(idleAutomaticSlotCount)")
                                     .font(.footnote)
                                     .foregroundColor(.secondary)
                             }
@@ -3005,6 +3217,34 @@ struct ActivitySidebarView: View {
                             }
                             .buttonStyle(.bordered)
                             .controlSize(.small)
+                        }
+
+                        // Manual Recordings Section - only show if there are active manual recordings
+                        if manager.runtimeDiagnostics.activeManualRecordings > 0 {
+                            Divider()
+
+                            VStack(alignment: .leading, spacing: 6) {
+                                HStack {
+                                    Text("Manual Recordings")
+                                        .font(.subheadline)
+                                        .fontWeight(.semibold)
+                                        .foregroundColor(.blue)
+                                    Spacer()
+                                    Label("\(manager.runtimeDiagnostics.activeManualRecordings)", systemImage: "record.circle.fill")
+                                        .font(.subheadline)
+                                        .foregroundColor(.blue)
+                                }
+
+                                Text("Manual recordings have unlimited slots and always start immediately.")
+                                    .font(.footnote)
+                                    .foregroundColor(.secondary)
+                            }
+
+                            LazyVGrid(columns: slotGridColumns, spacing: 6) {
+                                ForEach(0..<manualRecordingChannels.count, id: \.self) { index in
+                                    manualRecordingSlotRow(for: index)
+                                }
+                            }
                         }
                     }
                     .padding(10)
@@ -3177,7 +3417,7 @@ struct ActivitySidebarView: View {
         if info.isChecking {
             return .accentColor
         }
-        if info.isPaused {
+        if !info.isAutoRecordEnabled {
             return .orange
         }
         if info.isOnline {
@@ -3247,10 +3487,38 @@ struct ActivitySidebarView: View {
         manager.runtimeDiagnostics.activeRecordings
     }
 
+    private var automaticRecordingCount: Int {
+        manager.runtimeDiagnostics.activeAutomaticRecordings
+    }
+
+    private var idleAutomaticSlotCount: Int {
+        max(0, visualizedSlotCount - min(automaticRecordingCount, visualizedSlotCount))
+    }
+
     private var recordingChannels: [ChannelInfo] {
         channelInfos
             .filter {
                 $0.isActivelyRecording &&
+                !$0.isInvalid
+            }
+            .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
+    }
+
+    private var automaticRecordingChannels: [ChannelInfo] {
+        channelInfos
+            .filter {
+                $0.isActivelyRecording &&
+                !$0.isManualRecording &&
+                !$0.isInvalid
+            }
+            .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
+    }
+
+    private var manualRecordingChannels: [ChannelInfo] {
+        channelInfos
+            .filter {
+                $0.isActivelyRecording &&
+                $0.isManualRecording &&
                 !$0.isInvalid
             }
             .sorted { $0.username.localizedStandardCompare($1.username) == .orderedAscending }
@@ -3314,6 +3582,16 @@ struct ActivitySidebarView: View {
         return .idle
     }
 
+    private func automaticRecordingSlotState(at index: Int) -> SlotState {
+        if index < automaticRecordingChannels.count {
+            return .active(automaticRecordingChannels[index])
+        }
+        if index < min(automaticRecordingCount, visualizedSlotCount) {
+            return .busyUnknown
+        }
+        return .idle
+    }
+
     private func requestSlotState(at index: Int) -> SlotState {
         if index < requestActiveChannels.count {
             return .active(requestActiveChannels[index])
@@ -3358,6 +3636,63 @@ struct ActivitySidebarView: View {
                 accent: .secondary,
                 isInteractive: false
             )
+        }
+    }
+
+    @ViewBuilder
+    private func automaticRecordingSlotRow(for index: Int) -> some View {
+        let state = automaticRecordingSlotState(at: index)
+        switch state {
+        case .active(let info):
+            Button {
+                onSelectChannel?(info.username)
+            } label: {
+                slotRowContent(
+                    primary: info.username,
+                    secondary: "auto recording",
+                    trailing: "\(info.duration) • \(info.filesize)",
+                    accent: .green,
+                    isInteractive: true
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Open \(info.username)")
+        case .busyUnknown:
+            slotRowContent(
+                primary: "Recording in progress",
+                secondary: "syncing details",
+                trailing: nil,
+                accent: .green,
+                isInteractive: false
+            )
+        case .idle:
+            slotRowContent(
+                primary: "Idle",
+                secondary: "available",
+                trailing: nil,
+                accent: .secondary,
+                isInteractive: false
+            )
+        }
+    }
+
+    @ViewBuilder
+    private func manualRecordingSlotRow(for index: Int) -> some View {
+        if index < manualRecordingChannels.count {
+            let info = manualRecordingChannels[index]
+            Button {
+                onSelectChannel?(info.username)
+            } label: {
+                slotRowContent(
+                    primary: info.username,
+                    secondary: "manual record",
+                    trailing: "\(info.duration) • \(info.filesize)",
+                    accent: .blue,
+                    isInteractive: true
+                )
+            }
+            .buttonStyle(.plain)
+            .help("Open \(info.username)")
         }
     }
 
@@ -3490,6 +3825,7 @@ struct ChannelDetailView: View {
     var onEdit: (() -> Void)? = nil
     var onDeleted: (() -> Void)? = nil
     var onOpenRecording: ((String, [String]) -> Void)? = nil
+    var onViewAllRecordings: (() -> Void)? = nil
     @State private var info: ChannelInfo?
     @State private var timer: Timer?
     @State private var showingDeleteConfirmation = false
@@ -3515,7 +3851,8 @@ struct ChannelDetailView: View {
         canGoNext: Bool = false,
         onEdit: (() -> Void)? = nil,
         onDeleted: (() -> Void)? = nil,
-        onOpenRecording: ((String, [String]) -> Void)? = nil
+        onOpenRecording: ((String, [String]) -> Void)? = nil,
+        onViewAllRecordings: (() -> Void)? = nil
     ) {
         self.manager = manager
         self.username = username
@@ -3528,6 +3865,7 @@ struct ChannelDetailView: View {
         self.onEdit = onEdit
         self.onDeleted = onDeleted
         self.onOpenRecording = onOpenRecording
+        self.onViewAllRecordings = onViewAllRecordings
         _info = State(initialValue: initialInfo)
     }
     
@@ -3758,40 +4096,40 @@ struct ChannelDetailView: View {
                 .buttonStyle(.bordered)
                 .controlSize(.small)
 
+                Button(action: {
+                    Task {
+                        await manager.refreshChannelStatus(username: username)
+                    }
+                }) {
+                    Label("Refresh Status", systemImage: "arrow.clockwise")
+                        .frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+
                 HStack(spacing: 8) {
                     Button(action: {
                         Task {
-                            await manager.setManualBreakOverride(username: username, enabled: !info.isManualBreakOverrideActive)
+                            await manager.requestManualRecording(username: username)
                         }
                     }) {
-                        Label(info.isManualBreakOverrideActive ? "Clear Break" : "Mark Break", systemImage: info.isManualBreakOverrideActive ? "checkmark.circle.fill" : "pause.circle")
+                        Label("Record", systemImage: "record.circle.fill")
                             .frame(maxWidth: .infinity)
                     }
-                    .buttonStyle(.bordered)
+                    .buttonStyle(.borderedProminent)
                     .controlSize(.small)
-                    .tint(info.isManualBreakOverrideActive ? .orange : .secondary)
+                    .disabled(info.isActivelyRecording)
 
-                    if info.isPaused {
+                    if info.isActivelyRecording {
                         Button(action: {
                             Task {
-                                await manager.resumeChannel(username: username)
+                                await manager.stopRecordingThisSession(username: username)
                             }
                         }) {
-                            Label("Resume", systemImage: "play.fill")
+                            Label("Stop", systemImage: "stop.fill")
                                 .frame(maxWidth: .infinity)
                         }
                         .buttonStyle(.borderedProminent)
-                        .controlSize(.small)
-                    } else {
-                        Button(action: {
-                            Task {
-                                await manager.pauseChannel(username: username)
-                            }
-                        }) {
-                            Label("Pause", systemImage: "pause.fill")
-                                .frame(maxWidth: .infinity)
-                        }
-                        .buttonStyle(.bordered)
                         .controlSize(.small)
                     }
 
@@ -3811,6 +4149,18 @@ struct ChannelDetailView: View {
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                 }
+
+                Toggle(isOn: Binding(
+                    get: { info.isAutoRecordEnabled },
+                    set: { _ in
+                        Task {
+                            await manager.toggleAutoRecord(username: username)
+                        }
+                    }
+                )) {
+                    Label("Auto-Record", systemImage: "record.circle")
+                }
+                .toggleStyle(.switch)
             }
             .padding(.horizontal, sidebarHorizontalInset)
         }
@@ -3821,14 +4171,17 @@ struct ChannelDetailView: View {
         if info.isInvalid {
             return "Invalid (404)"
         }
+        if info.isManualRecording {
+            return "Manual Recording"
+        }
         if info.isWaitingForRecordingSlot {
             return info.isOnline ? "Waiting Live" : "Offline"
         }
-        if info.isPaused {
-            return info.isOnline ? "Paused (Online)" : "Paused"
-        }
         if info.isActivelyRecording {
             return "Recording"
+        }
+        if !info.isAutoRecordEnabled {
+            return info.isOnline ? "Paused (Online)" : "Paused"
         }
         if info.isOnline {
             return "Online"
@@ -3843,11 +4196,11 @@ struct ChannelDetailView: View {
         if info.isWaitingForRecordingSlot {
             return info.isOnline ? .blue : .gray
         }
-        if info.isPaused {
-            return .orange
-        }
         if info.isActivelyRecording {
             return .green
+        }
+        if !info.isAutoRecordEnabled {
+            return .orange
         }
         if info.isOnline {
             return .mint
@@ -3872,7 +4225,7 @@ struct ChannelDetailView: View {
                     lastDetailProbeAt = Date()
 
                     let shouldRefreshPausedThumbnail = refreshed.isOnline
-                        && (refreshed.isPaused || !refreshed.globalRecordingEnabled)
+                        && (!refreshed.isAutoRecordEnabled || !refreshed.globalRecordingEnabled)
 
                     if let probed = await manager.refreshChannelStatusForDetail(
                         username: username,
@@ -3900,75 +4253,130 @@ struct ChannelDetailView: View {
     @ViewBuilder
     private func recordingsSection(info: ChannelInfo) -> some View {
         let entries = recordingsCache
-        let activeCount = entries.filter(\ .isActive).count
-        let missingCount = entries.filter { !$0.fileExists && !$0.isActive && !$0.isFinalizing }.count
-
-        VStack(alignment: .leading, spacing: 8) {
+        let totalDurationSeconds = entries.reduce(0.0) { $0 + $1.durationSeconds }
+        let totalSizeBytes = entries.reduce(0) { $0 + $1.fileSizeBytes }
+        let recentRecordings = entries
+            .sorted { $0.modifiedAt > $1.modifiedAt }
+            .prefix(5)
+        
+        VStack(alignment: .leading, spacing: 10) {
+            // Header
             HStack {
-                Text("Recordings")
+                Text("Recording Stats")
                     .font(.subheadline)
                     .fontWeight(.semibold)
-
                 Spacer()
             }
 
-            HStack(spacing: 4) {
-                Text("\(entries.count) recording\(entries.count == 1 ? "" : "s") in ledger")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                Text("• active \(activeCount)")
-                    .font(.caption2)
-                    .foregroundColor(.secondary)
-                if missingCount > 0 {
-                    Text("• missing \(missingCount)")
-                        .font(.caption2)
-                        .foregroundColor(.orange)
-                }
-            }
-
+            // Stats row
             if entries.isEmpty {
-                Text("No recordings found for this channel in the recording ledger")
-                    .font(.caption)
-                    .foregroundColor(.secondary)
-                    .italic()
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("No recordings found for this channel in the recording ledger")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                        .italic()
+                }
             } else {
-                ScrollView {
-                    VStack(alignment: .leading, spacing: 6) {
-                        ForEach(entries, id: \.path) { entry in
-                            Button {
-                                onOpenRecording?(entry.path, entries.map(\ .path))
-                            } label: {
-                                HStack(alignment: .top, spacing: 8) {
-                                    VStack(alignment: .leading, spacing: 4) {
-                                        Text((entry.path as NSString).lastPathComponent)
-                                            .font(.system(.caption, design: .monospaced))
-                                            .lineLimit(1)
-                                            .frame(maxWidth: .infinity, alignment: .leading)
+                VStack(alignment: .leading, spacing: 6) {
+                    HStack(spacing: 12) {
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Total Recordings")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text("\(entries.count)")
+                                .font(.headline)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
 
-                                        HStack(spacing: 6) {
-                                            Text(recordingStatusLabel(for: entry))
-                                                .font(.caption2)
-                                                .foregroundColor(recordingStatusColor(for: entry))
-                                            Text(recordingDateText(for: entry.modifiedAt))
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
-                                            Text(recordingSizeText(for: entry.fileSizeBytes))
-                                                .font(.caption2)
-                                                .foregroundColor(.secondary)
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Hours Recorded")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text(String(format: "%.1f", totalDurationSeconds / 3600))
+                                .font(.headline)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+
+                        VStack(alignment: .leading, spacing: 2) {
+                            Text("Space Used")
+                                .font(.caption2)
+                                .foregroundColor(.secondary)
+                            Text(recordingSizeText(for: totalSizeBytes))
+                                .font(.headline)
+                        }
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                    }
+                    .padding(10)
+                    .background(Color(NSColor.controlBackgroundColor))
+                    .cornerRadius(6)
+
+                    // Recent recordings header
+                    HStack {
+                        Text("Recent Recordings")
+                            .font(.caption)
+                            .fontWeight(.semibold)
+                            .foregroundColor(.secondary)
+                        Spacer()
+                    }
+                    .padding(.top, 4)
+
+                    // Recent recordings list
+                    if recentRecordings.isEmpty {
+                        Text("No recordings")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                            .italic()
+                    } else {
+                        VStack(alignment: .leading, spacing: 4) {
+                            ForEach(Array(recentRecordings), id: \.path) { entry in
+                                Button {
+                                    onOpenRecording?(entry.path, entries.map(\ .path))
+                                } label: {
+                                    HStack(alignment: .top, spacing: 8) {
+                                        VStack(alignment: .leading, spacing: 3) {
+                                            Text((entry.path as NSString).lastPathComponent)
+                                                .font(.system(.caption, design: .monospaced))
+                                                .lineLimit(1)
+                                                .frame(maxWidth: .infinity, alignment: .leading)
+
+                                            HStack(spacing: 6) {
+                                                Text(recordingStatusLabel(for: entry))
+                                                    .font(.caption2)
+                                                    .foregroundColor(recordingStatusColor(for: entry))
+                                                Text(recordingDateText(for: entry.modifiedAt))
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                                Text(recordingSizeText(for: entry.fileSizeBytes))
+                                                    .font(.caption2)
+                                                    .foregroundColor(.secondary)
+                                            }
                                         }
-                                    }
 
-                                    Image(systemName: "chevron.right")
-                                        .font(.caption2)
-                                        .foregroundColor(.secondary)
+                                        Image(systemName: "chevron.right")
+                                            .font(.caption2)
+                                            .foregroundColor(.secondary)
+                                    }
+                                    .padding(.vertical, 2)
                                 }
-                                .padding(.vertical, 2)
+                                .buttonStyle(.plain)
                             }
-                            .buttonStyle(.plain)
                         }
                     }
+
+                    // View all recordings button
+                    Button(action: {
+                        onViewAllRecordings?()
+                    }) {
+                        HStack {
+                            Text("View All Recordings")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                            Image(systemName: "arrow.right")
+                        }
+                    }
+                    .buttonStyle(.bordered)
+                    .controlSize(.small)
+                    .frame(maxWidth: .infinity)
                 }
-                .frame(minHeight: 120, maxHeight: 220)
             }
         }
         .padding(10)
@@ -3988,7 +4396,7 @@ struct ChannelDetailView: View {
             info.username,
             info.filename ?? "",
             String(info.isOnline),
-            String(info.isPaused)
+            String(info.isAutoRecordEnabled)
         ].joined(separator: "|")
 
         if !force, scanKey == lastRecordingsScanKey {
@@ -4105,6 +4513,7 @@ private struct ChannelLivePreviewView: View {
     @State private var lastRecoveryAt = Date.distantPast
     @State private var recoveryAttempts = 0
     @State private var streamUnavailable = false
+    @State private var videoAspectRatio: CGFloat = 16 / 9
 
     var body: some View {
         ZStack {
@@ -4181,9 +4590,24 @@ private struct ChannelLivePreviewView: View {
             }
         }
         .frame(maxWidth: .infinity)
-        .aspectRatio(16/9, contentMode: .fit)
+        .aspectRatio(videoAspectRatio, contentMode: .fit)
         .clipped()
         .cornerRadius(10)
+        .task(id: thumbnailPath) {
+            if let thumbnailPath,
+               FileManager.default.fileExists(atPath: thumbnailPath),
+               let nsImage = NSImage(contentsOfFile: thumbnailPath) {
+                let width = nsImage.size.width
+                let height = nsImage.size.height
+                if width > 0 && height > 0 {
+                    videoAspectRatio = width / height
+                } else {
+                    videoAspectRatio = 16 / 9  // Fallback to default
+                }
+            } else {
+                videoAspectRatio = 16 / 9  // Fallback to default
+            }
+        }
         .task(id: isOnline) {
             guard isOnline else {
                 resetPlayerState()
@@ -4356,6 +4780,7 @@ private struct ChannelLivePreviewView: View {
         player = nil
         currentStreamURL = nil
         isRecovering = false
+        videoAspectRatio = 16 / 9  // Reset to default
     }
 }
 
@@ -4383,6 +4808,7 @@ struct RecordingDetailView: View {
     @State private var posterLoadTask: Task<Void, Never>?
     @State private var channelThumbnailPath: String?
     @State private var observedMediaDurationSeconds: Double?
+    @State private var videoAspectRatio: CGFloat = 16 / 9
     @State private var isTrimEditorActive = false
     @State private var trimStartSecondsText = ""
     @State private var trimEndSecondsText = ""
@@ -4393,6 +4819,9 @@ struct RecordingDetailView: View {
     @State private var trimPreviewDurationSeconds: Double = 0
     @State private var trimPreviewTimer: Timer?
     @State private var activeTrimTrackInteraction: TrimTrackInteraction?
+    @State private var isRemuxing = false
+    @State private var remuxErrorMessage: String?
+    @State private var showingRemuxError = false
 
     private enum PlayerPreparationError: LocalizedError {
         case timedOut
@@ -4473,6 +4902,11 @@ struct RecordingDetailView: View {
             } else {
                 stopTrimPreviewTimer()
             }
+        }
+        .alert("Remux Error", isPresented: $showingRemuxError) {
+            Button("OK") { }
+        } message: {
+            Text(remuxErrorMessage ?? "Unknown error during remux")
         }
     }
 
@@ -4636,6 +5070,28 @@ struct RecordingDetailView: View {
                 .buttonStyle(.bordered)
                 .disabled(!canTrim(detail) || isTrimming)
 
+                Button {
+                    startRemuxWithAudioSyncCorrection(detail)
+                } label: {
+                    Label("Remux Sync", systemImage: "waveform.badge.exclamationmark")
+                }
+                .buttonStyle(.bordered)
+                .disabled(isRemuxing || !detail.fileExists)
+
+                if isRemuxing {
+                    HStack(spacing: 8) {
+                        ProgressView()
+                            .scaleEffect(0.9)
+                        Text("Remuxing with audio sync correction...")
+                            .font(.caption)
+                            .foregroundColor(.secondary)
+                    }
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 6)
+                    .background(Color.blue.opacity(0.1), in: RoundedRectangle(cornerRadius: 6))
+                }
+
                 Button(role: .destructive) {
                     moveRecordingToTrash(detail)
                 } label: {
@@ -4744,7 +5200,7 @@ struct RecordingDetailView: View {
                 }
             }
             .frame(maxWidth: .infinity)
-            .aspectRatio(16 / 9, contentMode: .fit)
+            .aspectRatio(videoAspectRatio, contentMode: .fit)
             .modifier(TrimPlayerHeightLimit(maxVideoHeight: maxVideoHeight))
 
             if let playerError {
@@ -4889,26 +5345,27 @@ struct RecordingDetailView: View {
 
     @ViewBuilder
     private func detailCard(title: String, @ViewBuilder content: () -> some View) -> some View {
-        VStack(alignment: .leading, spacing: 10) {
+        VStack(alignment: .leading, spacing: 6) {
             Text(title)
-                .font(.headline)
+                .font(.subheadline)
+                .fontWeight(.semibold)
             content()
         }
         .frame(maxWidth: .infinity, alignment: .leading)
-        .padding(12)
+        .padding(10)
         .background(Color(NSColor.controlBackgroundColor).opacity(0.34))
         .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
     }
 
     @ViewBuilder
     private func metadataRow(_ title: String, _ value: String, valueColor: Color = .primary) -> some View {
-        HStack(alignment: .top, spacing: 8) {
+        HStack(alignment: .top, spacing: 6) {
             Text(title)
-                .font(.caption)
+                .font(.system(.caption, design: .default))
                 .foregroundColor(.secondary)
-                .frame(width: 112, alignment: .leading)
+                .frame(width: 100, alignment: .leading)
             Text(value)
-                .font(.caption)
+                .font(.system(.caption, design: .default))
                 .foregroundColor(valueColor)
                 .textSelection(.enabled)
             Spacer(minLength: 0)
@@ -4922,9 +5379,9 @@ struct RecordingDetailView: View {
 
     @ViewBuilder
     private func metadataBlock(_ title: String, _ value: String) -> some View {
-        VStack(alignment: .leading, spacing: 4) {
+        VStack(alignment: .leading, spacing: 2) {
             Text(title)
-                .font(.caption)
+                .font(.system(.caption, design: .default))
                 .foregroundColor(.secondary)
             Text(value)
                 .font(.system(.caption, design: .monospaced))
@@ -4995,6 +5452,24 @@ struct RecordingDetailView: View {
         }
     }
 
+    private func resolveVideoAspectRatio(for asset: AVURLAsset) async -> CGFloat {
+        do {
+            let tracks = try await asset.loadTracks(withMediaType: .video)
+            guard let videoTrack = tracks.first else {
+                return 16.0 / 9.0
+            }
+
+            let naturalSize = try await videoTrack.load(.naturalSize)
+            let preferredTransform = try await videoTrack.load(.preferredTransform)
+            let size = naturalSize.applying(preferredTransform)
+            let width = abs(size.width)
+            let height = abs(size.height)
+            return width > 0 && height > 0 ? width / height : 16.0 / 9.0
+        } catch {
+            return 16.0 / 9.0
+        }
+    }
+
     private func preparePlayer(for detail: RecordingLedgerDetail, requestedPath: String) async {
         let normalizedRequestedPath = normalizedPath(requestedPath)
 
@@ -5044,6 +5519,8 @@ struct RecordingDetailView: View {
                 return
             }
 
+            let resolvedAspectRatio = await resolveVideoAspectRatio(for: asset)
+
             await MainActor.run {
                 guard normalizedPath(recordingPath) == normalizedRequestedPath else { return }
 
@@ -5055,6 +5532,8 @@ struct RecordingDetailView: View {
                         }
                     }
                 }
+
+                videoAspectRatio = resolvedAspectRatio
 
                 let newPlayer = AVPlayer(playerItem: item)
                 newPlayer.pause()
@@ -5093,6 +5572,7 @@ struct RecordingDetailView: View {
         player = nil
         isPreparingPlayer = false
         playerError = nil
+        videoAspectRatio = 16 / 9  // Reset to default
     }
 
     private var effectiveNavigationPaths: [String] {
@@ -5731,6 +6211,37 @@ struct RecordingDetailView: View {
         trimPreviewPositionSeconds = safeSeconds
     }
 
+    private func startRemuxWithAudioSyncCorrection(_ detail: RecordingLedgerDetail) {
+        guard detail.fileExists else {
+            remuxErrorMessage = "Recording file does not exist at path: \(detail.path)"
+            showingRemuxError = true
+            return
+        }
+
+        isRemuxing = true
+        let fileURL = URL(fileURLWithPath: detail.path)
+
+        Task {
+            do {
+                try await manager.remuxRecordingWithAudioSyncCorrection(
+                    username: detail.channelUsername,
+                    fileURL: fileURL
+                )
+                await MainActor.run {
+                    isRemuxing = false
+                }
+                // Reload the current detail to reflect changes
+                await loadRecordingDetail()
+            } catch {
+                await MainActor.run {
+                    isRemuxing = false
+                    remuxErrorMessage = "Remux with audio sync correction failed: \(error.localizedDescription)"
+                    showingRemuxError = true
+                }
+            }
+        }
+    }
+
     private func formatTrimSeconds(_ seconds: Double) -> String {
         guard seconds.isFinite, seconds >= 0 else { return "0:00" }
         let whole = Int(seconds.rounded())
@@ -6272,11 +6783,12 @@ struct ChannelInfoView: View {
     let info: ChannelInfo
     
     var body: some View {
-        VStack(spacing: 10) {
+        VStack(spacing: 6) {
+            // Session & Recording settings (2-column grid)
             LazyVGrid(columns: [
                 GridItem(.flexible()),
                 GridItem(.flexible())
-            ], spacing: 8) {
+            ], spacing: 4) {
                 InfoCard(title: "Duration", value: info.duration, icon: "clock")
                 InfoCard(title: "File Size", value: info.filesize, icon: "doc")
                 InfoCard(title: "Split After Duration", value: info.maxDuration, icon: "timer")
@@ -6299,76 +6811,69 @@ struct ChannelInfoView: View {
                 .cornerRadius(8)
             }
             
-            if let streamedAt = info.streamedAt {
-                detailRow(label: "Stream Started", value: streamedAt)
-            }
+            // Live stream status info (2-column grid)
+            LazyVGrid(columns: [
+                GridItem(.flexible()),
+                GridItem(.flexible())
+            ], spacing: 4) {
+                if let streamedAt = info.streamedAt {
+                    InfoCard(title: "Stream Started", value: streamedAt, icon: "play.circle")
+                }
 
-            if let lastOnlineAt = info.lastOnlineAt {
-                detailRow(label: "Last Online", value: lastOnlineAt)
-            }
+                if let lastOnlineAt = info.lastOnlineAt {
+                    InfoCard(title: "Last Online", value: lastOnlineAt, icon: "clock.badge.checkmark")
+                }
 
-            if info.isOnline {
-                let personDetectionText: String = {
-                    if let isPersonDetected = info.isPersonDetected {
-                        return isPersonDetected ? "Person detected" : "No person detected"
-                    }
+                if info.isOnline {
+                    let personDetectionText: String = {
+                        if let isPersonDetected = info.isPersonDetected {
+                            return isPersonDetected ? "Detected" : "Not detected"
+                        }
+                        return info.isNoPersonDetected
+                            ? "Not detected · \(formatNoPersonDuration(info.noPersonDurationSeconds))"
+                            : "Detected"
+                    }()
 
-                    return info.isNoPersonDetected
-                        ? "No person detected for \(formatNoPersonDuration(info.noPersonDurationSeconds))"
-                        : "Person detected"
-                }()
+                    let personDetectionColor: Color = {
+                        if let isPersonDetected = info.isPersonDetected {
+                            return isPersonDetected ? .primary : .orange
+                        }
+                        return info.isNoPersonDetected ? .orange : .primary
+                    }()
 
-                let personDetectionColor: Color = {
-                    if let isPersonDetected = info.isPersonDetected {
-                        return isPersonDetected ? .primary : .orange
-                    }
-                    return info.isNoPersonDetected ? .orange : .primary
-                }()
+                    ColoredInfoCard(title: "Person Detection", value: personDetectionText, icon: "figure.stand", valueColor: personDetectionColor)
+                }
 
-                detailRow(
-                    label: "Person Detection",
-                    value: personDetectionText,
-                    valueColor: personDetectionColor
+                ColoredInfoCard(
+                    title: "Segment Retries",
+                    value: "\(info.segmentRetryCount)",
+                    icon: "arrow.triangle.2.circlepath",
+                    valueColor: .primary
                 )
-            }
 
-            detailRow(label: "Segment Retries", value: "\(info.segmentRetryCount)")
+                ColoredInfoCard(
+                    title: "Segment Failures",
+                    value: "\(info.consecutiveSegmentFailures)",
+                    icon: "exclamationmark.circle",
+                    valueColor: info.consecutiveSegmentFailures > 0 ? .orange : .primary
+                )
 
-            detailRow(
-                label: "Consecutive Segment Failures",
-                value: "\(info.consecutiveSegmentFailures)",
-                valueColor: info.consecutiveSegmentFailures > 0 ? .orange : .primary
-            )
+                ColoredInfoCard(
+                    title: "Timeline Mismatches",
+                    value: "\(info.timelineMismatchCount)",
+                    icon: "exclamationmark.triangle",
+                    valueColor: info.timelineMismatchCount > 0 ? .red : .primary
+                )
 
-            detailRow(
-                label: "Timeline Mismatch Events",
-                value: "\(info.timelineMismatchCount)",
-                valueColor: info.timelineMismatchCount > 0 ? .red : .primary
-            )
+                if let lastFailureAt = info.lastSegmentFailureAt {
+                    InfoCard(title: "Last Segment Failure", value: lastFailureAt, icon: "clock.badge.xmark")
+                }
 
-            if let lastFailureAt = info.lastSegmentFailureAt {
-                detailRow(label: "Last Segment Failure", value: lastFailureAt, valueColor: .orange)
-            }
-
-            if let lastTimelineMismatchAt = info.lastTimelineMismatchAt {
-                detailRow(label: "Last Timeline Mismatch", value: lastTimelineMismatchAt, valueColor: .red)
+                if let lastTimelineMismatchAt = info.lastTimelineMismatchAt {
+                    InfoCard(title: "Last Timeline Mismatch", value: lastTimelineMismatchAt, icon: "clock.badge.xmark")
+                }
             }
         }
-    }
-
-    private func detailRow(label: String, value: String, valueColor: Color = .primary) -> some View {
-        HStack(alignment: .firstTextBaseline, spacing: 8) {
-            Text("\(label):")
-                .font(.caption)
-                .foregroundColor(.secondary)
-            Spacer(minLength: 0)
-            Text(value)
-                .font(.caption)
-                .foregroundColor(valueColor)
-                .lineLimit(1)
-                .multilineTextAlignment(.trailing)
-        }
-        .padding(.horizontal, 2)
     }
 }
 
@@ -6378,16 +6883,40 @@ struct InfoCard: View {
     let icon: String
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 5) {
+        VStack(alignment: .leading, spacing: 2) {
             Label(title, systemImage: icon)
-                .font(.caption2)
+                .font(.caption)
                 .foregroundColor(.secondary)
             Text(value)
-                .font(.headline)
+                .font(.body)
                 .fontWeight(.medium)
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(Color(NSColor.controlBackgroundColor))
+        .cornerRadius(8)
+    }
+}
+
+struct ColoredInfoCard: View {
+    let title: String
+    let value: String
+    let icon: String
+    let valueColor: Color
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Label(title, systemImage: icon)
+                .font(.caption)
+                .foregroundColor(.secondary)
+            Text(value)
+                .font(.body)
+                .fontWeight(.medium)
+                .foregroundColor(valueColor)
+        }
+        .padding(.horizontal, 8)
+        .padding(.vertical, 6)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(Color(NSColor.controlBackgroundColor))
         .cornerRadius(8)
@@ -6402,41 +6931,40 @@ struct BioMetadataView: View {
     @State private var localBioMetadata: BioMetadata?
     
     var body: some View {
-        VStack(alignment: .leading, spacing: 8) {
+        VStack(alignment: .leading, spacing: 6) {
             Text("Bio Metadata")
-                .font(.subheadline)
+                .font(.headline)
                 .fontWeight(.semibold)
             
             if let bioMetadata = localBioMetadata ?? info.bioMetadata {
-                VStack(alignment: .leading, spacing: 7) {
+                LazyVGrid(columns: [
+                    GridItem(.flexible()),
+                    GridItem(.flexible())
+                ], spacing: 4) {
                     if let gender = bioMetadata.gender {
-                        metadataRow("Gender", value: gender, labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Gender", value: gender, icon: "figure")
                     }
 
                     if let followers = bioMetadata.followers {
-                        metadataRow("Followers", value: String(followers), labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Followers", value: String(followers), icon: "person.2")
                     }
 
                     if let location = bioMetadata.location {
-                        metadataRow("Location", value: location, labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Location", value: location, icon: "mappin")
                     }
 
                     if let body = bioMetadata.body {
-                        metadataRow("Body", value: body, labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Body", value: body, icon: "figure.wave")
                     }
 
                     if let language = bioMetadata.language {
-                        metadataRow("Language", value: language, labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Language", value: language, icon: "globe")
                     }
 
                     if let lastBioRefresh = bioMetadata.lastBioRefresh {
-                        metadataRow("Last Refreshed", value: formatTimestamp(lastBioRefresh), labelFont: .caption, valueFont: .caption)
+                        InfoCard(title: "Last Refreshed", value: formatTimestamp(lastBioRefresh), icon: "clock")
                     }
                 }
-                .padding(10)
-                .frame(maxWidth: .infinity, alignment: .leading)
-                .background(Color(NSColor.controlBackgroundColor))
-                .cornerRadius(8)
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("No bio data yet")
@@ -6470,19 +6998,6 @@ struct BioMetadataView: View {
             if localBioMetadata == nil {
                 localBioMetadata = info.bioMetadata
             }
-        }
-    }
-
-    private func metadataRow(_ label: String, value: String, labelFont: Font = .body, valueFont: Font = .body) -> some View {
-        HStack(alignment: .firstTextBaseline) {
-            Text(label)
-                .font(labelFont)
-                .foregroundColor(.secondary)
-            Spacer(minLength: 12)
-            Text(value)
-                .font(valueFont)
-                .fontWeight(.medium)
-                .multilineTextAlignment(.trailing)
         }
     }
     
@@ -7425,7 +7940,7 @@ struct EditChannelView: View {
                     maxSessionFilesize = config.maxSessionFilesize
                     outputDirectory = config.outputDirectory
                     pattern = config.pattern
-                    canEditUsername = !(channelInfo?.isOnline == true && channelInfo?.isPaused == false)
+                    canEditUsername = !(channelInfo?.isOnline == true && channelInfo?.isAutoRecordEnabled == true)
                     isLoading = false
                 }
             } else {
@@ -7453,7 +7968,7 @@ struct EditChannelView: View {
                 }
                 
                 let updatedConfig = ChannelConfig(
-                    isPaused: currentConfig.isPaused,
+                    isAutoRecordEnabled: currentConfig.isAutoRecordEnabled,
                     username: sanitizedEditedUsername,
                     outputDirectory: outputDirectory,
                     framerate: framerate,

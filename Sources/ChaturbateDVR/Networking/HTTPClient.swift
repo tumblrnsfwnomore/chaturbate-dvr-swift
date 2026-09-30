@@ -1,15 +1,21 @@
 import Foundation
 
 actor HTTPClient {
+    private static let sharedSession: URLSession = {
+        let configuration = URLSessionConfiguration.default
+        configuration.timeoutIntervalForRequest = 10.0
+        configuration.timeoutIntervalForResource = 30.0
+        // Keep connection growth bounded for long-running sessions.
+        configuration.httpMaximumConnectionsPerHost = 16
+        configuration.waitsForConnectivity = false
+        return URLSession(configuration: configuration)
+    }()
+
     private let session: URLSession
     private let config: AppConfig
     
     init(config: AppConfig) {
-        let configuration = URLSessionConfiguration.default
-        configuration.timeoutIntervalForRequest = 10.0
-        configuration.timeoutIntervalForResource = 30.0
-        
-        self.session = URLSession(configuration: configuration)
+        self.session = Self.sharedSession
         self.config = config
     }
     

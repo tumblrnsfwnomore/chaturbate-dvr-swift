@@ -493,27 +493,9 @@ actor RecordingLedger {
             }
         }
 
-        // Also capture recordings that exist on disk but are no longer listed in channel configs.
-        // This keeps forensic history complete even after channel removals/import drift.
-        let rootPath = normalizePath((defaultOutputRoot as NSString).expandingTildeInPath)
-        let orphanCandidates = listVideoFilesRecursively(at: rootPath, allowedExtensions: allowedExtensions)
-        for filePath in orphanCandidates {
-            if recordingID(forPath: filePath, database: database) != nil {
-                summary.skippedExisting += 1
-                continue
-            }
-
-            guard FileManager.default.fileExists(atPath: filePath) else { continue }
-            let channelName = URL(fileURLWithPath: filePath).deletingLastPathComponent().lastPathComponent
-            guard !channelName.isEmpty else { continue }
-
-            let channelID = ensureChannelID(username: channelName, database: database)
-            guard channelID > 0 else { continue }
-
-            if await insertBackfilledFile(path: filePath, channelID: channelID, repairedPaths: repairedPaths, database: database) {
-                summary.inserted += 1
-            }
-        }
+        // Orphan discovery (recursive scan) is deferred to background maintenance task
+        // to avoid blocking the UI during foreground tab load on large libraries.
+        // See scheduleBackgroundOrphanDiscovery() in ChannelManager.
 
         return summary
     }

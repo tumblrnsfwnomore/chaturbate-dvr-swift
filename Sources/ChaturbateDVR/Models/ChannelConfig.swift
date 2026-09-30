@@ -27,7 +27,7 @@ struct BioMetadata: Codable, Equatable {
 
 struct ChannelConfig: Codable, Identifiable {
     var id: String { username }
-    var isPaused: Bool
+    var isAutoRecordEnabled: Bool
     var username: String
     var outputDirectory: String
     var framerate: Int
@@ -44,7 +44,7 @@ struct ChannelConfig: Codable, Identifiable {
     var bioMetadata: BioMetadata?
     
     init(
-        isPaused: Bool = false,
+        isAutoRecordEnabled: Bool = true,
         username: String,
         outputDirectory: String = "",
         framerate: Int = 30,
@@ -60,7 +60,7 @@ struct ChannelConfig: Codable, Identifiable {
         isInvalid: Bool = false,
         bioMetadata: BioMetadata? = nil
     ) {
-        self.isPaused = isPaused
+        self.isAutoRecordEnabled = isAutoRecordEnabled
         self.username = Self.sanitizeUsername(username)
         self.outputDirectory = outputDirectory
         self.framerate = framerate
@@ -78,7 +78,8 @@ struct ChannelConfig: Codable, Identifiable {
     }
 
     private enum CodingKeys: String, CodingKey {
-        case isPaused
+        case isAutoRecordEnabled
+        case isPaused // legacy key for backward compatibility
         case username
         case outputDirectory
         case framerate
@@ -97,7 +98,16 @@ struct ChannelConfig: Codable, Identifiable {
 
     init(from decoder: Decoder) throws {
         let container = try decoder.container(keyedBy: CodingKeys.self)
-        isPaused = try container.decode(Bool.self, forKey: .isPaused)
+        // Support both new and legacy keys for backward compatibility
+        if container.contains(.isAutoRecordEnabled) {
+            isAutoRecordEnabled = try container.decode(Bool.self, forKey: .isAutoRecordEnabled)
+        } else if container.contains(.isPaused) {
+            // Legacy: isPaused was inverted logic, so invert it back
+            let wasPaused = try container.decode(Bool.self, forKey: .isPaused)
+            isAutoRecordEnabled = !wasPaused
+        } else {
+            isAutoRecordEnabled = true // default to enabled if neither key exists
+        }
         username = Self.sanitizeUsername(try container.decode(String.self, forKey: .username))
         outputDirectory = try container.decodeIfPresent(String.self, forKey: .outputDirectory) ?? ""
         framerate = try container.decode(Int.self, forKey: .framerate)
@@ -114,6 +124,25 @@ struct ChannelConfig: Codable, Identifiable {
         bioMetadata = try container.decodeIfPresent(BioMetadata.self, forKey: .bioMetadata)
     }
     
+    func encode(to encoder: Encoder) throws {
+        var container = encoder.container(keyedBy: CodingKeys.self)
+        try container.encode(isAutoRecordEnabled, forKey: .isAutoRecordEnabled)
+        try container.encode(username, forKey: .username)
+        try container.encode(outputDirectory, forKey: .outputDirectory)
+        try container.encode(framerate, forKey: .framerate)
+        try container.encode(resolution, forKey: .resolution)
+        try container.encode(pattern, forKey: .pattern)
+        try container.encode(maxDuration, forKey: .maxDuration)
+        try container.encode(maxFilesize, forKey: .maxFilesize)
+        try container.encode(maxSessionDuration, forKey: .maxSessionDuration)
+        try container.encode(maxSessionFilesize, forKey: .maxSessionFilesize)
+        try container.encode(createdAt, forKey: .createdAt)
+        try container.encodeIfPresent(lastOnlineAt, forKey: .lastOnlineAt)
+        try container.encode(recordingHistory, forKey: .recordingHistory)
+        try container.encode(isInvalid, forKey: .isInvalid)
+        try container.encodeIfPresent(bioMetadata, forKey: .bioMetadata)
+    }
+    
     private static func sanitizeUsername(_ username: String) -> String {
         let allowed = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "_-"))
         return username.components(separatedBy: allowed.inverted).joined()
@@ -124,9 +153,11 @@ struct ChannelConfig: Codable, Identifiable {
 struct ChannelInfo: Identifiable {
     var id: String { username }
     var isOnline: Bool
-    var isPaused: Bool
+    var isAutoRecordEnabled: Bool
+    var isRecordingSessionBlocked: Bool
     var isPausedBySessionLimit: Bool
     var isActivelyRecording: Bool
+    var isManualRecording: Bool  // True if this recording was started by a manual "Record Now" request
     var username: String
     var duration: String
     var filesize: String
@@ -172,6 +203,8 @@ struct RuntimeDiagnostics {
     var activeRecordings: Int
     var queuedRecordings: Int
     var maxConcurrentRecordings: Int
+    var activeManualRecordings: Int  // Separate count for manual recordings
+    var activeAutomaticRecordings: Int  // Separate count for automatic recordings
 
     static let empty = RuntimeDiagnostics(
         activeRequests: 0,
@@ -185,7 +218,9 @@ struct RuntimeDiagnostics {
         cloudflareBlockedChannels: 0,
         activeRecordings: 0,
         queuedRecordings: 0,
-        maxConcurrentRecordings: 0
+        maxConcurrentRecordings: 0,
+        activeManualRecordings: 0,
+        activeAutomaticRecordings: 0
     )
 }
 

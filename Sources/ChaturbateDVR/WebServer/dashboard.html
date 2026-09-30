@@ -15,55 +15,66 @@
 *,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
 html{scroll-behavior:smooth}
 body{background:#0f0f0f;color:#e5e5e5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;min-height:100vh;padding-top:calc(60px + env(safe-area-inset-top, 0px));padding-bottom:60px}
-header{background:#1a1a1a;padding:calc(14px + env(safe-area-inset-top, 0px)) 16px 14px;display:flex;align-items:center;gap:12px;border-bottom:1px solid #252525;position:fixed;top:0;left:0;right:0;z-index:20}
-header h1{font-size:16px;font-weight:600;flex:1}
-#meta{font-size:12px;color:#666;display:flex;align-items:center;gap:6px}
+header{background:#1a1a1a;padding:calc(10px + env(safe-area-inset-top, 0px)) 12px 10px;display:flex;align-items:center;gap:8px;border-bottom:1px solid #252525;position:fixed;top:0;left:0;right:0;z-index:20;flex-wrap:wrap;justify-content:space-between}
+header h1{font-size:15px;font-weight:600;margin:0}
+#headerLeft{display:flex;align-items:center;gap:8px;flex:1;min-width:0}
+#headerRight{display:flex;align-items:center;gap:6px;flex-wrap:wrap;justify-content:flex-end}
+#meta{font-size:11px;color:#666;display:flex;align-items:center;gap:4px;flex-shrink:0}
 #dot{width:6px;height:6px;border-radius:50%;background:#ef4444;flex-shrink:0;transition:background .3s}
 #dot.ok{background:#22c55e}
-#recBtn{display:flex;align-items:center;gap:6px;padding:6px 12px;border-radius:6px;font-size:12px;font-weight:600;cursor:pointer;border:none;transition:all .2s;flex-shrink:0}
+#slotStatus{font-size:10px;padding:2px 6px;background:rgba(99,102,241,.15);color:#818cf8;border-radius:4px;border:1px solid rgba(99,102,241,.3);flex-shrink:0;display:none;white-space:nowrap;align-items:center;gap:2px}
+#slotStatus.show{display:inline-flex}
+#slotStatus button{background:transparent;border:none;color:#818cf8;cursor:pointer;font-size:14px;font-weight:bold;padding:0;width:16px;height:16px;display:flex;align-items:center;justify-content:center;transition:color .15s}
+#slotStatus button:hover{color:#a0aeff}
+#slotDecBtn:disabled,#slotIncBtn:disabled{opacity:.4;cursor:not-allowed}
+.slot-indicator{display:inline-block;width:3px;height:3px;border-radius:50%;background:#818cf8}
+#recBtn{display:flex;align-items:center;gap:4px;padding:5px 10px;border-radius:6px;font-size:11px;font-weight:600;cursor:pointer;border:none;transition:all .2s;flex-shrink:0}
 #recBtn.enabled{background:rgba(239,68,68,.15);color:#f87171;border:1px solid rgba(239,68,68,.4)}
 #recBtn.disabled{background:rgba(249,115,22,.18);color:#fb923c;border:1px solid rgba(249,115,22,.5)}
-#recBtn .dot{width:8px;height:8px;border-radius:50%;flex-shrink:0}
+#recBtn .dot{width:6px;height:6px;border-radius:50%;flex-shrink:0}
 #recBtn.enabled .dot{background:#ef4444;animation:pulse 1.4s ease-in-out infinite}
 #recBtn.disabled .dot{background:#f97316}
 @keyframes pulse{0%,100%{opacity:1}50%{opacity:.4}}
-#filterBtn{background:transparent;border:1px solid #383838;color:#999;padding:6px 10px;border-radius:6px;font-size:12px;cursor:pointer;transition:all .15s}
+#filterBtn{background:transparent;border:1px solid #383838;color:#999;padding:5px 8px;border-radius:6px;font-size:11px;cursor:pointer;transition:all .15s;flex-shrink:0}
 #filterBtn:hover{border-color:#666;color:#ccc}
-#filterPanel{position:fixed;top:calc(60px + env(safe-area-inset-top, 0px));left:0;right:0;background:#1a1a1a;border-bottom:1px solid #252525;padding:16px;display:none;z-index:19}
+#filterPanel{position:fixed;top:calc(60px + env(safe-area-inset-top, 0px));left:0;right:0;background:#1a1a1a;border-bottom:1px solid #252525;padding:12px;display:none;z-index:19;max-height:calc(100vh - 60px);overflow-y:auto}
 #filterPanel.open{display:block}
-.filter-group{margin-bottom:14px}
+.filter-group{margin-bottom:10px}
 .filter-group:last-child{margin-bottom:0}
-.filter-label{font-size:12px;font-weight:600;color:#999;margin-bottom:6px;display:block}
-.filter-options{display:flex;flex-wrap:wrap;gap:8px}
-.filter-btn{background:transparent;border:1px solid #383838;color:#999;padding:6px 12px;border-radius:20px;font-size:11px;cursor:pointer;transition:all .15s}
+.filter-label{font-size:11px;font-weight:600;color:#999;margin-bottom:6px;display:block}
+.filter-options{display:flex;flex-wrap:wrap;gap:6px}
+.filter-btn{background:transparent;border:1px solid #383838;color:#999;padding:5px 10px;border-radius:20px;font-size:10px;cursor:pointer;transition:all .15s}
 .filter-btn.active{background:#a78bfa;color:#0f0f0f;border-color:#a78bfa}
 .filter-btn:hover{border-color:#666}
-#searchBox{width:100%;padding:8px 12px;background:#0f0f0f;border:1px solid #383838;color:#e5e5e5;border-radius:6px;font-size:14px;margin-bottom:12px}
+#searchBox{width:100%;padding:8px 10px;background:#0f0f0f;border:1px solid #383838;color:#e5e5e5;border-radius:6px;font-size:13px;margin-bottom:10px}
 #searchBox::placeholder{color:#666}
-body{scroll-padding-top:140px}
+body{scroll-padding-top:160px}
 .grid{display:grid;grid-template-columns:1fr;gap:12px;padding:16px}
-.card{background:#1a1a1a;border-radius:10px;overflow:hidden;border:1px solid #252525;transition:border-color .15s;cursor:pointer;display:flex;flex-direction:column}
+.card{background:#1a1a1a;border-radius:10px;overflow:hidden;border:1px solid #252525;transition:border-color .15s;display:flex;flex-direction:column}
 .card:active{border-color:#383838}
 .thumb-wrap{position:relative;width:100%;aspect-ratio:16/9;background:#1e1e1e;overflow:hidden}
 .thumb-wrap img{width:100%;height:100%;object-fit:cover;display:block}
 .placeholder{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:#2e2e2e}
-.info{padding:12px;display:flex;flex-direction:column;flex:1;min-height:110px}
+.info{padding:12px;display:flex;flex-direction:column;flex:1;min-height:130px}
 .username{font-size:14px;font-weight:600;margin-bottom:8px;word-break:break-word}
 .badges{display:flex;flex-wrap:wrap;gap:4px;margin-bottom:8px}
 .badge{font-size:10px;font-weight:600;padding:3px 8px;border-radius:99px;white-space:nowrap}
-.b-rec {background:rgba(124,58,237,.18);color:#a78bfa;border:1px solid rgba(124,58,237,.5)}
-.b-on  {background:rgba(34,197,94,.12); color:#4ade80;border:1px solid rgba(34,197,94,.4)}
-.b-wait{background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.4)}
-.b-off {background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
-.b-paus{background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
-.b-np  {background:rgba(239,68,68,.12); color:#f87171;border:1px solid rgba(239,68,68,.35)}
+.b-rec  {background:rgba(124,58,237,.18);color:#a78bfa;border:1px solid rgba(124,58,237,.5)}
+.b-manu {background:rgba(168,85,247,.18);color:#d8b4fe;border:1px solid rgba(168,85,247,.5)}
+.b-on   {background:rgba(34,197,94,.12); color:#4ade80;border:1px solid rgba(34,197,94,.4)}
+.b-wait {background:rgba(59,130,246,.12);color:#60a5fa;border:1px solid rgba(59,130,246,.4)}
+.b-off  {background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
+.b-paus {background:rgba(107,114,128,.10);color:#9ca3af;border:1px solid rgba(107,114,128,.3)}
+.b-np   {background:rgba(239,68,68,.12); color:#f87171;border:1px solid rgba(239,68,68,.35)}
 .meta{font-size:12px;color:#666;line-height:1.6;margin-bottom:8px}
-.actions{display:flex;gap:8px;margin-top:auto}
-.actions button{font-size:12px;font-weight:500;padding:6px 12px;border-radius:5px;border:1px solid;cursor:pointer;background:transparent;flex:1;transition:opacity .15s}
+.actions{display:flex;gap:6px;margin-top:auto;flex-wrap:wrap}
+.actions button{font-size:11px;font-weight:500;padding:5px 10px;border-radius:5px;border:1px solid;cursor:pointer;background:transparent;flex:1;min-width:50px;transition:opacity .15s}
 .actions button:active{opacity:.6}
 .actions button:disabled{opacity:.35;cursor:not-allowed}
-.btn-pause {color:#facc15;border-color:rgba(234,179,8,.45)}
-.btn-resume{color:#4ade80;border-color:rgba(34,197,94,.45)}
+.btn-record  {color:#a78bfa;border-color:rgba(167,139,250,.45)}
+.btn-stop    {color:#ef4444;border-color:rgba(239,68,68,.45)}
+.btn-auto    {color:#60a5fa;border-color:rgba(96,165,250,.45)}
+.btn-auto.off{color:#9ca3af;border-color:rgba(156,163,175,.3)}
 #empty{text-align:center;color:#444;padding:60px 20px;font-size:15px}
 #toTop{position:fixed;bottom:20px;right:20px;width:40px;height:40px;background:#a78bfa;color:#0f0f0f;border:none;border-radius:50%;cursor:pointer;font-size:18px;display:none;z-index:15;font-weight:600;transition:all .2s}
 #toTop:active{transform:scale(.95)}
@@ -72,27 +83,42 @@ body{scroll-padding-top:140px}
 #recBtn.loading .dot{animation:none !important}
 @media (min-width:768px) {
   body{padding-top:0;padding-bottom:20px}
-  header{position:sticky;top:0;padding:14px 20px}
+  header{position:sticky;top:0;padding:12px 16px;gap:16px;flex-wrap:nowrap}
+  header h1{font-size:16px}
+  #headerLeft{flex:1}
+  #headerRight{flex:0 1 auto;gap:8px}
   #filterBtn{display:none}
-  #filterPanel{position:sticky;top:59px;left:auto;right:auto;display:flex !important;gap:12px;align-items:center;flex-wrap:wrap;background:#151515;border-bottom:1px solid #252525;padding:12px 20px;z-index:19}
+  #filterPanel{position:sticky;top:59px;left:auto;right:auto;display:flex !important;gap:12px;align-items:center;padding:12px 16px;z-index:19;max-height:none;overflow:visible}
+  #filterPanel.open{display:flex}
   .grid{grid-template-columns:repeat(auto-fill,minmax(220px,1fr));gap:14px;padding:20px}
   .card:hover{border-color:#383838}
-  .actions button{font-size:11px;padding:4px 10px}
+  .actions button{font-size:11px;padding:4px 8px}
   #toTop{width:36px;height:36px;font-size:16px}
   .filter-group{margin:0}
   .filter-label{display:none}
   .filter-options{gap:6px}
-  #searchBox{width:240px;max-width:100%;padding:6px 10px;font-size:12px;margin-bottom:0}
+  #searchBox{width:200px;max-width:100%;padding:6px 10px;font-size:12px;margin-bottom:0}
 }
 </style>
 </head>
 <body>
 <header>
-  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
-    <circle cx="12" cy="12" r="10"/><polygon points="10,8 16,12 10,16"/>
-  </svg>
-  <h1>ChaturbateDVR</h1>  <button id="recBtn" class="enabled" title="Toggle global recording on/off"><span class="dot"></span><span id="recLabel">On</span></button>  <div id="meta"><span id="updated">Connecting…</span><span id="dot"></span></div>
-  <button id="filterBtn">≋ Filter</button>
+  <div id="headerLeft">
+    <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="#a78bfa" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+      <circle cx="12" cy="12" r="10"/><polygon points="10,8 16,12 10,16"/>
+    </svg>
+    <h1>ChaturbateDVR</h1>
+  </div>
+  <div id="meta"><span id="updated">Connecting…</span><span id="dot"></span></div>
+  <div id="headerRight">
+    <div id="slotStatus" class="show">
+      <button id="slotDecBtn" title="Decrease max concurrent recordings">−</button>
+      <span id="slotText">--</span>
+      <button id="slotIncBtn" title="Increase max concurrent recordings">+</button>
+    </div>
+    <button id="recBtn" class="enabled" title="Toggle global recording on/off"><span class="dot"></span><span id="recLabel">On</span></button>
+    <button id="filterBtn">≋</button>
+  </div>
 </header>
 <div id="filterPanel">
   <input type="text" id="searchBox" placeholder="Search channels...">
@@ -108,6 +134,7 @@ body{scroll-padding-top:140px}
 </div>
 <div class="grid" id="grid"></div>
 <button id="toTop" title="Back to top">↑</button>
+
 <script>
 const grid = document.getElementById('grid');
 const updated = document.getElementById('updated');
@@ -118,17 +145,39 @@ const filterBtn = document.getElementById('filterBtn');
 const filterPanel = document.getElementById('filterPanel');
 const searchBox = document.getElementById('searchBox');
 const toTopBtn = document.getElementById('toTop');
+const slotStatus = document.getElementById('slotStatus');
+const slotText = document.getElementById('slotText');
+const slotIncBtn = document.getElementById('slotIncBtn');
+const slotDecBtn = document.getElementById('slotDecBtn');
 
 let allChannels = [];
 let statusFilter = '';
 let recordingEnabled = true;
 let isFetching = false;
+let queueSnapshot = null;
+let lastQueueFetchAt = 0;
+
+const CHANNELS_POLL_INTERVAL_MS = 5000;
+const QUEUE_FETCH_MIN_INTERVAL_MS = 15000;
 
 function setRecordingUI(enabled) {
   recordingEnabled = enabled;
   recBtn.className = enabled ? 'enabled' : 'disabled';
   recLabel.textContent = enabled ? 'On' : 'Off';
   recBtn.title = enabled ? 'Click to pause all recordings' : 'Click to resume all recordings';
+}
+
+function updateSlotStatus() {
+  if (!queueSnapshot) {
+    slotStatus.classList.remove('show');
+    return;
+  }
+  const active = queueSnapshot.activeUsernames.length;
+  const max = Math.max(1, queueSnapshot.maxConcurrent);
+  slotText.textContent = `${active}/${max}`;
+  slotStatus.classList.add('show');
+  slotIncBtn.disabled = max >= 12;
+  slotDecBtn.disabled = max <= 1;
 }
 
 function esc(s) {
@@ -138,17 +187,23 @@ function esc(s) {
 }
 
 function badge(ch) {
-  if (ch.isRecording)              return {cls:'b-rec', label:'Recording'};
+  if (ch.isManualRecording) {
+    return {cls:'b-manu',label:'Manual Recording'};
+  }
+  if (ch.isRecording) {
+    return {cls:'b-rec',label:'Recording'};
+  }
   if (ch.isWaiting)                return {cls:'b-wait',label:'Waiting'};
-  if (ch.isOnline && ch.isPaused)  return {cls:'b-on',  label:'Online'};
-  if (!ch.isOnline && !ch.isPaused)return {cls:'b-off', label:'Offline'};
-  return {cls:'b-paus',label:'Paused'};
+  if (ch.isOnline && !ch.isAutoRecordEnabled)  return {cls:'b-on',  label:'Online (Auto Off)'};
+  if (ch.isOnline && ch.isAutoRecordEnabled)  return {cls:'b-on',  label:'Online'};
+  if (!ch.isOnline && !ch.isAutoRecordEnabled)return {cls:'b-off', label:'Offline (Auto Off)'};
+  return {cls:'b-paus',label:'Offline'};
 }
 
 function matchesFilter(ch) {
   if (statusFilter) {
     if (statusFilter === 'recording' && !ch.isRecording) return false;
-    if (statusFilter === 'online' && !(ch.isOnline && ch.isPaused)) return false;
+    if (statusFilter === 'online' && !ch.isOnline) return false;
     if (statusFilter === 'offline' && ch.isOnline) return false;
   }
   const search = searchBox.value.toLowerCase();
@@ -158,21 +213,25 @@ function matchesFilter(ch) {
 
 function cardDynHTML(ch) {
   const {cls, label} = badge(ch);
-  const pausedBadge = (ch.isOnline && ch.isPaused)
-    ? '<span class="badge b-paus">Paused</span>' : '';
   const noPerson = ch.isNoPersonDetected
     ? '<span class="badge b-np">No Person</span>' : '';
   const meta = [];
-  if ((ch.isRecording || ch.isWaiting) && ch.duration && ch.duration !== '0:00')
+  if ((ch.isRecording || ch.isWaiting || ch.isManualRecording) && ch.duration && ch.duration !== '0:00')
     meta.push('🕐 ' + esc(ch.duration) + (ch.filesize ? ' · ' + esc(ch.filesize) : ''));
   if (ch.lastOnlineAt && !ch.isOnline)
     meta.push('Last: ' + esc(ch.lastOnlineAt));
   const metaHTML = meta.length ? '<div class="meta">' + meta.join('<br>') + '</div>' : '';
-  const btn = ch.isPaused
-    ? '<button class="btn-resume" data-user="' + esc(ch.username) + '" data-action="resume">Resume</button>'
-    : '<button class="btn-pause" data-user="' + esc(ch.username) + '" data-action="pause">Pause</button>';
-  return '<div class="badges"><span class="badge ' + cls + '">' + label + '</span>' + pausedBadge + noPerson + '</div>' +
-    metaHTML + '<div class="actions">' + btn + '</div>';
+  
+  const buttons = [];
+  if (ch.isActivelyRecording) {
+    buttons.push('<button class="btn-stop" data-user="' + esc(ch.username) + '" data-action="stop">Stop</button>');
+  } else if (ch.isOnline) {
+    buttons.push('<button class="btn-record" data-user="' + esc(ch.username) + '" data-action="manual-record">Record Now</button>');
+  }
+  buttons.push('<button class="btn-auto' + (ch.isAutoRecordEnabled ? '' : ' off') + '" data-user="' + esc(ch.username) + '" data-action="toggle-auto-record">' + (ch.isAutoRecordEnabled ? 'Auto On' : 'Auto Off') + '</button>');
+  
+  return '<div class="badges"><span class="badge ' + cls + '">' + label + '</span>' + noPerson + '</div>' +
+    metaHTML + '<div class="actions">' + buttons.join('') + '</div>';
 }
 
 function thumbHTML(ch) {
@@ -215,34 +274,23 @@ function createCard(ch) {
 
 function render() {
   const filtered = allChannels.filter(matchesFilter);
-
-  // Index existing cards
   const existing = new Map();
   grid.querySelectorAll('.card[data-username]').forEach(el => existing.set(el.dataset.username, el));
-
   const desiredSet = new Set(filtered.map(ch => ch.username));
-
-  // Remove cards no longer in the filtered list
   existing.forEach((el, u) => { if (!desiredSet.has(u)) el.remove(); });
-
   if (filtered.length === 0) {
     if (!grid.querySelector('#empty'))
       grid.innerHTML = '<div id="empty">No channels match your filters</div>';
     return;
   }
-
   const emptyEl = grid.querySelector('#empty');
   if (emptyEl) emptyEl.remove();
-
-  // Update or create each card, maintaining sort order
   let prevEl = null;
   for (const ch of filtered) {
     let el = existing.get(ch.username);
     if (el) {
-      // Patch only the dynamic section — thumbnails are untouched so they don't flash
       const dynEl = el.querySelector('.card-dyn');
       if (dynEl) dynEl.innerHTML = cardDynHTML(ch);
-      // Only replace thumb-wrap when hasThumbnail state actually changes
       const hadThumb = el.dataset.hasThumb === '1';
       if (hadThumb !== ch.hasThumbnail) {
         const tw = el.querySelector('.thumb-wrap');
@@ -256,7 +304,6 @@ function render() {
     } else {
       el = createCard(ch);
     }
-    // Keep cards in correct order without a full rebuild
     if (prevEl) {
       if (el.previousElementSibling !== prevEl) prevEl.after(el);
     } else {
@@ -281,22 +328,61 @@ async function fetchChannels() {
     dot.className = 'ok';
     updated.textContent = new Date().toLocaleTimeString();
     render();
+    const now = Date.now();
+    if (!queueSnapshot || now - lastQueueFetchAt >= QUEUE_FETCH_MIN_INTERVAL_MS) {
+      fetchQueueSnapshot();
+    }
   } catch(e) {
     clearTimeout(timer);
     dot.className = '';
-    updated.textContent = e.name === 'AbortError' ? 'Timeout – retrying…' : 'Error – retrying…';
+    updated.textContent = e.name === 'AbortError' ? 'Timeout' : 'Error';
   } finally {
     isFetching = false;
   }
+}
+
+async function fetchQueueSnapshot() {
+  try {
+    const r = await fetch('/api/recording-queue/snapshot');
+    if (r.ok) {
+      queueSnapshot = await r.json();
+      lastQueueFetchAt = Date.now();
+      updateSlotStatus();
+    }
+  } catch(_) {}
 }
 
 filterBtn.addEventListener('click', () => {
   filterPanel.classList.toggle('open');
 });
 
+slotIncBtn.addEventListener('click', async () => {
+  if (queueSnapshot) {
+    const newMax = Math.min(12, queueSnapshot.maxConcurrent + 1);
+    slotIncBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/recording-queue/max-concurrent/${newMax}`, {method:'POST'});
+      if (r.ok) await fetchQueueSnapshot();
+    } catch(_) {}
+    slotIncBtn.disabled = false;
+  }
+});
+
+slotDecBtn.addEventListener('click', async () => {
+  if (queueSnapshot) {
+    const newMax = Math.max(1, queueSnapshot.maxConcurrent - 1);
+    slotDecBtn.disabled = true;
+    try {
+      const r = await fetch(`/api/recording-queue/max-concurrent/${newMax}`, {method:'POST'});
+      if (r.ok) await fetchQueueSnapshot();
+    } catch(_) {}
+    slotDecBtn.disabled = false;
+  }
+});
+
 recBtn.addEventListener('click', async () => {
   const newEnabled = !recordingEnabled;
-  setRecordingUI(newEnabled);           // optimistic update
+  setRecordingUI(newEnabled);
   recBtn.classList.add('loading');
   recBtn.disabled = true;
   try {
@@ -304,7 +390,7 @@ recBtn.addEventListener('click', async () => {
     if (!r.ok) throw new Error();
     await fetchChannels();
   } catch(_) {
-    setRecordingUI(!newEnabled);        // revert on failure
+    setRecordingUI(!newEnabled);
   } finally {
     recBtn.classList.remove('loading');
     recBtn.disabled = false;
@@ -330,13 +416,14 @@ grid.addEventListener('click', async e => {
   const username = btn.dataset.user;
   const action   = btn.dataset.action;
   btn.disabled = true;
+  const oldText = btn.textContent;
   btn.textContent = '…';
   try {
     await fetch('/api/channels/' + encodeURIComponent(username) + '/' + action, {method:'POST'});
     await fetchChannels();
   } catch(_) {
     btn.disabled = false;
-    btn.textContent = action === 'pause' ? 'Pause' : 'Resume';
+    btn.textContent = oldText;
   }
 });
 
@@ -349,7 +436,9 @@ toTopBtn.addEventListener('click', () => {
 });
 
 fetchChannels();
-setInterval(fetchChannels, 3000);
+fetchQueueSnapshot();
+setInterval(fetchChannels, CHANNELS_POLL_INTERVAL_MS);
+setInterval(fetchQueueSnapshot, QUEUE_FETCH_MIN_INTERVAL_MS);
 </script>
 </body>
 </html>

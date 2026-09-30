@@ -3,13 +3,42 @@ import AVFoundation
 import AppKit
 import Vision
 
+private struct ProcessResult {
+    let status: Int32
+    let stdout: String
+    let stderr: String
+}
+
 private actor MP4Finalizer {
+    static func buildRetimedAudioFilter(
+        audioInputIndex: Int,
+        tempoAdjustment: Double? = nil,
+        audioDelaySeconds: Double? = nil
+    ) -> String {
+        var stages: [String] = []
+
+        if let tempoAdjustment {
+            let tempoText = String(format: "%.6f", tempoAdjustment)
+            stages.append("atempo=\(tempoText)")
+        }
+
+        if let audioDelaySeconds,
+           audioDelaySeconds > 0 {
+            let delayMs = max(0, Int(round(audioDelaySeconds * 1000.0)))
+            stages.append("adelay=\(delayMs)|\(delayMs)")
+        }
+
+        stages.append("aresample=async=1:first_pts=0")
+        return "[\(audioInputIndex):a:0]\(stages.joined(separator: ","))[a]"
+    }
+
     private struct PendingJob {
         let sourcePath: String
         let audioSourcePath: String?
         let destinationPath: String
         let channel: String
         let preferRetimingOnFailure: Bool
+        let audioDelaySeconds: Double?
         let queuedAt: Date
         let onCompletion: (@Sendable (RepairOutcome) -> Void)?
     }
@@ -32,12 +61,6 @@ private actor MP4Finalizer {
     private struct MediaMetrics {
         let durationSeconds: Double?
         let sizeBytes: Int64
-    }
-
-    private struct ProcessResult {
-        let status: Int32
-        let stdout: String
-        let stderr: String
     }
 
     private var inFlightPaths: Set<String> = []
@@ -91,6 +114,7 @@ private actor MP4Finalizer {
         destinationPath: String,
         channel: String,
         preferRetimingOnFailure: Bool = false,
+        audioDelaySeconds: Double? = nil,
         onCompletion: (@Sendable (RepairOutcome) -> Void)? = nil
     ) {
         guard inFlightPaths.insert(sourcePath).inserted else { return }
@@ -101,6 +125,7 @@ private actor MP4Finalizer {
             destinationPath: destinationPath,
             channel: channel,
             preferRetimingOnFailure: preferRetimingOnFailure,
+            audioDelaySeconds: audioDelaySeconds,
             queuedAt: Date(),
             onCompletion: onCompletion
         ))
@@ -117,6 +142,10 @@ private actor MP4Finalizer {
             return .skipped("repair already in progress")
         }
 
+        defer {
+            inFlightPaths.remove(path)
+        }
+
         return await finalize(
             sourcePath: path,
             destinationPath: path,
@@ -125,12 +154,30 @@ private actor MP4Finalizer {
         )
     }
 
+    func repairAudioSync(path: String, channel: String, detectedAudioDelaySeconds: Double? = nil) async -> RepairOutcome {
+        guard inFlightPaths.insert(path).inserted else {
+            return .skipped("repair already in progress")
+        }
+
+        defer {
+            inFlightPaths.remove(path)
+        }
+
+        return await finalizeWithForceRetime(
+            sourcePath: path,
+            destinationPath: path,
+            channel: channel,
+            audioDelaySeconds: detectedAudioDelaySeconds
+        )
+    }
+
     private func finalize(
         sourcePath: String,
         audioSourcePath: String? = nil,
         destinationPath: String,
         channel: String,
-        preferRetimingOnFailure: Bool
+        preferRetimingOnFailure: Bool,
+        audioDelaySeconds: Double? = nil
     ) async -> RepairOutcome {
         let sourceURL = URL(fileURLWithPath: sourcePath)
         let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: $0) }
@@ -178,7 +225,8 @@ private actor MP4Finalizer {
                     sourceURL: sourceURL,
                     audioSourceURL: hasAudioSidecar ? audioSourceURL : nil,
                     destinationURL: tempURL,
-                    fps: fps
+                    fps: fps,
+                    audioDelaySeconds: audioDelaySeconds
                 )
 
                 let retimedMetrics = try await loadMediaMetrics(for: tempURL)
@@ -226,6 +274,116 @@ private actor MP4Finalizer {
         } catch {
             try? FileManager.default.removeItem(at: tempURL)
             await FileLogger.shared.log("[recording] mp4 finalization skipped: \(error.localizedDescription)", channel: channel, level: "WARN")
+            return .skipped(error.localizedDescription)
+        }
+    }
+
+    private func finalizeWithForceRetime(
+        sourcePath: String,
+        destinationPath: String,
+        channel: String,
+        audioDelaySeconds: Double? = nil
+    ) async -> RepairOutcome {
+        let sourceURL = URL(fileURLWithPath: sourcePath)
+        let destinationURL = URL(fileURLWithPath: destinationPath)
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            return .skipped("source file missing")
+        }
+
+        // Check for audio sidecar (same name with _audio.m4a suffix)
+        let audioSidecarPath = sourcePath.replacingOccurrences(
+            of: sourceURL.lastPathComponent,
+            with: "\(sourceURL.deletingPathExtension().lastPathComponent)_audio.m4a"
+        )
+        let hasAudioSidecar = FileManager.default.fileExists(atPath: audioSidecarPath)
+
+        let tempURL = sourceURL
+            .deletingLastPathComponent()
+            .appendingPathComponent("\(sourceURL.deletingPathExtension().lastPathComponent)_audiosync_\(UUID().uuidString).mp4")
+
+        do {
+            let sourceAttributes = try? FileManager.default.attributesOfItem(atPath: sourceURL.path)
+            let sourceMetrics = try await loadMediaMetrics(for: sourceURL)
+
+            guard let ffmpegPath = resolveFFMPEGPath() else {
+                return .skipped("ffmpeg is required for audio sync correction")
+            }
+
+            let fps = await detectSourceFPS(for: sourceURL)
+
+            // If we have split audio, calculate tempo adjustment needed
+            var audioTempoAdjustment: Double? = nil
+            if hasAudioSidecar {
+                let audioMetrics = try await loadMediaMetrics(for: URL(fileURLWithPath: audioSidecarPath))
+                
+                // Calculate tempo adjustment if durations differ by more than 50ms
+                if let videoDuration = sourceMetrics.durationSeconds,
+                   let audioDuration = audioMetrics.durationSeconds,
+                   abs(videoDuration - audioDuration) > 0.05 {
+                    audioTempoAdjustment = videoDuration / audioDuration
+                    await FileLogger.shared.log(
+                        "[recording] audio/video duration mismatch detected: video=\(String(format: "%.2f", videoDuration))s, audio=\(String(format: "%.2f", audioDuration))s, applying tempo adjustment=\(String(format: "%.4f", audioTempoAdjustment!))",
+                        channel: channel
+                    )
+                }
+            }
+
+            let effectiveAudioDelay = audioDelaySeconds ?? 0
+            if effectiveAudioDelay > 0 {
+                await FileLogger.shared.log(
+                    "[recording] applying detected audio delay during retime: \(String(format: "%.3f", effectiveAudioDelay))s",
+                    channel: channel,
+                    level: "WARN"
+                )
+            }
+
+            try await retimeWithFFMPEG(
+                ffmpegPath: ffmpegPath,
+                sourceURL: sourceURL,
+                audioSourceURL: hasAudioSidecar ? URL(fileURLWithPath: audioSidecarPath) : nil,
+                destinationURL: tempURL,
+                fps: fps,
+                audioTempoAdjustment: audioTempoAdjustment,
+                audioDelaySeconds: effectiveAudioDelay
+            )
+
+            let retimedMetrics = try await loadMediaMetrics(for: tempURL)
+            try validateExport(source: sourceMetrics, exported: retimedMetrics)
+
+            if FileManager.default.fileExists(atPath: sourceURL.path) {
+                try FileManager.default.removeItem(at: sourceURL)
+            }
+            if FileManager.default.fileExists(atPath: destinationURL.path) {
+                try FileManager.default.removeItem(at: destinationURL)
+            }
+            try FileManager.default.moveItem(at: tempURL, to: destinationURL)
+
+            var preservedAttributes: [FileAttributeKey: Any] = [:]
+            if let createdAt = sourceAttributes?[.creationDate] {
+                preservedAttributes[.creationDate] = createdAt
+            }
+            if let modifiedAt = sourceAttributes?[.modificationDate] {
+                preservedAttributes[.modificationDate] = modifiedAt
+            }
+            if !preservedAttributes.isEmpty {
+                try? FileManager.default.setAttributes(preservedAttributes, ofItemAtPath: destinationURL.path)
+            }
+
+            // Clean up audio sidecar if present
+            if hasAudioSidecar, FileManager.default.fileExists(atPath: audioSidecarPath) {
+                try? FileManager.default.removeItem(atPath: audioSidecarPath)
+            }
+
+            let destinationMetrics = try await loadMediaMetrics(for: destinationURL)
+            await FileLogger.shared.log(
+                "[recording] finalized mp4 with audio sync correction (duration \(formatSeconds(destinationMetrics.durationSeconds)) size \(destinationMetrics.sizeBytes) bytes)",
+                channel: channel,
+                level: "WARN"
+            )
+            return .succeeded
+        } catch {
+            try? FileManager.default.removeItem(at: tempURL)
+            await FileLogger.shared.log("[recording] audio sync correction failed: \(error.localizedDescription)", channel: channel, level: "WARN")
             return .skipped(error.localizedDescription)
         }
     }
@@ -299,7 +457,9 @@ private actor MP4Finalizer {
         sourceURL: URL,
         audioSourceURL: URL? = nil,
         destinationURL: URL,
-        fps: Double
+        fps: Double,
+        audioTempoAdjustment: Double? = nil,
+        audioDelaySeconds: Double? = nil
     ) async throws {
         let fpsText = String(format: "%.6f", fps)
         var arguments: [String] = [
@@ -325,7 +485,15 @@ private actor MP4Finalizer {
         if hasAudio {
             // Normalize both timelines to start at zero so retimed video does not
             // drift from copied/offset audio timestamps.
-            let filter = "[0:v:0]setpts=N/(\(fpsText)*TB),fps=\(fpsText),format=yuv420p[v];[\(audioInputIndex):a:0]aresample=async=1:first_pts=0[a]"
+            // Repairing a file that is consistently late by ~0.5s requires an
+            // explicit audio delay while regenerating timestamps; otherwise the
+            // ffmpeg retime step leaves the audio effectively unchanged.
+            let audioFilter = MP4Finalizer.buildRetimedAudioFilter(
+                audioInputIndex: audioInputIndex,
+                tempoAdjustment: audioTempoAdjustment,
+                audioDelaySeconds: audioDelaySeconds
+            )
+            let filter = "[0:v:0]setpts=N/(\(fpsText)*TB),fps=\(fpsText),format=yuv420p[v];\(audioFilter)"
             arguments += [
                 "-filter_complex", filter,
                 "-map", "[v]",
@@ -592,7 +760,8 @@ private actor MP4Finalizer {
                     audioSourcePath: job.audioSourcePath,
                     destinationPath: job.destinationPath,
                     channel: job.channel,
-                    preferRetimingOnFailure: job.preferRetimingOnFailure
+                    preferRetimingOnFailure: job.preferRetimingOnFailure,
+                    audioDelaySeconds: job.audioDelaySeconds
                 )
                 finishJob(sourcePath: job.sourcePath)
                 job.onCompletion?(outcome)
@@ -618,6 +787,18 @@ private actor MP4Finalizer {
 
 actor Channel {
     private static let workingFilePrefix = "cbdvr_inprogress_"
+
+    static func buildRetimedAudioFilter(
+        audioInputIndex: Int,
+        tempoAdjustment: Double? = nil,
+        audioDelaySeconds: Double? = nil
+    ) -> String {
+        MP4Finalizer.buildRetimedAudioFilter(
+            audioInputIndex: audioInputIndex,
+            tempoAdjustment: tempoAdjustment,
+            audioDelaySeconds: audioDelaySeconds
+        )
+    }
 
     private enum IngestContainerMode {
         case unknown
@@ -695,7 +876,9 @@ actor Channel {
     private var monitoringTask: Task<Void, Never>?
     private var waitingForSlotStatusTask: Task<Void, Never>?
     private var client: ChaturbateClient
+    private var mediaHTTPClient: HTTPClient
     private var appConfig: AppConfig
+    private var previousOnlineState: Bool = false
     private var lastThumbnailTime: Date = Date.distantPast
     private var lastPausedPreviewTime: Date = Date.distantPast
     private var lastWaitingPreviewTime: Date = Date.distantPast
@@ -757,6 +940,7 @@ actor Channel {
     private let requestCoordinator: RequestCoordinator
     private let recordingRequestCoordinator: RequestCoordinator
     private let recordingCoordinator: RecordingCoordinator
+    private let manualRecordingSlotManager: ManualRecordingSlotManager
     private let recordingLedger: RecordingLedger
     private var activeRecordingID: Int64?
     private var activeRecordingStartedAt: Date?
@@ -773,12 +957,22 @@ actor Channel {
     private var maxAudioLeadObserved: Double = 0 // Maximum audio lead observed during session
     private var lastSyncDiagnosticLogAt: Date = .distantPast
     
+    // Session-level recording control: blocks this channel from recording until offline + back online,
+    // regardless of isPaused/auto-record setting. Used to stop current recording while preserving auto-record state.
+    private var shouldBlockRecordingThisSession: Bool = false
+    
+    // Temporary slot management for manual "Record Now" requests
+    private var isUsingTemporarySlot: Bool = false
+    private var manualRecordingSlotID: UUID?
+    private var isManualRecordingRequest: Bool = false
+    
     init(
         config: ChannelConfig,
         appConfig: AppConfig,
         requestCoordinator: RequestCoordinator,
         recordingRequestCoordinator: RequestCoordinator,
         recordingCoordinator: RecordingCoordinator,
+        manualRecordingSlotManager: ManualRecordingSlotManager,
         recordingLedger: RecordingLedger,
         onRecordingFinalized: (@Sendable (String) -> Void)? = nil
     ) {
@@ -786,9 +980,11 @@ actor Channel {
         self.onRecordingFinalized = onRecordingFinalized
         self.appConfig = appConfig
         self.client = ChaturbateClient(config: appConfig)
+        self.mediaHTTPClient = HTTPClient(config: appConfig)
         self.requestCoordinator = requestCoordinator
         self.recordingRequestCoordinator = recordingRequestCoordinator
         self.recordingCoordinator = recordingCoordinator
+        self.manualRecordingSlotManager = manualRecordingSlotManager
         self.recordingLedger = recordingLedger
         self.isInvalid = config.isInvalid
         
@@ -799,6 +995,7 @@ actor Channel {
     func updateAppConfig(_ newAppConfig: AppConfig) {
         appConfig = newAppConfig
         client = ChaturbateClient(config: newAppConfig)
+        mediaHTTPClient = HTTPClient(config: newAppConfig)
     }
     
     private nonisolated static func findExistingThumbnail(username: String) -> String? {
@@ -815,8 +1012,10 @@ actor Channel {
     func pause() {
         let wasOnline = isOnline
         clearActiveRecordingTransientFailureState()
-        config.isPaused = true
+        config.isAutoRecordEnabled = false
+        shouldBlockRecordingThisSession = false
         isPausedBySessionLimit = false
+        isManualRecordingRequest = false
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
         resetBreakDetectionState()
         clearDegradedState()
@@ -826,17 +1025,19 @@ actor Channel {
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
         if wasOnline {
-            addLog("Channel paused (kept as paused-online for up to 1 minute)")
+            addLog("Auto-record disabled (kept as paused-online for up to 1 minute)")
         } else {
-            addLog("Channel paused")
+            addLog("Auto-record disabled")
         }
     }
     
     func pauseForSessionLimit(reason: String) {
         let wasOnline = isOnline
         clearActiveRecordingTransientFailureState()
-        config.isPaused = true
+        config.isAutoRecordEnabled = false
+        shouldBlockRecordingThisSession = false
         isPausedBySessionLimit = true
+        isManualRecordingRequest = false
         pausedOnlineStickyUntil = wasOnline ? Date().addingTimeInterval(Self.pausedOnlineStickyDuration) : nil
         resetBreakDetectionState()
         clearDegradedState()
@@ -845,12 +1046,13 @@ actor Channel {
         endWaitingForSlotMonitoring()
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
-        addLog("Session limit reached (\(reason)). Channel paused until it goes offline and comes back for a new session.")
+        addLog("Session limit reached (\(reason)). Auto-record paused until channel goes offline and comes back online.")
     }
     
     func resume() {
         clearActiveRecordingTransientFailureState()
-        config.isPaused = false
+        config.isAutoRecordEnabled = true
+        shouldBlockRecordingThisSession = false
         isPausedBySessionLimit = false
         pausedOnlineStickyUntil = nil
         sessionDurationSeconds = 0
@@ -861,12 +1063,113 @@ actor Channel {
         monitoringTask = Task {
             await monitor()
         }
-        addLog("Channel resumed")
+        addLog("Auto-record enabled")
+    }
+    
+    /// Request manual recording: starts recording immediately for this session without changing auto-record setting.
+    /// If already recording or session is blocked, attempts to proceed anyway.
+    func requestManualRecording() {
+        clearActiveRecordingTransientFailureState()
+        shouldBlockRecordingThisSession = false
+        isManualRecordingRequest = true
+        isPausedBySessionLimit = false
+        pausedOnlineStickyUntil = nil
+        
+        // If monitoring task is already running, cancel it and restart to immediately
+        // evaluate the new manual recording request
+        if let existing = monitoringTask {
+            existing.cancel()
+            monitoringTask = Task {
+                await monitor()
+            }
+            addLog("Manual recording requested (restarted monitor)")
+            return
+        }
+        
+        monitoringTask = Task {
+            await monitor()
+        }
+        addLog("Manual recording requested")
+    }
+    
+    /// Toggle auto-record setting for this channel (independent of manual recording state)
+    func toggleAutoRecord() {
+        config.isAutoRecordEnabled = !config.isAutoRecordEnabled
+        let state = config.isAutoRecordEnabled ? "enabled" : "disabled"
+        addLog("Auto-record \(state)")
+        
+        if config.isAutoRecordEnabled && monitoringTask == nil {
+            // Start monitoring if auto-record just got enabled and we're not already monitoring
+            monitoringTask = Task {
+                await monitor()
+            }
+        }
+    }
+    
+    /// Manually refresh the channel's online status (non-blocking check)
+    func refreshChannelStatus() {
+        Task {
+            do {
+                let stream = try await withRequestSlot(priority: .low) {
+                    try await client.getStream(username: config.username)
+                }
+                markChannelValid()
+                isOnline = true
+                markLastOnlineNow()
+                liveStreamURL = stream.hlsSource
+                addLog("Manual status check: channel is online")
+            } catch let cbError as ChaturbateError {
+                switch cbError {
+                case .invalidChannel:
+                    markChannelInvalid()
+                    addLog("Manual status check: channel is invalid (404)")
+                case .channelOffline:
+                    isOnline = false
+                    liveStreamURL = nil
+                    addLog("Manual status check: channel is offline")
+                case .privateStream:
+                    isOnline = false
+                    liveStreamURL = nil
+                    addLog("Manual status check: channel is private")
+                default:
+                    addLog("Manual status check: error - \(cbError.localizedDescription)")
+                }
+            } catch {
+                addLog("Manual status check: error - \(error.localizedDescription)")
+            }
+        }
+    }
+    
+    /// Stop recording this session: blocks recording for the current session without changing auto-record setting.
+    /// Recording will resume automatically when the channel goes offline and comes back online.
+    func stopRecordingThisSession() {
+        if !isOnline || currentFile == nil {
+            addLog("Stop recording: not currently recording")
+            return
+        }
+        
+        shouldBlockRecordingThisSession = true
+        
+        // Clean up manual recording state
+        if isUsingTemporarySlot {
+            if let slotID = manualRecordingSlotID {
+                Task {
+                    await self.manualRecordingSlotManager.releaseSlot(slotID: slotID)
+                }
+                manualRecordingSlotID = nil
+            }
+            isUsingTemporarySlot = false
+            isManualRecordingRequest = false
+        }
+        
+        closeCurrentFile(resetStats: false) // keep the file, just stop
+        addLog("Stopped recording (will resume auto-record when channel goes offline and back online)")
     }
     
     func stopForDeletion() {
         clearActiveRecordingTransientFailureState()
-        config.isPaused = true
+        config.isAutoRecordEnabled = false
+        shouldBlockRecordingThisSession = false
         pausedOnlineStickyUntil = nil
         resetBreakDetectionState()
         monitoringTask?.cancel()
@@ -927,7 +1230,7 @@ actor Channel {
     }
     
     func updateConfig(_ newConfig: ChannelConfig) {
-        let wasRecording = !config.isPaused && isOnline
+        let wasRecording = config.isAutoRecordEnabled && isOnline
         
         // Update config fields (keep username as identifier)
         config.outputDirectory = newConfig.outputDirectory
@@ -997,14 +1300,17 @@ actor Channel {
         let waitingBecauseGlobalPause = isInGlobalRecordingPauseMode
             && !appConfig.recordingEnabled
             && isOnline
-            && !config.isPaused
-        let effectiveWaitingForSlot = (isWaitingForRecordingSlot || waitingBecauseGlobalPause) && !config.isPaused
+            && config.isAutoRecordEnabled
+            && !isManualRecordingRequest
+        let effectiveWaitingForSlot = (isWaitingForRecordingSlot || waitingBecauseGlobalPause) && (config.isAutoRecordEnabled || isManualRecordingRequest) && !shouldBlockRecordingThisSession
         
         return ChannelInfo(
             isOnline: isOnline,
-            isPaused: config.isPaused,
+            isAutoRecordEnabled: config.isAutoRecordEnabled,
+            isRecordingSessionBlocked: shouldBlockRecordingThisSession,
             isPausedBySessionLimit: isPausedBySessionLimit,
             isActivelyRecording: currentFile != nil || activeRecordingID != nil,
+            isManualRecording: isManualRecordingRequest && (currentFile != nil || activeRecordingID != nil),
             username: config.username,
             duration: formatDuration(duration),
             filesize: formatFilesize(filesize),
@@ -1038,6 +1344,12 @@ actor Channel {
         )
     }
 
+    func checkAndResetOnlineTransition() -> Bool {
+        let wasJustOnline = !previousOnlineState && isOnline
+        previousOnlineState = isOnline
+        return wasJustOnline
+    }
+
     func backfillOfflineThumbnailIfNeeded() async -> OfflineThumbnailBackfillResult {
         // Only skip if we already have a successful thumbnail
         guard thumbnailPath == nil,
@@ -1050,7 +1362,7 @@ actor Channel {
     }
 
     func refreshPausedOnlineStatus(bypassRateLimit: Bool = false) async {
-        guard config.isPaused else { return }
+        guard !config.isAutoRecordEnabled else { return }
 
         let wasOnline = isOnline
 
@@ -1162,7 +1474,7 @@ actor Channel {
         guard !isChecking else { return }
 
         // If actively recording, the recorder loop already provides fresh state.
-        if currentFile != nil && !config.isPaused {
+        if currentFile != nil && config.isAutoRecordEnabled {
             return
         }
 
@@ -1235,7 +1547,7 @@ actor Channel {
                 framerate: config.framerate
             )
 
-            let httpClient = HTTPClient(config: appConfig)
+            let httpClient = mediaHTTPClient
             let mediaPlaylistContent = try await withRequestSlot(priority: .low) {
                 try await httpClient.get(playlist.playlistURL)
             }
@@ -1330,11 +1642,90 @@ actor Channel {
         recordingsDirectoryPath()
     }
     
+    func remuxWithAudioSyncCorrection(fileURL: URL) async throws {
+        // Fix audio/video sync by regenerating timestamps for both streams IN-PLACE.
+        // This MUST use forced retime (not passthrough) to properly regenerate audio/video timestamps.
+        // Stream copy alone does not fix sync issues; re-encoding is required.
+        let fileName = fileURL.lastPathComponent
+        addLog("Starting audio/video sync correction with retime: \(fileName)")
+        
+        // Use MP4Finalizer's dedicated audio sync correction which forces retime
+        let outcome = await Self.mp4Finalizer.repairAudioSync(path: fileURL.path, channel: config.username)
+        
+        switch outcome {
+        case .succeeded:
+            addLog("✓ Audio/video sync correction applied: \(fileName)")
+        case .skipped(let reason):
+            throw ChaturbateError.fileError("Audio/video sync correction skipped: \(reason)")
+        }
+    }
+    
+    private func resolveFFMPEGPath() -> String? {
+        let candidates = [
+            "/opt/homebrew/bin/ffmpeg",
+            "/usr/local/bin/ffmpeg",
+            "/usr/bin/ffmpeg",
+        ]
+
+        return candidates.first { FileManager.default.isExecutableFile(atPath: $0) }
+    }
+    
+    private func runProcess(executablePath: String, arguments: [String]) async -> ProcessResult {
+        // Run process on utility queue with proper continuation resume on main thread
+        // IMPORTANT: Must resume on main thread to maintain actor isolation invariants
+        return await withCheckedContinuation { continuation in
+            DispatchQueue.global(qos: .utility).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: executablePath)
+                process.arguments = arguments
+
+                let stdoutPipe = Pipe()
+                let stderrPipe = Pipe()
+                process.standardOutput = stdoutPipe
+                process.standardError = stderrPipe
+
+                let result: ProcessResult
+                do {
+                    try process.run()
+                    process.waitUntilExit()
+
+                    let stdoutData = stdoutPipe.fileHandleForReading.readDataToEndOfFile()
+                    let stderrData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+
+                    result = ProcessResult(
+                        status: process.terminationStatus,
+                        stdout: String(decoding: stdoutData, as: UTF8.self),
+                        stderr: String(decoding: stderrData, as: UTF8.self)
+                    )
+                } catch {
+                    result = ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
+                }
+                
+                // Resume on main thread to preserve continuation safety and actor isolation
+                DispatchQueue.main.async {
+                    continuation.resume(returning: result)
+                }
+            }
+        }
+    }
+    
+
+    
     private func monitor() async {
         addLog("Starting to record `\(config.username)`")
         
         while !Task.isCancelled {
-            if !appConfig.recordingEnabled && !config.isPaused {
+            // Check if this session should be blocked (user explicitly stopped recording)
+            if shouldBlockRecordingThisSession && config.isAutoRecordEnabled {
+                if !isInGlobalRecordingPauseMode {
+                    isInGlobalRecordingPauseMode = true
+                    addLog("Recording blocked this session; switching to low-volume status checks")
+                }
+                await runLowVolumeStatusCheckWhileRecordingPaused()
+                continue
+            }
+            
+            if !appConfig.recordingEnabled && config.isAutoRecordEnabled && !isManualRecordingRequest {
                 if !isInGlobalRecordingPauseMode {
                     isInGlobalRecordingPauseMode = true
                     addLog("Recording is globally paused; switching to low-volume status checks")
@@ -1354,7 +1745,13 @@ actor Channel {
                 clearActiveRecordingTransientFailureState()
                 cloudflareBlockCount = 0
                 isFirstCheck = false
+                // Clear manual recording flag after successful session
+                isManualRecordingRequest = false
             } catch {
+                // NOTE: DO NOT clear isManualRecordingRequest here!
+                // Manual recording should persist across retries until explicitly stopped
+                // or the channel goes offline. Only clear it on success or offline transition.
+                
                 if Task.isCancelled { break }
                 
                 var waitTime = appConfig.interval * 60 // base wait in seconds
@@ -1464,7 +1861,7 @@ actor Channel {
             }
         }
 
-        if !config.isPaused {
+        if config.isAutoRecordEnabled {
             isOnline = false
         }
         resetBreakDetectionState()
@@ -1535,6 +1932,14 @@ actor Channel {
     }
     
     private func recordStream() async throws {
+        // Check if this session should be blocked or if auto-record is disabled (unless manual recording)
+        if shouldBlockRecordingThisSession {
+            throw ChaturbateError.channelOffline
+        }
+        if !config.isAutoRecordEnabled && !isManualRecordingRequest {
+            throw ChaturbateError.channelOffline
+        }
+        
         isChecking = true
         defer {
             manualBreakOverrideActive = false
@@ -1551,8 +1956,11 @@ actor Channel {
             throw ChaturbateError.channelOffline
         }
 
-        if await shouldDelayStartForNoPerson(hlsSource: stream.hlsSource) {
-            throw ChaturbateError.channelOffline
+        // Skip no-person check for manual recording requests (user has explicitly chosen to record)
+        if !isManualRecordingRequest {
+            if await shouldDelayStartForNoPerson(hlsSource: stream.hlsSource) {
+                throw ChaturbateError.channelOffline
+            }
         }
         
         // Check is complete, now we're in recording mode
@@ -1595,14 +2003,19 @@ actor Channel {
                     try await nextFile()
                     defer {
                         // Preserve paused-live state after a user pause until paused probes settle.
-                        if config.isPaused {
+                        // Also preserve online status if recording was manually stopped - the channel
+                        // is still online, we just voluntarily stopped recording.
+                        if !config.isAutoRecordEnabled {
                             let stickyActive = pausedOnlineStickyUntil.map { Date() < $0 } ?? false
                             if !stickyActive {
                                 isOnline = false
                             }
-                        } else {
+                        } else if !shouldBlockRecordingThisSession {
+                            // Only mark offline if we're not in a manual stop state
                             isOnline = false
                         }
+                        // If shouldBlockRecordingThisSession is true, keep isOnline at its current
+                        // value (should still be true if the channel is actually online)
                         closeCurrentFile(resetStats: true)
                         clearRecordingPreviewState(removeTempFile: true)
                     }
@@ -1624,6 +2037,10 @@ actor Channel {
                 }
 
                 endWaitingForSlotMonitoring()
+                
+                // withRecordingSlot already cleaned up the manual slot
+                isUsingTemporarySlot = false
+                
                 return
             } catch let cbError as ChaturbateError {
                 let isRetryableSetupError: Bool
@@ -1634,7 +2051,7 @@ actor Channel {
                     isRetryableSetupError = false
                 }
 
-                if isRetryableSetupError, setupAttempt < 2, !config.isPaused {
+                if isRetryableSetupError, setupAttempt < 2, (config.isAutoRecordEnabled || isManualRecordingRequest) && !shouldBlockRecordingThisSession {
                     addLog("Stream setup returned offline/private, refreshing stream source and retrying once")
                     let refreshed = try await withRequestSlot(priority: .high) {
                         try await client.getStream(username: config.username)
@@ -1648,9 +2065,17 @@ actor Channel {
                 }
 
                 endWaitingForSlotMonitoring()
+                
+                // withRecordingSlot already cleaned up the manual slot
+                isUsingTemporarySlot = false
+                
                 throw cbError
             } catch {
                 endWaitingForSlotMonitoring()
+                
+                // withRecordingSlot already cleaned up the manual slot
+                isUsingTemporarySlot = false
+                
                 throw error
             }
         }
@@ -1697,7 +2122,7 @@ actor Channel {
 
     // Returns an updated HLS source when stream probing succeeds.
     private func probeWaitingStreamStatus() async -> String? {
-        guard isWaitingForRecordingSlot, !config.isPaused else { return nil }
+        guard isWaitingForRecordingSlot, (config.isAutoRecordEnabled || isManualRecordingRequest) && !shouldBlockRecordingThisSession else { return nil }
 
         isChecking = true
         let wasOnlineBeforeFailure = isOnline
@@ -1816,7 +2241,7 @@ actor Channel {
                 framerate: config.framerate
             )
 
-            let httpClient = HTTPClient(config: appConfig)
+            let httpClient = mediaHTTPClient
             let mediaPlaylistContent = try await withRequestSlot(priority: .low) {
                 try await httpClient.get(playlist.playlistURL)
             }
@@ -1947,13 +2372,42 @@ actor Channel {
     }
 
     private func withRecordingSlot<T>(_ operation: () async throws -> T) async throws -> T {
-        let slotGranted = await recordingCoordinator.acquireSlot(for: config.username)
+        // Manual recordings get their own slot immediately, completely separate from automatic recordings
+        if isManualRecordingRequest {
+            let slotID = await manualRecordingSlotManager.acquireSlot(for: config.username)
+            manualRecordingSlotID = slotID
+            isUsingTemporarySlot = true
+            
+            do {
+                try Task.checkCancellation()
+                let result = try await operation()
+                
+                if let slotID = manualRecordingSlotID {
+                    await manualRecordingSlotManager.releaseSlot(slotID: slotID)
+                    manualRecordingSlotID = nil
+                }
+                isUsingTemporarySlot = false
+                return result
+            } catch {
+                if let slotID = manualRecordingSlotID {
+                    await manualRecordingSlotManager.releaseSlot(slotID: slotID)
+                    manualRecordingSlotID = nil
+                }
+                isUsingTemporarySlot = false
+                throw error
+            }
+        }
+        
+        // Automatic recordings use the shared recording coordinator
+        let slotGranted = await recordingCoordinator.acquireSlot(for: config.username, forManualRecording: false)
         guard slotGranted else {
             throw ChaturbateError.paused
         }
+        
         do {
             try Task.checkCancellation()
             let result = try await operation()
+            
             await recordingCoordinator.releaseSlot(for: config.username)
             return result
         } catch {
@@ -1965,12 +2419,12 @@ actor Channel {
     private func watchSegments(playlist: Playlist) async throws {
         var lastVideoSeq = -1
         var lastAudioSeq = -1
-        let httpClient = HTTPClient(config: appConfig)
+        let httpClient = mediaHTTPClient
         let recordingStartedAt = Date()
         let noSegmentTimeoutSeconds = 45.0 // Alert if no segments after 45 seconds
         var emptySegmentCount = 0
         
-        while !Task.isCancelled && !config.isPaused && appConfig.recordingEnabled {
+        while !Task.isCancelled && (config.isAutoRecordEnabled || isManualRecordingRequest) && !shouldBlockRecordingThisSession && (appConfig.recordingEnabled || isManualRecordingRequest) {
             // Exit recording if break detection has been triggered (still frame, no person, etc)
             if breakEnforced {
                 throw ChaturbateError.channelOffline
@@ -1995,10 +2449,10 @@ actor Channel {
             
             var processedAnySegment = false
             for segment in segments {
-                if Task.isCancelled || config.isPaused {
+                if Task.isCancelled || (!config.isAutoRecordEnabled && !isManualRecordingRequest) || shouldBlockRecordingThisSession {
                     throw ChaturbateError.paused
                 }
-                if !appConfig.recordingEnabled {
+                if !appConfig.recordingEnabled && !isManualRecordingRequest {
                     break
                 }
                 
@@ -2051,10 +2505,10 @@ actor Channel {
                 }
 
                 for segment in audioSegments {
-                    if Task.isCancelled || config.isPaused {
+                    if Task.isCancelled || (!config.isAutoRecordEnabled && !isManualRecordingRequest) || shouldBlockRecordingThisSession {
                         throw ChaturbateError.paused
                     }
-                    if !appConfig.recordingEnabled {
+                    if !appConfig.recordingEnabled && !isManualRecordingRequest {
                         break
                     }
 
@@ -2121,7 +2575,12 @@ actor Channel {
             try await Task.sleep(nanoseconds: 1_000_000_000) // 1 second
         }
 
-        if !appConfig.recordingEnabled && !Task.isCancelled && !config.isPaused {
+        // Log sync drift summary if any drift was detected
+        if audioVideoSyncDriftDetections > 0 {
+            addLog("[AUDIO-SYNC-DRIFT] Detected \(audioVideoSyncDriftDetections) sync drift event(s) during this session; if file has audio/video sync issues, it may need manual remux with sync correction")
+        }
+
+        if !appConfig.recordingEnabled && !Task.isCancelled && config.isAutoRecordEnabled && !shouldBlockRecordingThisSession && !isManualRecordingRequest {
             addLog("Recording globally disabled, waiting for recording to be re-enabled")
         }
     }
@@ -2151,7 +2610,7 @@ actor Channel {
         var cacheExpiredDetected = false
         
         for attempt in 1...maxRetries {
-            if Task.isCancelled || (!allowPaused && config.isPaused) {
+            if Task.isCancelled || (!allowPaused && !isManualRecordingRequest && (!config.isAutoRecordEnabled || shouldBlockRecordingThisSession)) {
                 throw ChaturbateError.paused
             }
 
@@ -2171,7 +2630,7 @@ actor Channel {
                 }
                 return data
             } catch {
-                if Task.isCancelled || (!allowPaused && config.isPaused) {
+                if Task.isCancelled || (!allowPaused && !isManualRecordingRequest && (!config.isAutoRecordEnabled || shouldBlockRecordingThisSession)) {
                     throw ChaturbateError.paused
                 }
                 
@@ -2318,19 +2777,40 @@ actor Channel {
         preserveNoPersonStateAcrossTransientOffline()
         clearDegradedState()
         
-        // When channel goes offline, clear session limit pause so it can
-        // record fresh when it comes back with a new session
-        if isPausedBySessionLimit && !config.isPaused {
-            // Only clear if it's not manually paused; manual pauses take precedence
+        // Clean up manual recording state on offline transition
+        if isUsingTemporarySlot {
+            if let slotID = manualRecordingSlotID {
+                Task {
+                    await self.manualRecordingSlotManager.releaseSlot(slotID: slotID)
+                }
+                manualRecordingSlotID = nil
+            }
+            isUsingTemporarySlot = false
+        }
+        
+        // Always clear manual recording request when channel goes offline.
+        // Manual recordings are one-time per online session - once the channel goes offline,
+        // the manual recording request is consumed and won't repeat when it comes back online.
+        isManualRecordingRequest = false
+        
+        // When channel goes offline, clear session block so auto-recording can resume
+        // when the channel comes back online. This allows stop to act as a temporary
+        // pause for the current session until the next online/offline cycle.
+        shouldBlockRecordingThisSession = false
+        
+        // Also clear session limit pause so it can record fresh when it comes back
+        if isPausedBySessionLimit && config.isAutoRecordEnabled {
+            // Only clear if it's not manually disabled; manual disables take precedence
             isPausedBySessionLimit = false
-            config.isPaused = false
+            shouldBlockRecordingThisSession = false
             sessionDurationSeconds = 0
             sessionFilesizeBytes = 0
             sessionStartedAt = nil
             addLog("Channel went offline - session limit pause cleared, ready to record on next session")
-        } else if isPausedBySessionLimit && config.isPaused {
-            // Clear the session limit flag but keep the manual pause
+        } else if isPausedBySessionLimit && !config.isAutoRecordEnabled {
+            // Clear the session limit flag but keep the manual disable
             isPausedBySessionLimit = false
+            shouldBlockRecordingThisSession = false
             sessionDurationSeconds = 0
             sessionFilesizeBytes = 0
             sessionStartedAt = nil
@@ -2407,7 +2887,7 @@ actor Channel {
     }
     
     private func handleSegment(data: Data, duration: Double) async throws {
-        if config.isPaused {
+        if (!config.isAutoRecordEnabled && !isManualRecordingRequest) || shouldBlockRecordingThisSession {
             throw ChaturbateError.paused
         }
 
@@ -2527,7 +3007,7 @@ actor Channel {
             audioVideoSyncSkippedSegments += 1
             if audioVideoSyncSkippedSegments == 1 {
                 audioVideoSyncDriftDetections += 1
-                addLog("⚠️ Audio lead \(String(format: "%.2f", audioLead))s exceeds threshold (\(Self.maxAudioLeadSeconds)s); deferring audio segment #\(Int(currentAudioDuration)) for sync")
+                addLog("[AUDIO-SYNC-DRIFT] Audio lead \(String(format: "%.2f", audioLead))s exceeds threshold (\(Self.maxAudioLeadSeconds)s); deferring audio segment for sync correction")
             }
             return false
         }
@@ -2801,12 +3281,19 @@ actor Channel {
                 if let recordingID {
                     await recordingLedger.markFinalizing(recordingID: recordingID)
                 }
+
+                let remuxAudioDelaySeconds: Double? = shouldRetimeForSyncIssues ? maxAudioLeadSnapshot : nil
+                if let remuxAudioDelaySeconds, remuxAudioDelaySeconds > 0 {
+                    addLog("[audio-sync-remux] detected audio lead: \(String(format: "%.3f", remuxAudioDelaySeconds))s; applying during retime repair")
+                }
+
                 await Self.mp4Finalizer.enqueue(
                     sourcePath: workingPath,
                     audioSourcePath: usableAudioWorkingPath,
                     destinationPath: finalPath,
                     channel: channelName,
-                    preferRetimingOnFailure: recordingTimingWasSuspect || shouldRetimeForSyncIssues
+                    preferRetimingOnFailure: recordingTimingWasSuspect || shouldRetimeForSyncIssues,
+                    audioDelaySeconds: remuxAudioDelaySeconds
                 ) { outcome in
                     guard let recordingID else { return }
                     Task {
@@ -2947,6 +3434,12 @@ actor Channel {
             pendingFilenameBase = nil
             currentFileDecodeTimeOffset = nil
             resetSegmentTimelineTracking()
+            
+            // Reset break detection state for the new file to avoid carrying over
+            // old streak counters (person-not-detected, no-motion) from the previous file.
+            // This is critical when file rollovers occur due to timestamp discontinuities,
+            // as accumulated break streaks would be applied to fresh content.
+            resetBreakDetectionState()
         }
     }
 
@@ -3824,7 +4317,8 @@ actor Channel {
 
         noPersonCarryExpiryAt = nil
         lastBreakAnalysisAt = nil
-        lastBreakLumaFrame = nil
+        // DO NOT reset lastBreakLumaFrame here - we need to preserve motion tracking
+        // across preflight samples to detect static content (which is a stronger signal than person detection)
         pendingBreakOfflineReason = nil
     }
 
@@ -3871,29 +4365,32 @@ actor Channel {
                 let checkResult = try await runPreflightFrameAnalysis(
                     hlsSource: hlsSource,
                     purpose: "start_gate_\(index)",
-                    analyzeForBreak: false
+                    analyzeForBreak: true
                 )
 
+                // Only block recording if break conditions are met (no person AND no motion).
+                // If there's motion or person detected, allow recording to start.
                 if checkResult.breakDetected {
                     return true
                 }
 
-                let personDetected = latestPersonDetected == true
-                if personDetected {
-                    return false
-                }
-
+                // No break detected means either person is present OR there's motion.
+                // This is acceptable for starting recording - only require consistent break conditions.
                 misses += 1
                 if misses >= requiredMisses {
-                    pendingBreakOfflineReason = "Start gate: no person detected during preflight checks"
-                    addLog("Start gate: delaying recording start (no person detected)")
-                    noPersonCarryExpiryAt = Date().addingTimeInterval(Self.noPersonOfflineCarryWindowSeconds)
-                    return true
+                    // Consistent "safe" conditions across multiple samples - allow recording
+                    return false
                 }
             } catch {
-                // Fail open on preflight errors to avoid blocking healthy channels due transient fetch issues.
-                addLog("Start gate preflight error (\(error.localizedDescription)); not blocking start")
-                return false
+                // Treat preflight errors conservatively: count as unable-to-verify rather than
+                // failing open and bypassing the check entirely. This prevents false starts due to
+                // transient errors, authentication issues, or other preflight problems.
+                addLog("Start gate preflight error (sample \(index): \(error.localizedDescription)); treating as unable-to-analyze")
+                misses += 1
+                if misses >= requiredMisses {
+                    // Assume safe conditions if we can't verify - allow recording to proceed
+                    return false
+                }
             }
 
             if index < sampleCount - 1 {
@@ -3917,7 +4414,7 @@ actor Channel {
             )
         }
 
-        let httpClient = HTTPClient(config: appConfig)
+        let httpClient = mediaHTTPClient
         let mediaPlaylistContent = try await withRequestSlot(priority: .high) {
             try await httpClient.get(playlist.playlistURL)
         }
@@ -4243,7 +4740,7 @@ actor Channel {
         let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
-        imageGenerator.maximumSize = CGSize(width: 1280, height: 720)
+        imageGenerator.maximumSize = CGSize(width: 960, height: 540)
         
         do {
             // For large files, loading duration can be slow. Use a timeout.
@@ -4292,7 +4789,7 @@ actor Channel {
             let image = NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
             if let tiffData = image.tiffRepresentation,
                let bitmapImage = NSBitmapImageRep(data: tiffData),
-               let jpegData = bitmapImage.representation(using: .jpeg, properties: [.compressionFactor: 0.90]) {
+                    let jpegData = bitmapImage.representation(using: .jpeg, properties: [.compressionFactor: 0.70]) {
                 try jpegData.write(to: thumbnailURL)
                 thumbnailPath = newThumbnailPath
                 addLog("✓ Thumbnail generated successfully")
