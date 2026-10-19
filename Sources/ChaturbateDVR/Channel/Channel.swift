@@ -4674,7 +4674,7 @@ actor Channel {
             return true
         }
 
-        let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
+        let asset = AVURLAsset(url: URL(fileURLWithPath: videoPath))
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.maximumSize = CGSize(width: 960, height: 540)
@@ -4713,7 +4713,7 @@ actor Channel {
             visitedTimes.insert(key)
 
             let targetTime = CMTime(seconds: seconds, preferredTimescale: 600)
-            guard let cgImage = try? imageGenerator.copyCGImage(at: targetTime, actualTime: nil) else {
+            guard let cgImage = try? await imageGenerator.image(at: targetTime).image else {
                 continue
             }
 
@@ -4737,7 +4737,7 @@ actor Channel {
             return ThumbnailGenerationResult(success: false, breakDetected: false)
         }
         
-        let asset = AVAsset(url: URL(fileURLWithPath: videoPath))
+        let asset = AVURLAsset(url: URL(fileURLWithPath: videoPath))
         let imageGenerator = AVAssetImageGenerator(asset: asset)
         imageGenerator.appliesPreferredTrackTransform = true
         imageGenerator.maximumSize = CGSize(width: 960, height: 540)
@@ -4769,7 +4769,7 @@ actor Channel {
                 targetTime = CMTime(seconds: max(0, duration.seconds - 2.0), preferredTimescale: 600)
             }
             
-            let cgImage = try imageGenerator.copyCGImage(at: targetTime, actualTime: nil)
+            let cgImage = try await imageGenerator.image(at: targetTime).image
             let breakDetected = analyzeForBreak ? evaluateBreakSignalIfNeeded(frameImage: cgImage) : false
             
             // Save thumbnail to persistent app support directory

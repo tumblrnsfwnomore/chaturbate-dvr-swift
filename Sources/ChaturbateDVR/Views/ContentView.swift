@@ -215,7 +215,7 @@ struct ContentView: View {
         .onAppear {
             startChannelInfoTimer()
         }
-        .onChange(of: selectedDetailTab) { newTab in
+        .onChange(of: selectedDetailTab) { _, newTab in
             if newTab != .recording {
                 lastNonRecordingDetailTab = newTab
             }
@@ -228,7 +228,7 @@ struct ContentView: View {
                 detailNavigationOrder = []
             }
         }
-        .onChange(of: selectedChannel) { newSelection in
+        .onChange(of: selectedChannel) { _, newSelection in
             guard selectedDetailTab == .channel,
                   let newSelection else { return }
 
@@ -1070,7 +1070,7 @@ private actor RecordingThumbnailStore {
 
         let sourcePath = (sourcePathRaw as NSString).expandingTildeInPath
         let task = Task.detached(priority: .userInitiated) {
-            Self.generateThumbnail(sourcePath: sourcePath, destinationURL: destinationURL)
+            await Self.generateThumbnail(sourcePath: sourcePath, destinationURL: destinationURL)
         }
         inFlight[cacheKey] = task
 
@@ -1199,7 +1199,7 @@ private actor RecordingThumbnailStore {
         return NSImage(cgImage: cgImage, size: NSSize(width: cgImage.width, height: cgImage.height))
     }
 
-    private nonisolated static func generateThumbnail(sourcePath: String, destinationURL: URL) -> String? {
+    private nonisolated static func generateThumbnail(sourcePath: String, destinationURL: URL) async -> String? {
         let sourceURL = URL(fileURLWithPath: sourcePath)
         guard FileManager.default.fileExists(atPath: sourceURL.path) else { return nil }
 
@@ -1220,7 +1220,7 @@ private actor RecordingThumbnailStore {
         ]
 
         for time in candidateTimes {
-            guard let cgImage = try? imageGenerator.copyCGImage(at: time, actualTime: nil) else {
+            guard let cgImage = try? await imageGenerator.image(at: time).image else {
                 continue
             }
 
@@ -1748,7 +1748,7 @@ struct RecordingsLibraryView: View {
             .onAppear {
                 updateThumbnailViewportSize(geometry.size)
             }
-            .onChange(of: geometry.size) { newSize in
+            .onChange(of: geometry.size) { _, newSize in
                 updateThumbnailViewportSize(newSize)
             }
         }
@@ -1767,44 +1767,44 @@ struct RecordingsLibraryView: View {
             durationProbeTask?.cancel()
             durationProbeTask = nil
         }
-        .onChange(of: repairFilter) { _ in
+        .onChange(of: repairFilter) { _, _ in
             currentPage = 0
             recomputeVisibleCaches()
         }
-        .onChange(of: selectedChannelFilter) { _ in
+        .onChange(of: selectedChannelFilter) { _, _ in
             currentPage = 0
             recomputeVisibleCaches()
         }
-        .onChange(of: searchText) { _ in
+        .onChange(of: searchText) { _, _ in
             currentPage = 0
             recomputeVisibleCaches()
         }
-        .onChange(of: isDateFilterEnabled) { _ in
+        .onChange(of: isDateFilterEnabled) { _, _ in
             currentPage = 0
             recomputeVisibleCaches()
         }
-        .onChange(of: selectedDateFilter) { _ in
+        .onChange(of: selectedDateFilter) { _, _ in
             if isDateFilterEnabled {
                 currentPage = 0
                 recomputeVisibleCaches()
             }
         }
-        .onChange(of: sortOption) { _ in
+        .onChange(of: sortOption) { _, _ in
             applySortOption()
             currentPage = 0
         }
-        .onChange(of: currentPage) { _ in
+        .onChange(of: currentPage) { _, _ in
             recomputeVisibleCaches()
         }
-        .onChange(of: manager.recordingRepairSummary) { _ in
+        .onChange(of: manager.recordingRepairSummary) { _, _ in
             if repairFilter != .all {
                 recomputeVisibleCaches()
             }
         }
-        .onChange(of: refreshGeneration) { _ in
+        .onChange(of: refreshGeneration) { _, _ in
             refreshRecordings()
         }
-        .onChange(of: pageCacheVersion) { _ in
+        .onChange(of: pageCacheVersion) { _, _ in
             scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
         }
     }
@@ -3313,7 +3313,7 @@ struct ActivitySidebarView: View {
                         .onAppear {
                             updateSlotColumnCount(for: geometry.size.width)
                         }
-                        .onChange(of: geometry.size.width) { newWidth in
+                        .onChange(of: geometry.size.width) { _, newWidth in
                             updateSlotColumnCount(for: newWidth)
                         }
                 }
@@ -3881,16 +3881,16 @@ struct ChannelDetailView: View {
                 updateInfo()
             }
         }
-        .onChange(of: info?.recordingsDirectory ?? "") { _ in
+        .onChange(of: info?.recordingsDirectory ?? "") { _, _ in
             refreshRecordingsCacheIfNeeded(force: true)
         }
-        .onChange(of: info?.recordings.count ?? 0) { _ in
+        .onChange(of: info?.recordings.count ?? 0) { _, _ in
             refreshRecordingsCacheIfNeeded(force: false)
         }
-        .onChange(of: info?.filename ?? "") { _ in
+        .onChange(of: info?.filename ?? "") { _, _ in
             refreshRecordingsCacheIfNeeded(force: false)
         }
-        .onChange(of: refreshGeneration) { _ in
+        .onChange(of: refreshGeneration) { _, _ in
             refreshRecordingsCacheIfNeeded(force: true)
         }
         .onDisappear {
@@ -4619,7 +4619,7 @@ private struct ChannelLivePreviewView: View {
             }
             await configurePlayerIfNeeded()
         }
-        .onChange(of: streamURL) { newValue in
+        .onChange(of: streamURL) { _, newValue in
             guard isOnline else { return }
             if newValue != nil {
                 streamUnavailable = false
@@ -4631,7 +4631,7 @@ private struct ChannelLivePreviewView: View {
                 await configurePlayerIfNeeded()
             }
         }
-        .onChange(of: isOnline) { online in
+        .onChange(of: isOnline) { _, online in
             if !online {
                 resetPlayerState()
             } else {
@@ -4896,7 +4896,7 @@ struct RecordingDetailView: View {
             stopTrimPreviewTimer()
             cleanupPlayer()
         }
-        .onChange(of: isTrimEditorActive) { active in
+        .onChange(of: isTrimEditorActive) { _, active in
             if active {
                 startTrimPreviewTimer()
             } else {
@@ -6523,7 +6523,7 @@ struct RecordingPreviewSheet: View {
         .onAppear {
             loadCurrentVideo()
         }
-        .onChange(of: currentIndex) { _ in
+        .onChange(of: currentIndex) { _, _ in
             loadCurrentVideo()
         }
         .onDisappear {
@@ -6994,7 +6994,7 @@ struct BioMetadataView: View {
         .onAppear {
             localBioMetadata = info.bioMetadata
         }
-        .onChange(of: info.bioMetadata?.lastBioRefresh) { _ in
+        .onChange(of: info.bioMetadata?.lastBioRefresh) { _, _ in
             if localBioMetadata == nil {
                 localBioMetadata = info.bioMetadata
             }
