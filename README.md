@@ -17,7 +17,7 @@ A native macOS application for recording Chaturbate streams, built with Swift an
 
 ## Requirements
 
-- macOS 13.0 or later
+- macOS 26 or later
 - Xcode 14.0 or later
 - Swift 5.9 or later
 

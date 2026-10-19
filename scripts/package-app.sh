@@ -167,7 +167,7 @@ cat > "$PLIST_PATH" <<'EOF'
     <key>CFBundlePackageType</key>
     <string>APPL</string>
     <key>LSMinimumSystemVersion</key>
-    <string>13.0</string>
+    <string>26.0</string>
     <key>NSHighResolutionCapable</key>
     <true/>
 </dict>
