@@ -945,6 +945,14 @@ actor Channel {
     private static let segmentTimelineMismatchMaxRatio: Double = 2.0
     private static let segmentTimelineMismatchRequiredEvents: Int = 3
     private static let fmp4ForwardDecodeJumpThresholdSeconds: Double = 45
+    // A jump caused by skipped segments spans the previous segment plus the skipped gap.
+    private static let skippedGapJumpToleranceSeconds: Double = 10
+    /// Seconds without a new segment before a stalled session re-checks channel status.
+    private static let stallHealThresholdSeconds: Double = 20
+    /// In-place heal attempts allowed per stall burst before the session ends and splits.
+    private static let maxStallHealAttempts = 3
+    /// Quiet time after a heal that resets the attempt budget.
+    private static let stallHealBudgetResetSeconds: Double = 60
     private static let minRolloverFragmentDurationSeconds: Double = 8.0
     private static let minRolloverFragmentSizeBytes = 256 * 1024
     private static let maxAudioLeadSeconds: Double = 0.75
@@ -1020,6 +1028,7 @@ actor Channel {
     private var segmentTimelineMismatchEvents: Int = 0
     private var consecutiveUnobservedFragmentTimings: Int = 0
     private var pendingTimestampDiscontinuity: Bool = false
+    private var pendingSkippedMediaSeconds: Double = 0
     private var sessionStartedAt: Date? // tracks session start for session duration limits
     private var lastPreviewFailureLogAt: Date = Date.distantPast
     private var cloudflareBlockCount: Int = 0
@@ -2528,18 +2537,38 @@ actor Channel {
         }
     }
     
-    private func watchSegments(playlist: Playlist) async throws {
+    private func watchSegments(playlist initialPlaylist: Playlist) async throws {
+        var playlist = initialPlaylist
         var lastVideoSeq = -1
         var lastAudioSeq = -1
         let httpClient = mediaHTTPClient
         let recordingStartedAt = Date()
         let noSegmentTimeoutSeconds = 45.0 // Alert if no segments after 45 seconds
         var emptySegmentCount = 0
+        var lastProgressAt = Date()
+        var stallHealAttempts = 0
+        var lastStallHealAt: Date?
         
         while !Task.isCancelled && (config.isAutoRecordEnabled || isManualRecordingRequest) && !shouldBlockRecordingThisSession && (appConfig.recordingEnabled || isManualRecordingRequest) {
             // Exit recording if break detection has been triggered (still frame, no person, etc)
             if breakEnforced {
                 throw ChaturbateError.channelOffline
+            }
+
+            // A stalled playlist keeps answering without new segments, so nothing else ends the session.
+            // Check status and refresh the playlist in place; the file stays open unless the channel went private or offline.
+            if Date().timeIntervalSince(lastProgressAt) > Self.stallHealThresholdSeconds {
+                if let lastHeal = lastStallHealAt, Date().timeIntervalSince(lastHeal) > Self.stallHealBudgetResetSeconds {
+                    stallHealAttempts = 0
+                }
+                guard stallHealAttempts < Self.maxStallHealAttempts else {
+                    addLog("Stream stalled and \(stallHealAttempts) in-place heal attempts failed; ending session to split the file")
+                    throw ChaturbateError.networkError("Stream stalled without new segments")
+                }
+                stallHealAttempts += 1
+                lastStallHealAt = Date()
+                playlist = try await healStalledRecording(attempt: stallHealAttempts, previous: playlist)
+                lastProgressAt = Date()
             }
             
             let content = try await withRequestSlot(priority: .high) {
@@ -2590,8 +2619,19 @@ actor Channel {
                     // Check if this is a cache expiration error
                     let errorDesc = error.localizedDescription.lowercased()
                     if errorDesc.contains("cache_expired") || errorDesc.contains("w3:") {
-                        // Segment has expired from CDN cache; skip it and continue with next segment
+                        // Expired signed URLs usually recover with a fresh playlist entry.
+                        if let freshData = await refetchExpiredSegmentData(
+                            sequenceNumber: seq,
+                            playlistURL: playlist.playlistURL,
+                            httpClient: httpClient
+                        ) {
+                            addLog("Segment #\(seq) recovered from a refreshed playlist entry")
+                            try await handleSegment(data: freshData, duration: segment.duration)
+                            continue
+                        }
+                        // Segment is unrecoverable; skip it and record the gap so its timeline jump is not treated as a discontinuity.
                         addLog("⚠️ Segment #\(seq) expired from CDN cache; skipping to maintain recording continuity")
+                        pendingSkippedMediaSeconds += segment.duration
                         continue
                     }
                     // Other network errors should fail the recording
@@ -2671,6 +2711,7 @@ actor Channel {
                 }
             } else {
                 emptySegmentCount = 0
+                lastProgressAt = Date()
             }
             
             // Periodic audio/video sync diagnostics (every 30 seconds)
@@ -2695,6 +2736,48 @@ actor Channel {
         if !appConfig.recordingEnabled && !Task.isCancelled && config.isAutoRecordEnabled && !shouldBlockRecordingThisSession && !isManualRecordingRequest {
             addLog("Recording globally disabled, waiting for recording to be re-enabled")
         }
+    }
+
+    /// Re-checks channel status after a stall. Throws offline/private so the caller splits as before;
+    /// otherwise returns a refreshed playlist and keeps the current file open.
+    private func healStalledRecording(attempt: Int, previous: Playlist) async throws -> Playlist {
+        addLog("⚠️ No new segments for \(Int(Self.stallHealThresholdSeconds)) s; checking channel status (attempt \(attempt)/\(Self.maxStallHealAttempts))")
+
+        let stream: Stream
+        do {
+            stream = try await withRequestSlot(priority: .high) {
+                try await client.getStream(username: config.username)
+            }
+        } catch let error as ChaturbateError {
+            switch error {
+            case .privateStream:
+                addLog("Channel went private during stall; ending session")
+                throw error
+            case .channelOffline:
+                addLog("Channel went offline during stall; ending session")
+                throw error
+            default:
+                addLog("Status check failed during stall (\(error.localizedDescription)); will retry")
+                return previous
+            }
+        } catch {
+            addLog("Status check failed during stall (\(error.localizedDescription)); will retry")
+            return previous
+        }
+
+        liveStreamURL = stream.hlsSource
+        markChannelValid()
+
+        let refreshed = try await withRequestSlot(priority: .high) {
+            try await client.getPlaylist(
+                hlsSource: stream.hlsSource,
+                resolution: config.resolution,
+                framerate: config.framerate
+            )
+        }
+        activeAudioPlaylistURL = refreshed.audioPlaylistURL
+        addLog("Channel still online and public; resuming in the same file")
+        return refreshed
     }
 
     private func resolveSegmentURL(_ uri: String, playlistURL: String) -> String {
@@ -3616,6 +3699,15 @@ actor Channel {
             markCurrentRecordingTimingSuspect(reason: "decode_timeline_rewind")
             addLog("fMP4 decode timeline rewind detected (raw tfdt \(rawDecodeStartTime) < \(previousRaw)); rolling to a new recording file")
         } else if let previousRaw = previousRawSegmentDecodeStartTime,
+                  isForwardDecodeTimeJump(rawDecodeStartTime, previousRawDecodeStartTime: previousRaw),
+                  isForwardJumpExplainedBySkippedSegments(rawDecodeStartTime, previousRawDecodeStartTime: previousRaw) {
+            if let timescale = activeFragmentTimescale, timescale > 0 {
+                let deltaSeconds = Double(rawDecodeStartTime - previousRaw) / Double(timescale)
+                addLog(
+                    "fMP4 decode gap (+\(String(format: "%.2f", deltaSeconds))s) matches \(String(format: "%.2f", pendingSkippedMediaSeconds))s of skipped segments; keeping current file"
+                )
+            }
+        } else if let previousRaw = previousRawSegmentDecodeStartTime,
                   isForwardDecodeTimeJump(rawDecodeStartTime, previousRawDecodeStartTime: previousRaw) {
             pendingTimestampDiscontinuity = true
             previousSegmentDecodeStartTime = nil
@@ -3633,11 +3725,47 @@ actor Channel {
             }
         }
 
+        pendingSkippedMediaSeconds = 0
         previousRawSegmentDecodeStartTime = rawDecodeStartTime
 
         // Preserve original fragment timestamps; mutating tfdt in-place can
         // corrupt long-session playback timing.
         return (data, rawDecodeStartTime)
+    }
+
+    private func isForwardJumpExplainedBySkippedSegments(_ rawDecodeStartTime: UInt64, previousRawDecodeStartTime: UInt64) -> Bool {
+        guard pendingSkippedMediaSeconds > 0,
+              let timescale = activeFragmentTimescale,
+              timescale > 0 else {
+            return false
+        }
+
+        let deltaSeconds = Double(rawDecodeStartTime - previousRawDecodeStartTime) / Double(timescale)
+        let excessSeconds = deltaSeconds - pendingSkippedMediaSeconds
+        return excessSeconds >= 0 && excessSeconds <= Self.skippedGapJumpToleranceSeconds
+    }
+
+    private func refetchExpiredSegmentData(
+        sequenceNumber: Int,
+        playlistURL: String,
+        httpClient: HTTPClient
+    ) async -> Data? {
+        guard let content = try? await withRequestSlot(priority: .high, {
+                  try await httpClient.get(playlistURL)
+              }),
+              let segments = try? M3U8Parser.parseMediaPlaylist(content),
+              let fresh = segments.first(where: { $0.sequenceNumber == sequenceNumber }) else {
+            return nil
+        }
+
+        let freshURL = resolveSegmentURL(fresh.uri, playlistURL: playlistURL)
+        return try? await downloadSegmentWithRetry(
+            httpClient: httpClient,
+            url: freshURL,
+            maxRetries: 1,
+            updateStreamHealth: false,
+            priority: .high
+        )
     }
 
     private func isForwardDecodeTimeJump(_ rawDecodeStartTime: UInt64, previousRawDecodeStartTime: UInt64) -> Bool {
@@ -3981,6 +4109,7 @@ actor Channel {
     private func resetSegmentTimelineTracking() {
         previousRawSegmentDecodeStartTime = nil
         previousSegmentDecodeStartTime = nil
+        pendingSkippedMediaSeconds = 0
         cumulativeClaimedSegmentDuration = 0
         cumulativeObservedSegmentDuration = 0
         segmentTimelineMismatchEvents = 0
