@@ -1509,6 +1509,15 @@ struct RecordingsLibraryView: View {
     @State private var durationProbeTask: Task<Void, Never>?
     @State private var refreshRecordingsTask: Task<Void, Never>?
     @State private var isLoadingRecordings = true
+    @State private var isCombineMode = false
+    @State private var isCombineSheetPresented = false
+    @State private var isCombining = false
+    @State private var combineSelection: Set<String> = []
+    @State private var combinePendingPaths: [String] = []
+    @State private var combineMoveOriginals = true
+    @State private var combineProgressValue: Double = 0
+    @State private var combineProgressText: String = ""
+    @State private var combineError: String?
 
     private let gridColumns = [GridItem(.adaptive(minimum: Self.thumbnailCardMinimumWidth), spacing: Self.thumbnailCardSpacing)]
 
@@ -1593,6 +1602,34 @@ struct RecordingsLibraryView: View {
                         }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
+
+                        if isCombineMode {
+                            Button {
+                                combineSelected()
+                            } label: {
+                                Label("Combine Selected", systemImage: "rectangle.stack.badge.plus")
+                            }
+                            .buttonStyle(.borderedProminent)
+                            .controlSize(.small)
+                            .disabled(isCombining || combineSelection.count < 2)
+
+                            Button {
+                                combineSelection.removeAll()
+                                isCombineMode = false
+                            } label: {
+                                Label("Clear", systemImage: "xmark")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        } else {
+                            Button {
+                                isCombineMode = true
+                            } label: {
+                                Label("Combine", systemImage: "rectangle.stack.badge.plus")
+                            }
+                            .buttonStyle(.bordered)
+                            .controlSize(.small)
+                        }
 
                         Button {
                             manager.startRepairForFlaggedRecordings()
@@ -1693,20 +1730,39 @@ struct RecordingsLibraryView: View {
                         ScrollView {
                             LazyVGrid(columns: gridColumns, spacing: Self.thumbnailCardSpacing) {
                                 ForEach(pageItems) { item in
+                                    let isSelected = combineSelection.contains(item.path)
                                     Button {
-                                        let contextPaths = cachedVisibleRecordings
-                                            .map(\ .path)
-                                        onOpenRecording?(item.path, item.channelName, contextPaths)
+                                        if isCombineMode {
+                                            toggleCombineSelection(for: item.path)
+                                        } else {
+                                            let contextPaths = cachedVisibleRecordings
+                                                .map(\.path)
+                                            onOpenRecording?(item.path, item.channelName, contextPaths)
+                                        }
                                     } label: {
-                                        RecordingLibraryCardView(
-                                            item: item,
-                                            hasDurationMismatch: hasDurationMismatch(item),
-                                            repairState: manager.recordingRepairState(
-                                                for: item.path,
-                                                fileExtension: item.fileExtension,
-                                                recordingStatus: item.recordingStatus
+                                        ZStack(alignment: .topTrailing) {
+                                            RecordingLibraryCardView(
+                                                item: item,
+                                                hasDurationMismatch: hasDurationMismatch(item),
+                                                repairState: manager.recordingRepairState(
+                                                    for: item.path,
+                                                    fileExtension: item.fileExtension,
+                                                    recordingStatus: item.recordingStatus
+                                                )
                                             )
-                                        )
+
+                                            if isCombineMode {
+                                                Circle()
+                                                    .fill(isSelected ? Color.accentColor : Color.black.opacity(0.35))
+                                                    .frame(width: 26, height: 26)
+                                                    .overlay(
+                                                        Image(systemName: isSelected ? "checkmark" : "plus")
+                                                            .font(.system(size: 12, weight: .bold))
+                                                            .foregroundColor(.white)
+                                                    )
+                                                    .padding(10)
+                                            }
+                                        }
                                     }
                                     .buttonStyle(.plain)
                                 }
@@ -1767,6 +1823,9 @@ struct RecordingsLibraryView: View {
             durationProbeTask?.cancel()
             durationProbeTask = nil
         }
+        .sheet(isPresented: $isCombineSheetPresented) {
+            combineConfirmationSheet
+        }
         .onChange(of: repairFilter) { _ in
             currentPage = 0
             recomputeVisibleCaches()
@@ -1807,6 +1866,183 @@ struct RecordingsLibraryView: View {
         .onChange(of: pageCacheVersion) { _ in
             scheduleThumbnailPrewarm(debounceNanoseconds: Self.thumbnailPrewarmDebounceNanoseconds)
         }
+    }
+
+    private func toggleCombineSelection(for path: String) {
+        if combineSelection.contains(path) {
+            combineSelection.remove(path)
+        } else {
+            combineSelection.insert(path)
+        }
+    }
+
+    private func combineSelected() {
+        let selectedPaths = orderedCombinePaths(Array(combineSelection))
+        guard selectedPaths.count >= 2 else {
+            combineSelection.removeAll()
+            isCombineMode = false
+            return
+        }
+
+        combinePendingPaths = selectedPaths
+        combineMoveOriginals = true
+        combineProgressValue = 0
+        combineProgressText = ""
+        combineError = nil
+        isCombineSheetPresented = true
+    }
+
+    private func orderedCombinePaths(_ paths: [String]) -> [String] {
+        let items = paths.map { path -> (path: String, date: Date) in
+            if let item = sortedRecordings.first(where: { $0.path == path }) {
+                let date = item.startedAt ?? item.endedAt ?? item.modifiedAt
+                return (path: path, date: date)
+            }
+
+            let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+            let fallback = (attrs?[.modificationDate] as? Date) ?? Date.distantPast
+            return (path: path, date: fallback)
+        }
+
+        return items.sorted { $0.date < $1.date }.map(\.path)
+    }
+
+    private func executeCombineFromSheet() {
+        let paths = combinePendingPaths
+        guard paths.count >= 2 else { return }
+
+        isCombining = true
+        combineProgressValue = 0
+        combineProgressText = "Preparing metadata..."
+        combineError = nil
+
+        Task {
+            do {
+                _ = try await manager.combineRecordings(
+                    paths: paths,
+                    outputPath: nil,
+                    keepOriginals: true,
+                    moveOriginalsToTrash: combineMoveOriginals,
+                    progress: { value, message in
+                        Task { @MainActor in
+                            combineProgressValue = value
+                            combineProgressText = message
+                        }
+                    }
+                )
+                await MainActor.run {
+                    isCombineMode = false
+                    isCombining = false
+                    combineSelection.removeAll()
+                    combinePendingPaths.removeAll()
+                    isCombineSheetPresented = false
+                    loadAllRecordingsFromDatabase()
+                }
+            } catch {
+                await MainActor.run {
+                    isCombining = false
+                    combineError = error.localizedDescription
+                    isCombineMode = false
+                    combinePendingPaths.removeAll()
+                    combineSelection.removeAll()
+                    isCombineSheetPresented = true
+                }
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var combineConfirmationSheet: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            HStack {
+                Text("Combine recordings")
+                    .font(.headline)
+                Spacer()
+                Button("Cancel") {
+                    if !isCombining {
+                        isCombineSheetPresented = false
+                        combineSelection.removeAll()
+                        isCombineMode = false
+                    }
+                }
+                .buttonStyle(.bordered)
+                .disabled(isCombining)
+            }
+
+            VStack(alignment: .leading, spacing: 8) {
+                Text("Order: oldest → newest")
+                    .font(.caption)
+                    .foregroundColor(.secondary)
+
+                if let newest = combinePendingPaths.compactMap({ path -> Date? in
+                    if let item = sortedRecordings.first(where: { $0.path == path }) {
+                        return item.endedAt ?? item.startedAt ?? item.modifiedAt
+                    }
+                    let attrs = try? FileManager.default.attributesOfItem(atPath: path)
+                    return attrs?[.modificationDate] as? Date
+                }).max() {
+                    Text("Creation date: \(Self.formatLocalDate(newest))")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            }
+
+            if isCombining {
+                VStack(alignment: .leading, spacing: 8) {
+                    Text(combineProgressText.isEmpty ? "Processing..." : combineProgressText)
+                        .font(.caption)
+                    ProgressView(value: combineProgressValue, total: 1.0)
+                    Text("\(Int(round(combineProgressValue * 100)))%")
+                        .font(.caption)
+                        .foregroundColor(.secondary)
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 8) {
+                    ForEach(combinePendingPaths, id: \.self) { path in
+                        HStack(alignment: .center, spacing: 8) {
+                            Image(systemName: "film.fill")
+                                .foregroundColor(.secondary)
+                            Text(URL(fileURLWithPath: path).lastPathComponent)
+                                .font(.caption)
+                                .lineLimit(1)
+                            Spacer()
+                            if let date = ((try? FileManager.default.attributesOfItem(atPath: path))?[.modificationDate] as? Date) {
+                                Text(Self.formatLocalDate(date))
+                                    .font(.caption2)
+                                    .foregroundColor(.secondary)
+                            }
+                        }
+                    }
+                }
+            }
+
+            Toggle("Move original videos to Trash after combining", isOn: $combineMoveOriginals)
+                .font(.caption)
+
+            if let combineError, !combineError.isEmpty {
+                Text(combineError)
+                    .font(.caption)
+                    .foregroundColor(.red)
+            }
+
+            HStack {
+                Spacer()
+                Button("Combine") {
+                    executeCombineFromSheet()
+                }
+                .buttonStyle(.borderedProminent)
+                .disabled(isCombining || combinePendingPaths.count < 2)
+            }
+        }
+        .frame(width: 500)
+        .padding(24)
+    }
+
+    private static func formatLocalDate(_ date: Date) -> String {
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     private var repairFilterCounts: RecordingRepairFilterCounts {
@@ -2060,7 +2296,7 @@ struct RecordingsLibraryView: View {
                                 .sorted { $0.lowercased() < $1.lowercased() }
                             applySortOption()
 
-                            let validPaths = Set(recordings.map(\ .path))
+                            let validPaths = Set(recordings.map(\.path))
                             observedMediaDurationByPath = observedMediaDurationByPath.filter { validPaths.contains($0.key) }
                             for item in recordings {
                                 if let mediaDuration = item.mediaDurationSeconds, mediaDuration > 0 {
@@ -4330,7 +4566,7 @@ struct ChannelDetailView: View {
                         VStack(alignment: .leading, spacing: 4) {
                             ForEach(Array(recentRecordings), id: \.path) { entry in
                                 Button {
-                                    onOpenRecording?(entry.path, entries.map(\ .path))
+                                    onOpenRecording?(entry.path, entries.map(\.path))
                                 } label: {
                                     HStack(alignment: .top, spacing: 8) {
                                         VStack(alignment: .leading, spacing: 3) {
@@ -4810,6 +5046,7 @@ struct RecordingDetailView: View {
     @State private var observedMediaDurationSeconds: Double?
     @State private var videoAspectRatio: CGFloat = 16 / 9
     @State private var isTrimEditorActive = false
+    @State private var activeEditMode: RecordingEditMode = .trim
     @State private var trimStartSecondsText = ""
     @State private var trimEndSecondsText = ""
     @State private var trimErrorMessage: String?
@@ -4859,6 +5096,11 @@ struct RecordingDetailView: View {
         case endHandle(fixedStart: Double, initialEnd: Double)
         case selectedRange(initialStart: Double, initialEnd: Double, initialPreview: Double)
         case playhead
+    }
+
+    private enum RecordingEditMode {
+        case trim
+        case split
     }
 
     var body: some View {
@@ -5063,7 +5305,15 @@ struct RecordingDetailView: View {
                 .buttonStyle(.bordered)
 
                 Button {
-                    prepareTrimForm(detail)
+                    prepareTrimForm(detail, mode: .split)
+                } label: {
+                    Label("Split", systemImage: "scissors")
+                }
+                .buttonStyle(.bordered)
+                .disabled(!canTrim(detail) || isTrimming)
+
+                Button {
+                    prepareTrimForm(detail, mode: .trim)
                 } label: {
                     Label(isTrimEditorActive ? "Done Editing" : "Trim", systemImage: isTrimEditorActive ? "checkmark.circle" : "scissors")
                 }
@@ -5581,7 +5831,7 @@ struct RecordingDetailView: View {
             return explicitPaths
         }
 
-        let siblingPaths = siblingEntries.map(\ .path)
+        let siblingPaths = siblingEntries.map(\.path)
         if siblingPaths.contains(recordingPath) {
             return siblingPaths
         }
@@ -5773,9 +6023,9 @@ struct RecordingDetailView: View {
     private var trimEditorPanel: some View {
         VStack(alignment: .leading, spacing: 10) {
             HStack(alignment: .firstTextBaseline, spacing: 12) {
-                Text("Trim Recording")
+                Text(activeEditMode == .split ? "Split Recording" : "Trim Recording")
                     .font(.headline)
-                Text("Edit in place while watching the preview.")
+                Text(activeEditMode == .split ? "Create a new segment while preserving the original." : "Edit in place while watching the preview.")
                     .font(.caption)
                     .foregroundColor(.secondary)
                 Spacer(minLength: 0)
@@ -5853,10 +6103,12 @@ struct RecordingDetailView: View {
                         HStack(spacing: 8) {
                             ProgressView()
                                 .controlSize(.small)
-                            Text("Trimming...")
+                            Text(activeEditMode == .split ? "Splitting..." : "Trimming...")
                         }
                     } else {
-                        Text(trimSaveAsNewFile ? "Trim & Save As New" : "Trim & Replace")
+                        Text(activeEditMode == .split
+                            ? (trimSaveAsNewFile ? "Split & Save As New" : "Split & Keep Original")
+                            : (trimSaveAsNewFile ? "Trim & Save As New" : "Trim & Replace"))
                     }
                 }
                 .buttonStyle(.borderedProminent)
@@ -6093,12 +6345,13 @@ struct RecordingDetailView: View {
         trimPreviewPositionSeconds = min(max(trimPreviewPositionSeconds, clampedStart), clampedEnd)
     }
 
-    private func prepareTrimForm(_ detail: RecordingLedgerDetail) {
-        if isTrimEditorActive {
+    private func prepareTrimForm(_ detail: RecordingLedgerDetail, mode: RecordingEditMode = .trim) {
+        if isTrimEditorActive && activeEditMode == mode {
             isTrimEditorActive = false
             return
         }
 
+        activeEditMode = mode
         let duration = observedMediaDurationSeconds ?? detail.mediaDurationSeconds ?? detail.durationSeconds
         trimStartSecondsText = "0"
         if duration > 0 {
@@ -6106,7 +6359,7 @@ struct RecordingDetailView: View {
         } else {
             trimEndSecondsText = ""
         }
-        trimSaveAsNewFile = false
+        trimSaveAsNewFile = mode == .split
         trimErrorMessage = nil
         trimPreviewDurationSeconds = duration
         trimPreviewPositionSeconds = min(trimPreviewPositionSeconds, max(duration, 0))
@@ -6139,12 +6392,23 @@ struct RecordingDetailView: View {
 
         Task {
             do {
-                let outputPath = try await manager.trimRecording(
-                    path: detail.path,
-                    startSeconds: start,
-                    endSeconds: end,
-                    saveAsNewFile: trimSaveAsNewFile
-                )
+                let outputPath: String
+                if activeEditMode == .split {
+                    outputPath = try await manager.splitRecording(
+                        path: detail.path,
+                        startSeconds: start,
+                        endSeconds: end,
+                        saveAsNewFile: trimSaveAsNewFile
+                    )
+                } else {
+                    outputPath = try await manager.trimRecording(
+                        path: detail.path,
+                        startSeconds: start,
+                        endSeconds: end,
+                        saveAsNewFile: trimSaveAsNewFile
+                    )
+                }
+
                 await MainActor.run {
                     isTrimming = false
                     isTrimEditorActive = false

@@ -9,6 +9,44 @@ private struct ProcessResult {
     let stderr: String
 }
 
+private final class FinalizerProcessRegistry {
+    static let shared = FinalizerProcessRegistry()
+
+    private let lock = NSLock()
+    private var activeProcesses: [String: [Process]] = [:]
+
+    func register(sourcePath: String, process: Process) {
+        lock.lock()
+        activeProcesses[sourcePath, default: []].append(process)
+        lock.unlock()
+    }
+
+    func unregister(sourcePath: String, process: Process) {
+        lock.lock()
+        activeProcesses[sourcePath]?.removeAll { $0 === process }
+        if activeProcesses[sourcePath]?.isEmpty == true {
+            activeProcesses.removeValue(forKey: sourcePath)
+        }
+        lock.unlock()
+    }
+
+    func terminateAll(for sourcePaths: [String]) {
+        lock.lock()
+        let allProcesses = sourcePaths.flatMap { activeProcesses[$0] ?? [] }
+        lock.unlock()
+
+        for process in allProcesses where process.isRunning {
+            process.terminate()
+        }
+    }
+
+    func clear() {
+        lock.lock()
+        activeProcesses.removeAll(keepingCapacity: true)
+        lock.unlock()
+    }
+}
+
 private actor MP4Finalizer {
     static func buildRetimedAudioFilter(
         audioInputIndex: Int,
@@ -66,9 +104,37 @@ private actor MP4Finalizer {
     private var inFlightPaths: Set<String> = []
     private var activelyProcessingPaths: Set<String> = []
     private var activeJobs: [String: ActiveJob] = [:]
+    private var activeTasks: [String: Task<RepairOutcome, Never>] = [:]
     private var pendingJobs: [PendingJob] = []
     private var idleWaiters: [CheckedContinuation<Void, Never>] = []
     private var maxConcurrentFinalizations: Int = 1
+
+    static func cleanupStaleFinalizingTempFiles(for sourcePath: String) {
+        let sourceURL = URL(fileURLWithPath: ChannelManager.canonicalRecordingPath(sourcePath))
+        let parentDirectory = sourceURL.deletingLastPathComponent()
+        let fileStem = sourceURL.deletingPathExtension().lastPathComponent
+        let prefixes = [
+            "\(fileStem)_finalizing_",
+            "\(fileStem)_audiosync_",
+            "cbdvr_inprogress_\(fileStem)_finalizing_",
+            "cbdvr_inprogress_\(fileStem)_audiosync_",
+            ".cbdvr_work_\(fileStem)_finalizing_",
+            ".cbdvr_work_\(fileStem)_audiosync_",
+        ]
+
+        guard let contents = try? FileManager.default.contentsOfDirectory(
+            at: parentDirectory,
+            includingPropertiesForKeys: [.isRegularFileKey],
+            options: [.skipsHiddenFiles]
+        ) else { return }
+
+        for candidate in contents where candidate.pathExtension.lowercased() == "mp4" {
+            let name = candidate.lastPathComponent
+            let isStaleTemp = prefixes.contains(where: { name.hasPrefix($0) })
+            guard isStaleTemp else { continue }
+            try? FileManager.default.removeItem(at: candidate)
+        }
+    }
 
     func activelyFinalizingPaths() -> Set<String> {
         activelyProcessingPaths
@@ -117,12 +183,16 @@ private actor MP4Finalizer {
         audioDelaySeconds: Double? = nil,
         onCompletion: (@Sendable (RepairOutcome) -> Void)? = nil
     ) {
-        guard inFlightPaths.insert(sourcePath).inserted else { return }
+        let canonicalSourcePath = ChannelManager.canonicalRecordingPath(sourcePath)
+        let canonicalDestinationPath = ChannelManager.canonicalRecordingPath(destinationPath)
+        let canonicalAudioSourcePath = audioSourcePath.map(ChannelManager.canonicalRecordingPath)
+
+        guard inFlightPaths.insert(canonicalSourcePath).inserted else { return }
 
         pendingJobs.append(PendingJob(
-            sourcePath: sourcePath,
-            audioSourcePath: audioSourcePath,
-            destinationPath: destinationPath,
+            sourcePath: canonicalSourcePath,
+            audioSourcePath: canonicalAudioSourcePath,
+            destinationPath: canonicalDestinationPath,
             channel: channel,
             preferRetimingOnFailure: preferRetimingOnFailure,
             audioDelaySeconds: audioDelaySeconds,
@@ -138,34 +208,36 @@ private actor MP4Finalizer {
     }
 
     func repair(path: String, channel: String) async -> RepairOutcome {
-        guard inFlightPaths.insert(path).inserted else {
+        let canonicalPath = ChannelManager.canonicalRecordingPath(path)
+        guard inFlightPaths.insert(canonicalPath).inserted else {
             return .skipped("repair already in progress")
         }
 
         defer {
-            inFlightPaths.remove(path)
+            inFlightPaths.remove(canonicalPath)
         }
 
         return await finalize(
-            sourcePath: path,
-            destinationPath: path,
+            sourcePath: canonicalPath,
+            destinationPath: canonicalPath,
             channel: channel,
             preferRetimingOnFailure: true
         )
     }
 
     func repairAudioSync(path: String, channel: String, detectedAudioDelaySeconds: Double? = nil) async -> RepairOutcome {
-        guard inFlightPaths.insert(path).inserted else {
+        let canonicalPath = ChannelManager.canonicalRecordingPath(path)
+        guard inFlightPaths.insert(canonicalPath).inserted else {
             return .skipped("repair already in progress")
         }
 
         defer {
-            inFlightPaths.remove(path)
+            inFlightPaths.remove(canonicalPath)
         }
 
         return await finalizeWithForceRetime(
-            sourcePath: path,
-            destinationPath: path,
+            sourcePath: canonicalPath,
+            destinationPath: canonicalPath,
             channel: channel,
             audioDelaySeconds: detectedAudioDelaySeconds
         )
@@ -179,12 +251,14 @@ private actor MP4Finalizer {
         preferRetimingOnFailure: Bool,
         audioDelaySeconds: Double? = nil
     ) async -> RepairOutcome {
-        let sourceURL = URL(fileURLWithPath: sourcePath)
-        let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: $0) }
-        let destinationURL = URL(fileURLWithPath: destinationPath)
+        let sourceURL = URL(fileURLWithPath: ChannelManager.canonicalRecordingPath(sourcePath))
+        let audioSourceURL = audioSourcePath.map { URL(fileURLWithPath: ChannelManager.canonicalRecordingPath($0)) }
+        let destinationURL = URL(fileURLWithPath: ChannelManager.canonicalRecordingPath(destinationPath))
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             return .skipped("source file missing")
         }
+
+        Self.cleanupStaleFinalizingTempFiles(for: sourceURL.path)
 
         let hasAudioSidecar = {
             guard let audioSourceURL else { return false }
@@ -284,8 +358,8 @@ private actor MP4Finalizer {
         channel: String,
         audioDelaySeconds: Double? = nil
     ) async -> RepairOutcome {
-        let sourceURL = URL(fileURLWithPath: sourcePath)
-        let destinationURL = URL(fileURLWithPath: destinationPath)
+        let sourceURL = URL(fileURLWithPath: ChannelManager.canonicalRecordingPath(sourcePath))
+        let destinationURL = URL(fileURLWithPath: ChannelManager.canonicalRecordingPath(destinationPath))
         guard FileManager.default.fileExists(atPath: sourceURL.path) else {
             return .skipped("source file missing")
         }
@@ -440,7 +514,7 @@ private actor MP4Finalizer {
             ]
         }
 
-        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments)
+        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments, sourcePath: sourceURL.path)
 
         guard result.status == 0 else {
             let details = result.stderr.isEmpty ? result.stdout : result.stderr
@@ -521,7 +595,7 @@ private actor MP4Finalizer {
             ]
         }
 
-        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments)
+        let result = await runProcess(executablePath: ffmpegPath, arguments: arguments, sourcePath: sourceURL.path)
         guard result.status == 0 else {
             let details = result.stderr.isEmpty ? result.stdout : result.stderr
             let trimmed = details.trimmingCharacters(in: .whitespacesAndNewlines)
@@ -693,12 +767,15 @@ private actor MP4Finalizer {
         return fps
     }
 
-    private func runProcess(executablePath: String, arguments: [String]) async -> ProcessResult {
+    private func runProcess(executablePath: String, arguments: [String], sourcePath: String? = nil) async -> ProcessResult {
         // Run process on utility queue with proper continuation resume on main thread
         // IMPORTANT: Must resume on main thread to maintain actor isolation invariants
         return await withCheckedContinuation { continuation in
             DispatchQueue.global(qos: .utility).async {
                 let process = Process()
+                if let sourcePath {
+                    FinalizerProcessRegistry.shared.register(sourcePath: sourcePath, process: process)
+                }
                 process.executableURL = URL(fileURLWithPath: executablePath)
                 process.arguments = arguments
 
@@ -723,13 +800,38 @@ private actor MP4Finalizer {
                 } catch {
                     result = ProcessResult(status: -1, stdout: "", stderr: error.localizedDescription)
                 }
-                
+
+                if let sourcePath {
+                    FinalizerProcessRegistry.shared.unregister(sourcePath: sourcePath, process: process)
+                }
+
                 // Resume on main thread to preserve continuation safety and actor isolation
                 DispatchQueue.main.async {
                     continuation.resume(returning: result)
                 }
             }
         }
+    }
+
+    func cancelAll() {
+        for task in activeTasks.values {
+            task.cancel()
+        }
+        activeTasks.removeAll(keepingCapacity: true)
+
+        let staleSources = Array(Set(activeJobs.keys).union(pendingJobs.map(\.sourcePath)))
+        for source in staleSources {
+            Self.cleanupStaleFinalizingTempFiles(for: source)
+        }
+
+        FinalizerProcessRegistry.shared.terminateAll(for: Array(activeJobs.keys) + pendingJobs.map(\.sourcePath))
+        FinalizerProcessRegistry.shared.clear()
+
+        pendingJobs.removeAll(keepingCapacity: true)
+        activelyProcessingPaths.removeAll(keepingCapacity: true)
+        activeJobs.removeAll(keepingCapacity: true)
+        inFlightPaths.removeAll(keepingCapacity: true)
+        idleWaiters.removeAll(keepingCapacity: true)
     }
 
     func waitUntilIdle() async {
@@ -754,7 +856,7 @@ private actor MP4Finalizer {
                 startedAt: Date()
             )
 
-            Task(priority: .utility) { [self] in
+            let task: Task<RepairOutcome, Never> = Task(priority: .utility) { [self] in
                 let outcome = await finalize(
                     sourcePath: job.sourcePath,
                     audioSourcePath: job.audioSourcePath,
@@ -765,13 +867,16 @@ private actor MP4Finalizer {
                 )
                 finishJob(sourcePath: job.sourcePath)
                 job.onCompletion?(outcome)
+                return outcome
             }
+            activeTasks[job.sourcePath] = task
         }
     }
 
     private func finishJob(sourcePath: String) {
         activelyProcessingPaths.remove(sourcePath)
         activeJobs.removeValue(forKey: sourcePath)
+        activeTasks.removeValue(forKey: sourcePath)
         inFlightPaths.remove(sourcePath)
         startNextJobsIfPossible()
 
@@ -798,6 +903,10 @@ actor Channel {
             tempoAdjustment: tempoAdjustment,
             audioDelaySeconds: audioDelaySeconds
         )
+    }
+
+    nonisolated static func cleanupStaleFinalizingTempFiles(for sourcePath: String) {
+        MP4Finalizer.cleanupStaleFinalizingTempFiles(for: sourcePath)
     }
 
     private enum IngestContainerMode {
@@ -1191,6 +1300,9 @@ actor Channel {
         isOnline = false
         closeCurrentFile(resetStats: true)
         clearRecordingPreviewState(removeTempFile: true)
+        Task {
+            await Self.mp4Finalizer.cancelAll()
+        }
     }
 
     static func waitForMP4FinalizationToComplete() async {

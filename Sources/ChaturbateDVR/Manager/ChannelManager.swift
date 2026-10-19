@@ -17,6 +17,7 @@ struct BioBackfillProgress {
 
 enum RecordingEditError: LocalizedError {
     case invalidTrimRange
+    case invalidSelection
     case recordingMissing
     case recordingStillActive
     case ffmpegUnavailable
@@ -27,16 +28,18 @@ enum RecordingEditError: LocalizedError {
         switch self {
         case .invalidTrimRange:
             return "Trim range is invalid. End time must be greater than start time."
+        case .invalidSelection:
+            return "Selection is invalid for this edit operation. Select at least two recordings to combine."
         case .recordingMissing:
             return "Recording file is missing from disk."
         case .recordingStillActive:
             return "Recording is still active/finalizing and cannot be trimmed yet."
         case .ffmpegUnavailable:
-            return "ffmpeg is required for trimming but was not found on this Mac."
+            return "ffmpeg is required for editing but was not found on this Mac."
         case .ffmpegFailed(let details):
-            return "ffmpeg trim failed: \(details)"
+            return "ffmpeg edit failed: \(details)"
         case .outputMissing:
-            return "Trim output was not created."
+            return "Edit output was not created."
         }
     }
 }
@@ -883,18 +886,19 @@ class ChannelManager: ObservableObject {
                     break
                 }
 
-                let existingState = await self.recordingRepairStateRaw(for: candidate.path)
+                let canonicalPath = Self.canonicalRecordingPath(candidate.path)
+                let existingState = await self.recordingRepairStateRaw(for: canonicalPath)
                 if existingState != .pendingScan {
                     remaining -= 1
                     continue
                 }
 
-                await self.setRecordingRepairScanDetail(candidate.path)
+                await self.setRecordingRepairScanDetail(canonicalPath)
 
                 var didAuditOnDisk = false
 
-                if await self.isAlreadyRepaired(path: candidate.path) {
-                    await self.setRecordingRepairState(.good, for: candidate.path)
+                if await self.isAlreadyRepaired(path: canonicalPath) {
+                    await self.setRecordingRepairState(.good, for: canonicalPath)
                     remaining -= 1
                     continue
                 }
@@ -903,28 +907,28 @@ class ChannelManager: ObservableObject {
                 if let cached = await self.cachedAuditDecision(for: candidate) {
                     switch cached {
                     case .good:
-                        await self.setRecordingRepairState(.good, for: candidate.path)
+                        await self.setRecordingRepairState(.good, for: canonicalPath)
                     case .optionalRemux, .needsRemux:
-                        await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                        await self.setRecordingRepairState(.needsRemux, for: canonicalPath)
                     }
                     remaining -= 1
                     continue
                 }
 
-                await self.setRecordingRepairState(.scanning, for: candidate.path)
-                let auditDecision = await Self.auditRecordingRepairCandidate(path: candidate.path)
+                await self.setRecordingRepairState(.scanning, for: canonicalPath)
+                let auditDecision = await Self.auditRecordingRepairCandidate(path: canonicalPath)
                 await self.storeAuditDecision(auditDecision, for: candidate)
                 didAuditOnDisk = true
 
                 switch auditDecision {
                 case .good:
-                    await self.setRecordingRepairState(.good, for: candidate.path)
+                    await self.setRecordingRepairState(.good, for: canonicalPath)
                 case .optionalRemux:
                     // Mirror audit-remux-candidates.sh semantics: fragmented head alone
                     // is optional, so surface it as a candidate but do not auto-remux.
-                    await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                    await self.setRecordingRepairState(.needsRemux, for: canonicalPath)
                 case .needsRemux:
-                    await self.setRecordingRepairState(.needsRemux, for: candidate.path)
+                    await self.setRecordingRepairState(.needsRemux, for: canonicalPath)
                 }
 
                 remaining -= 1
@@ -938,11 +942,19 @@ class ChannelManager: ObservableObject {
         }
     }
 
+    nonisolated static func canonicalRecordingPath(_ path: String) -> String {
+        let expandedPath = (path as NSString).expandingTildeInPath
+        let standardizedURL = URL(fileURLWithPath: expandedPath).standardizedFileURL
+        let resolvedURL = standardizedURL.resolvingSymlinksInPath()
+        return resolvedURL.path
+    }
+
     func hasExplicitRecordingRepairState(for path: String) -> Bool {
-        if recordingRepairStates[path] != nil { return true }
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        if recordingRepairStates[canonicalPath] != nil { return true }
         // Also check the real filesystem path for case-insensitive volume mismatches.
-        let resolvedPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-        return resolvedPath != path && recordingRepairStates[resolvedPath] != nil
+        let resolvedPath = URL(fileURLWithPath: canonicalPath).resolvingSymlinksInPath().path
+        return resolvedPath != canonicalPath && recordingRepairStates[resolvedPath] != nil
     }
 
     func startRepairForFlaggedRecordings() {
@@ -994,10 +1006,11 @@ class ChannelManager: ObservableObject {
                 await self.setRecordingRepairCurrentPath(path)
                 await self.setRecordingRepairState(.remuxing, for: path)
 
-                let channelName = URL(fileURLWithPath: path)
+                let canonicalPath = Self.canonicalRecordingPath(path)
+                let channelName = URL(fileURLWithPath: canonicalPath)
                     .deletingLastPathComponent()
                     .lastPathComponent
-                let repairFailure = await Channel.repairExistingMP4(path: path, channel: channelName)
+                let repairFailure = await Channel.repairExistingMP4(path: canonicalPath, channel: channelName)
 
                 await self.setRecordingRepairCurrentPath(nil)
                 if let repairFailure {
@@ -1074,8 +1087,9 @@ class ChannelManager: ObservableObject {
                 let sizeBytes = Int64(values.fileSize ?? 0)
                 guard sizeBytes > 0 else { continue }
 
+                let canonicalPath = Self.canonicalRecordingPath(fileURL.path)
                 let channelName = fileURL.deletingLastPathComponent().lastPathComponent
-                candidates.append(MP4RepairCandidate(path: fileURL.path, channelName: channelName, modifiedAt: modifiedAt, sizeBytes: sizeBytes))
+                candidates.append(MP4RepairCandidate(path: canonicalPath, channelName: channelName, modifiedAt: modifiedAt, sizeBytes: sizeBytes))
             }
 
             candidates.sort { lhs, rhs in
@@ -1307,22 +1321,23 @@ class ChannelManager: ObservableObject {
         var nextStates: [String: RecordingRepairState] = [:]
         nextStates.reserveCapacity(candidates.count)
         for candidate in candidates {
+            let canonicalPath = Self.canonicalRecordingPath(candidate.path)
             // Preserve .failed states so files that already failed repair don't get re-queued
-            if let failedState = preservedFailedStates[candidate.path] {
-                nextStates[candidate.path] = failedState
-            } else if let stateFromLedger = recordingRepairState(forLedgerStatus: ledgerStatuses[candidate.path]) {
-                nextStates[candidate.path] = stateFromLedger
+            if let failedState = preservedFailedStates[canonicalPath] {
+                nextStates[canonicalPath] = failedState
+            } else if let stateFromLedger = recordingRepairState(forLedgerStatus: ledgerStatuses[canonicalPath]) {
+                nextStates[canonicalPath] = stateFromLedger
             } else if isAlreadyRepaired(candidate: candidate) {
-                nextStates[candidate.path] = .good
+                nextStates[canonicalPath] = .good
             } else if let cachedDecision = cachedAuditDecision(for: candidate) {
                 switch cachedDecision {
                 case .good:
-                    nextStates[candidate.path] = .good
+                    nextStates[canonicalPath] = .good
                 case .optionalRemux, .needsRemux:
-                    nextStates[candidate.path] = .needsRemux
+                    nextStates[canonicalPath] = .needsRemux
                 }
             } else {
-                nextStates[candidate.path] = .pendingScan
+                nextStates[canonicalPath] = .pendingScan
             }
         }
         recordingRepairStates = nextStates
@@ -1338,7 +1353,8 @@ class ChannelManager: ObservableObject {
     }
 
     private func setRecordingRepairState(_ state: RecordingRepairState, for path: String) {
-        recordingRepairStates[path] = state
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        recordingRepairStates[canonicalPath] = state
         updateRecordingRepairSummary()
     }
 
@@ -1366,15 +1382,17 @@ class ChannelManager: ObservableObject {
     }
 
     private func recordingRepairStateRaw(for path: String) -> RecordingRepairState {
-        recordingRepairStates[path] ?? .pendingScan
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        return recordingRepairStates[canonicalPath] ?? .pendingScan
     }
 
     private func isAlreadyRepaired(path: String) -> Bool {
-        guard let entry = repairedRecordingIndex[path] else {
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        guard let entry = repairedRecordingIndex[canonicalPath] else {
             return false
         }
 
-        let fileURL = URL(fileURLWithPath: path)
+        let fileURL = URL(fileURLWithPath: canonicalPath)
         guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
               let fileSize = values.fileSize,
               let modifiedAt = values.contentModificationDate else {
@@ -1386,14 +1404,15 @@ class ChannelManager: ObservableObject {
     }
 
     private func markRecordingAsRepaired(path: String) {
-        let fileURL = URL(fileURLWithPath: path)
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        let fileURL = URL(fileURLWithPath: canonicalPath)
         guard let values = try? fileURL.resourceValues(forKeys: [.fileSizeKey, .contentModificationDateKey]),
               let fileSize = values.fileSize,
               let modifiedAt = values.contentModificationDate else {
             return
         }
 
-        repairedRecordingIndex[path] = RepairedRecordingIndexEntry(
+        repairedRecordingIndex[canonicalPath] = RepairedRecordingIndexEntry(
             sizeBytes: Int64(fileSize),
             modifiedAtUnix: modifiedAt.timeIntervalSince1970
         )
@@ -1471,19 +1490,27 @@ class ChannelManager: ObservableObject {
             return .unsupported
         }
 
-        // In-progress recordings are not repair candidates.
-        if recordingStatus == "active" || recordingStatus == "finalizing" {
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        let normalizedStatus = recordingStatus?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        let lowercasedPath = canonicalPath.lowercased()
+        let pathLooksInProgress = lowercasedPath.contains(".cbdvr_work_")
+            || lowercasedPath.contains("cbdvr_inprogress_")
+            || lowercasedPath.contains("_finalizing_")
+
+        // In-progress recordings are not repair candidates. Normalize the status and
+        // also guard against transient temp-file naming before the ledger state is updated.
+        if normalizedStatus == "active" || normalizedStatus == "finalizing" || pathLooksInProgress {
             return .unsupported
         }
 
-        if let state = recordingRepairStates[path] {
+        if let state = recordingRepairStates[canonicalPath] {
             return state
         }
 
         // Fall back to the real filesystem path in case the ledger stored a
         // different case variant on a case-insensitive volume.
-        let resolvedPath = URL(fileURLWithPath: path).resolvingSymlinksInPath().path
-        if resolvedPath != path, let state = recordingRepairStates[resolvedPath] {
+        let resolvedPath = URL(fileURLWithPath: canonicalPath).resolvingSymlinksInPath().path
+        if resolvedPath != canonicalPath, let state = recordingRepairStates[resolvedPath] {
             return state
         }
 
@@ -1593,9 +1620,10 @@ class ChannelManager: ObservableObject {
     }
 
     private func recordingDidFinalize(path: String) {
-        guard (path as NSString).pathExtension.lowercased() == "mp4" else { return }
-        guard recordingRepairStates[path] == nil else { return }
-        recordingRepairStates[path] = .pendingScan
+        let canonicalPath = Self.canonicalRecordingPath(path)
+        guard (canonicalPath as NSString).pathExtension.lowercased() == "mp4" else { return }
+        guard recordingRepairStates[canonicalPath] == nil else { return }
+        recordingRepairStates[canonicalPath] = .pendingScan
         updateRecordingRepairSummary()
         ensureRecordingRepairMaintenanceRunning()
     }
@@ -1921,6 +1949,170 @@ class ChannelManager: ObservableObject {
         return trimResult.outputPath
     }
 
+    func splitRecording(path: String, startSeconds: Double, endSeconds: Double, saveAsNewFile: Bool = true) async throws -> String {
+        try await trimRecording(path: path, startSeconds: startSeconds, endSeconds: endSeconds, saveAsNewFile: saveAsNewFile)
+    }
+
+    func combineRecordings(
+        paths: [String],
+        outputPath: String? = nil,
+        keepOriginals: Bool = true,
+        moveOriginalsToTrash: Bool = false,
+        progress: ((Double, String) -> Void)? = nil
+    ) async throws -> String {
+        let normalizedPaths = paths.map { ($0 as NSString).expandingTildeInPath }.filter { !$0.isEmpty }
+        guard normalizedPaths.count >= 2 else {
+            throw RecordingEditError.invalidSelection
+        }
+
+        let orderedPaths = await orderCombinePathsForDate(normalizedPaths)
+        guard orderedPaths.count >= 2 else {
+            throw RecordingEditError.invalidSelection
+        }
+
+        guard orderedPaths.allSatisfy({ FileManager.default.fileExists(atPath: $0) }) else {
+            throw RecordingEditError.recordingMissing
+        }
+
+        let details = try await withThrowingTaskGroup(of: (String, RecordingLedgerDetail?).self, returning: [String: RecordingLedgerDetail].self) { group in
+            for path in orderedPaths {
+                group.addTask {
+                    let detail = await self.recordingLedger.fetchRecordingDetail(filePath: path)
+                    return (path, detail)
+                }
+            }
+
+            var result: [String: RecordingLedgerDetail] = [:]
+            for try await (path, detail) in group {
+                guard let detail else {
+                    throw RecordingEditError.recordingMissing
+                }
+                guard !detail.isActive, !detail.isFinalizing else {
+                    throw RecordingEditError.recordingStillActive
+                }
+                result[path] = detail
+            }
+            return result
+        }
+
+        guard details.count == orderedPaths.count else {
+            throw RecordingEditError.recordingMissing
+        }
+
+        let targetChannel = details[orderedPaths[0]]?.channelUsername ?? "unknown"
+        let baseDir = URL(fileURLWithPath: orderedPaths[0]).deletingLastPathComponent()
+        let outputURL = outputPath.flatMap { URL(fileURLWithPath: ($0 as NSString).expandingTildeInPath) }
+            ?? Self.makeDerivedOutputURL(for: URL(fileURLWithPath: orderedPaths[0]), suffix: "combined")
+        let listPath = baseDir.appendingPathComponent("concat_\(UUID().uuidString).txt")
+
+        progress?(0.15, "Preparing \(orderedPaths.count) recordings for merge")
+
+        let listContents = orderedPaths.map { path in
+            "file '\(path.replacingOccurrences(of: "'", with: "'\\''"))'"
+        }.joined(separator: "\n")
+
+        do {
+            try listContents.write(to: listPath, atomically: true, encoding: .utf8)
+        } catch {
+            throw RecordingEditError.outputMissing
+        }
+
+        guard let ffmpegPath = Self.resolveFFMPEGPath() else {
+            throw RecordingEditError.ffmpegUnavailable
+        }
+
+        let args = [
+            "-nostdin",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-y",
+            "-f", "concat",
+            "-safe", "0",
+            "-i", listPath.path,
+            "-c", "copy",
+            outputURL.path
+        ]
+
+        progress?(0.35, "Merging recordings with ffmpeg")
+        let processResult = await Self.runProcessAsync(executablePath: ffmpegPath, arguments: args)
+        try? FileManager.default.removeItem(at: listPath)
+
+        guard processResult.status == 0, FileManager.default.fileExists(atPath: outputURL.path) else {
+            let detailsText = processResult.stderr.isEmpty ? processResult.stdout : processResult.stderr
+            let trimmed = detailsText.trimmingCharacters(in: .whitespacesAndNewlines)
+            throw RecordingEditError.ffmpegFailed(trimmed.isEmpty ? "exit status \(processResult.status)" : trimmed)
+        }
+
+        let fileSize = (try? FileManager.default.attributesOfItem(atPath: outputURL.path)[.size] as? NSNumber)?.int64Value ?? 0
+        let outputDuration = try await Self.mediaDurationSeconds(fileURL: outputURL)
+        let mergedEvents = orderedPaths.compactMap { path -> [RecordingEventEntry]? in
+            guard let detail = details[path] else { return nil }
+            return detail.events
+        }.flatMap { $0 }
+
+        let newestSourceDate = orderedPaths.compactMap { path in
+            details[path]?.endedAt ?? details[path]?.fileLastModifiedAt ?? details[path]?.fileLastSeenAt
+        }.max() ?? Date()
+        let oldestSourceDate = orderedPaths.compactMap { path in
+            details[path]?.startedAt ?? details[path]?.fileLastModifiedAt ?? details[path]?.fileLastSeenAt
+        }.min() ?? Date()
+
+        progress?(0.8, "Registering combined recording metadata")
+        await recordingLedger.registerManualCombinedCopy(
+            sourceFilePaths: orderedPaths,
+            newFilePath: outputURL.path,
+            channelUsername: targetChannel,
+            durationSeconds: outputDuration,
+            fileSizeBytes: fileSize,
+            sourceChannels: Array(Set(details.values.map(\.channelUsername))),
+            sourceEventEntries: mergedEvents,
+            startedAt: oldestSourceDate,
+            endedAt: newestSourceDate,
+            createdAt: newestSourceDate
+        )
+
+        if moveOriginalsToTrash {
+            progress?(0.9, "Moving original files to Trash")
+            for path in orderedPaths {
+                guard let detail = await recordingLedger.fetchRecordingDetail(filePath: path) else { continue }
+                let fileURL = URL(fileURLWithPath: path)
+                do {
+                    var resultingURL: NSURL? = nil
+                    try FileManager.default.trashItem(at: fileURL, resultingItemURL: &resultingURL)
+                    await recordingLedger.markRecordingMovedToTrash(recordingID: detail.id, filePath: path)
+                } catch {
+                    await FileLogger.shared.log("[manager] failed to move original combined recording to trash: \(path) — \(error.localizedDescription)", level: "WARN")
+                }
+            }
+        }
+
+        progress?(1.0, "Combine complete")
+        await FileLogger.shared.log("[manager] combined \(orderedPaths.count) recordings into \(outputURL.lastPathComponent) (duration \(String(format: "%.2f", outputDuration))s, movedOriginals: \(moveOriginalsToTrash ? "yes" : "no"))")
+        return outputURL.path
+    }
+
+    private func orderCombinePathsForDate(_ paths: [String]) async -> [String] {
+        let items = await withTaskGroup(of: (String, Date).self) { group -> [(String, Date)] in
+            for path in paths {
+                group.addTask {
+                    let detail = await self.recordingLedger.fetchRecordingDetail(filePath: path)
+                    let ledgerDate = detail?.startedAt ?? detail?.endedAt ?? detail?.fileLastSeenAt ?? detail?.fileLastModifiedAt
+                    let attributes = try? FileManager.default.attributesOfItem(atPath: path)
+                    let fallback = (attributes?[.modificationDate] as? Date) ?? Date.distantPast
+                    return (path, ledgerDate ?? fallback)
+                }
+            }
+
+            var results: [(String, Date)] = []
+            for await item in group {
+                results.append(item)
+            }
+            return results
+        }
+
+        return items.sorted { $0.1 < $1.1 }.map { $0.0 }
+    }
+
     func updateRecordingMediaDuration(path: String, mediaDurationSeconds: Double?) async {
         let normalizedPath = (path as NSString).expandingTildeInPath
         await recordingLedger.updateMediaDuration(filePath: normalizedPath, mediaDurationSeconds: mediaDurationSeconds)
@@ -2044,6 +2236,25 @@ class ChannelManager: ObservableObject {
         return candidate
     }
 
+    private nonisolated static func makeDerivedOutputURL(for inputURL: URL, suffix: String) -> URL {
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyyMMdd_HHmmss"
+        let stamp = formatter.string(from: Date())
+
+        let folderURL = inputURL.deletingLastPathComponent()
+        let base = inputURL.deletingPathExtension().lastPathComponent
+        let ext = inputURL.pathExtension
+        var candidate = folderURL.appendingPathComponent("\(base)_\(suffix)_\(stamp).\(ext)")
+        var counter = 1
+
+        while FileManager.default.fileExists(atPath: candidate.path) {
+            candidate = folderURL.appendingPathComponent("\(base)_\(suffix)_\(stamp)_\(counter).\(ext)")
+            counter += 1
+        }
+
+        return candidate
+    }
+
     private struct ProcessResult {
         let status: Int32
         let stdout: String
@@ -2104,11 +2315,12 @@ class ChannelManager: ObservableObject {
 
     func markRecordingMovedToTrash(recordingID: Int64, path: String) async {
         let normalizedPath = (path as NSString).expandingTildeInPath
+        let canonicalPath = Self.canonicalRecordingPath(normalizedPath)
         await recordingLedger.markRecordingMovedToTrash(recordingID: recordingID, filePath: normalizedPath)
 
-        recordingRepairStates.removeValue(forKey: normalizedPath)
-        repairedRecordingIndex.removeValue(forKey: normalizedPath)
-        auditCache.removeValue(forKey: normalizedPath)
+        recordingRepairStates.removeValue(forKey: canonicalPath)
+        repairedRecordingIndex.removeValue(forKey: canonicalPath)
+        auditCache.removeValue(forKey: canonicalPath)
 
         updateRecordingRepairSummary()
         saveRepairIndex()

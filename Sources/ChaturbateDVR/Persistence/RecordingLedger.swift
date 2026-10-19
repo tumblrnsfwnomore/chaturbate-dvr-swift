@@ -1454,6 +1454,124 @@ actor RecordingLedger {
         }
     }
 
+    func registerManualCombinedCopy(
+        sourceFilePaths: [String],
+        newFilePath: String,
+        channelUsername: String,
+        durationSeconds: Double,
+        fileSizeBytes: Int64,
+        sourceChannels: [String] = [],
+        sourceEventEntries: [RecordingEventEntry] = [],
+        startedAt: Date? = nil,
+        endedAt: Date? = nil,
+        createdAt: Date? = nil
+    ) async {
+        guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
+            return
+        }
+
+        let normalizedNewPath = normalizePath(newFilePath)
+        let now = nowUnix()
+        let channelID = ensureChannelID(username: channelUsername, database: database)
+        guard channelID > 0 else { return }
+
+        let attributes = try? FileManager.default.attributesOfItem(atPath: normalizedNewPath)
+        let modifiedAtUnix = ((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970).map(Int64.init) ?? now
+        let observedSize = (attributes?[.size] as? NSNumber)?.int64Value ?? fileSizeBytes
+        let exists = FileManager.default.fileExists(atPath: normalizedNewPath)
+        let audioPresent = exists ? await audioPresenceFromMediaFile(path: normalizedNewPath) : -1
+        let container = URL(fileURLWithPath: normalizedNewPath).pathExtension.lowercased()
+        let sourceDescription = sourceFilePaths.map { URL(fileURLWithPath: $0).lastPathComponent }.joined(separator: ", ")
+        let startedUnix = startedAt.map { Int64($0.timeIntervalSince1970) }
+        let endedUnix = endedAt.map { Int64($0.timeIntervalSince1970) }
+        let createdUnix = createdAt.map { Int64($0.timeIntervalSince1970) } ?? now
+
+        let sql = """
+        INSERT INTO recordings (
+            channel_id, started_at, ended_at, duration_seconds, media_duration_seconds,
+            media_duration_checked_at, file_size_bytes, file_path, working_file_path,
+            container, status, is_remuxed, remuxed_at, audio_present,
+            missing_since, file_last_seen_at, file_last_modified_at,
+            file_exists, is_backfilled, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?, 'completed', 1, ?, ?, NULL, ?, ?, ?, 0, ?, ?)
+        ON CONFLICT(file_path) DO UPDATE SET
+            channel_id = excluded.channel_id,
+            started_at = excluded.started_at,
+            ended_at = excluded.ended_at,
+            duration_seconds = excluded.duration_seconds,
+            media_duration_seconds = excluded.media_duration_seconds,
+            media_duration_checked_at = excluded.media_duration_checked_at,
+            file_size_bytes = excluded.file_size_bytes,
+            container = excluded.container,
+            status = 'completed',
+            is_remuxed = 1,
+            remuxed_at = excluded.remuxed_at,
+            audio_present = excluded.audio_present,
+            missing_since = NULL,
+            file_last_seen_at = excluded.file_last_seen_at,
+            file_last_modified_at = excluded.file_last_modified_at,
+            file_exists = excluded.file_exists,
+            is_backfilled = 0,
+            updated_at = excluded.updated_at
+        """
+
+        guard let statement = prepare(database: database, sql: sql) else { return }
+        defer { sqlite3_finalize(statement) }
+
+        sqlite3_bind_int64(statement, 1, channelID)
+        if let startedUnix {
+            sqlite3_bind_int64(statement, 2, startedUnix)
+        } else {
+            sqlite3_bind_null(statement, 2)
+        }
+        if let endedUnix {
+            sqlite3_bind_int64(statement, 3, endedUnix)
+        } else {
+            sqlite3_bind_null(statement, 3)
+        }
+        sqlite3_bind_double(statement, 4, durationSeconds)
+        sqlite3_bind_double(statement, 5, durationSeconds)
+        sqlite3_bind_int64(statement, 6, now)
+        sqlite3_bind_int64(statement, 7, observedSize)
+        bindText(statement: statement, index: 8, value: normalizedNewPath)
+        bindText(statement: statement, index: 9, value: container)
+        sqlite3_bind_int64(statement, 10, now)
+        sqlite3_bind_int(statement, 11, Int32(audioPresent))
+        sqlite3_bind_int64(statement, 12, now)
+        sqlite3_bind_int64(statement, 13, modifiedAtUnix)
+        sqlite3_bind_int(statement, 14, exists ? 1 : 0)
+        sqlite3_bind_int64(statement, 15, createdUnix)
+        sqlite3_bind_int64(statement, 16, now)
+
+        _ = sqlite3_step(statement)
+
+        if let newRecordingID = recordingID(forPath: normalizedNewPath, database: database) {
+            let sources = sourceDescription.isEmpty ? "selected recordings" : sourceDescription
+            let sourcesLabel = sourceChannels.isEmpty ? sources : "\(sourceChannels.joined(separator: ", "))"
+            appendSystemEvent(
+                recordingID: newRecordingID,
+                level: "INFO",
+                eventType: "manual_recording_combined",
+                message: "Combined recordings from \(sourcesLabel) into one output",
+                database: database
+            )
+
+            for event in sourceEventEntries {
+                let mergedMessage = "[merged from source] \(event.message)"
+                let metadataJSON = event.metadataJSON ?? "\(event.eventType)"
+                appendSystemEvent(
+                    recordingID: newRecordingID,
+                    level: event.level,
+                    eventType: "source_event_merged",
+                    message: mergedMessage,
+                    metadataJSON: metadataJSON,
+                    database: database
+                )
+            }
+        }
+    }
+
     func fetchStatusByPath(paths: [String]) async -> [String: String] {
         guard let database = openIfNeeded(databaseURL: databaseURL ?? defaultDatabaseURL()) else {
             return [:]
@@ -2241,11 +2359,12 @@ actor RecordingLedger {
         level: String,
         eventType: String,
         message: String,
+        metadataJSON: String? = nil,
         database: OpaquePointer
     ) {
         let sql = """
         INSERT INTO recording_events (recording_id, created_at, level, event_type, message, metadata_json)
-        VALUES (?, ?, ?, ?, ?, NULL)
+        VALUES (?, ?, ?, ?, ?, ?)
         """
 
         guard let statement = prepare(database: database, sql: sql) else { return }
@@ -2256,6 +2375,11 @@ actor RecordingLedger {
         bindText(statement: statement, index: 3, value: level)
         bindText(statement: statement, index: 4, value: eventType)
         bindText(statement: statement, index: 5, value: message)
+        if let metadataJSON {
+            bindText(statement: statement, index: 6, value: metadataJSON)
+        } else {
+            sqlite3_bind_null(statement, 6)
+        }
         _ = sqlite3_step(statement)
     }
 
